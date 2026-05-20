@@ -587,7 +587,8 @@ def run_analysis(
     ]
 
     surveys_data = []
-    pages_by_local_idx = {i: [] for i in range(config.page_count)}
+    # 파일별 템플릿 생성용 데이터: fname -> {local_p: [bytes]}
+    file_pages = {}  # dict[str, dict[int, list[bytes]]]
     prepared_surveys = 0
 
     for fpath in file_paths:
@@ -599,6 +600,9 @@ def run_analysis(
             continue
 
         survey_count = _survey_count(len(doc), config.page_count)
+        f_pages = file_pages.setdefault(
+            fname, {i: [] for i in range(config.page_count)}
+        )
 
         for survey_idx in range(survey_count):
             survey_gray_pages = {}
@@ -621,10 +625,9 @@ def run_analysis(
 
                 survey_gray_pages[local_p] = aligned
 
-                if len(pages_by_local_idx[local_p]) < 31:
-                    pages_by_local_idx[local_p].append(
-                        cv2.imencode(".png", aligned)[1].tobytes()
-                    )
+                # 파일별 템플릿용 수집 (파일당 최대 31장)
+                if len(f_pages[local_p]) < 31:
+                    f_pages[local_p].append(cv2.imencode(".png", aligned)[1].tobytes())
 
             surveys_data.append(
                 {
@@ -644,14 +647,45 @@ def run_analysis(
 
         doc.close()
 
-    # pages_by_local_idx는 generate_dynamic_templates에 넘긴 후 바로 해제
-    dynamic_templates = generate_dynamic_templates(pages_by_local_idx)
-    pages_by_local_idx.clear()
-    report_progress(40, "분석 시작 중...")
+    # 파일별 템플릿 생성 + 첫 파일 기준 정렬
+    report_progress(40, "템플릿 생성 중...")
+    reference_templates = None  # 첫 번째 유효 파일의 템플릿 (gray)
+    file_templates = {}  # fname -> dict[local_p, np.ndarray] (gray)
 
+    for fname, f_pages in file_pages.items():
+        file_template = generate_dynamic_templates(f_pages)
+        if not file_template:
+            continue
+
+        if reference_templates is None:
+            reference_templates = file_template
+            file_templates[fname] = file_template
+        else:
+            # reference 템플릿에 각 local_p 정렬
+            aligned = {}
+            for local_p, tpl in file_template.items():
+                if local_p in reference_templates:
+                    aligner = ImageAligner(reference_templates[local_p])
+                    aligned[local_p] = aligner.align(tpl)
+                else:
+                    aligned[local_p] = tpl
+            file_templates[fname] = aligned
+
+    if reference_templates is None:
+        print("템플릿 생성에 실패했습니다.")
+        return False
+
+    # 템플릿이 없는 파일은 reference로 대체
+    for fname in file_pages:
+        if fname not in file_templates or not file_templates[fname]:
+            file_templates[fname] = reference_templates
+
+    report_progress(45, "분석 시작 중...")
+
+    # 검토용 템플릿 PDF 저장 (reference 기준)
     template_pdf = fitz.open()
-    for local_p in sorted(dynamic_templates.keys()):
-        _insert_img_into_pdf(template_pdf, dynamic_templates[local_p], quality=90)
+    for local_p in sorted(reference_templates.keys()):
+        _insert_img_into_pdf(template_pdf, reference_templates[local_p], quality=90)
 
     if len(template_pdf) > 0:
         template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
@@ -669,8 +703,10 @@ def run_analysis(
             out_pdfs_original[fname] = fitz.open()
             out_pdfs_ink_only[fname] = fitz.open()
 
+        # 파일별 템플릿 적용
+        f_template = file_templates.get(fname, reference_templates)
         row_data, debug_base, ink_base, debug_ann, ink_ann, comment_pages = (
-            process_survey_data(survey, config, dynamic_templates)
+            process_survey_data(survey, config, f_template)
         )
         all_results.append(row_data)
 
@@ -696,7 +732,7 @@ def run_analysis(
 
         processed_surveys += 1
         report_progress(
-            40 + int(processed_surveys / total_surveys * 50),
+            45 + int(processed_surveys / total_surveys * 45),
             f"분석 중... ({processed_surveys}/{total_surveys})",
         )
 
