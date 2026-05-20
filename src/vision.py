@@ -131,19 +131,16 @@ class ImageAligner:
         matches = sorted(matcher.match(self.des1, des2), key=lambda m: m.distance)
         top_matches = matches[: max(4, int(len(matches) * 0.15))]
 
-        if len(top_matches) < 4:
+        if len(top_matches) < 3:
             return self._resize_to_ref(img)
 
         pts1 = np.float32([self.kp1[m.queryIdx].pt for m in top_matches]).reshape(
             -1, 1, 2
         )
         pts2 = np.float32([kp2[m.trainIdx].pt for m in top_matches]).reshape(-1, 1, 2)
-        H, _ = cv2.findHomography(pts2, pts1, cv2.RANSAC)
 
-        if H is not None:
-            return cv2.warpPerspective(img, H, (self.ref_w, self.ref_h))
-
-        M, _ = cv2.estimateAffinePartial2D(pts2, pts1)
+        # affine transform: rotation + translation + scale, no perspective (no twisting)
+        M, _ = cv2.estimateAffine2D(pts2, pts1, ransacReprojThreshold=3.0)
         if M is not None:
             return cv2.warpAffine(img, M, (self.ref_w, self.ref_h))
 

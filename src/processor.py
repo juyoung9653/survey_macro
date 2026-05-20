@@ -393,7 +393,7 @@ def _select_working_boxes(
     if field.is_comment or is_contiguous or field.allow_duplicates:
         return [copy.copy(b) for b in z_sorted_boxes]
 
-    return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=3.0)
+    return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=2.0)
 
 
 def _collect_ink_data(
