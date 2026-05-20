@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -204,3 +205,59 @@ def auto_detect_checkboxes(
                 boxes.append((int(x), int(y), int(w), int(h)))
 
     return boxes
+
+
+def _checkbox_cache_key(
+    pdf_paths: list[str],
+    page_count: int,
+    rot_code: int,
+    fine_angle: float,
+    dpi: int = 200,
+) -> str:
+    parts = []
+    for p in pdf_paths:
+        try:
+            stat = os.stat(p)
+            parts.append(f"{os.path.abspath(p)}_{stat.st_size}_{stat.st_mtime}")
+        except Exception:
+            parts.append(p)
+    unique_str = f"{'|'.join(parts)}_{page_count}_{rot_code}_{fine_angle}_{dpi}"
+    return hashlib.md5(unique_str.encode("utf-8")).hexdigest()
+
+
+def load_checkbox_cache(
+    pdf_paths: list[str], page_count: int, rot_code: int, fine_angle: float
+) -> dict[int, list[tuple[int, int, int, int]]] | None:
+    key = _checkbox_cache_key(pdf_paths, page_count, rot_code, fine_angle)
+    cache_dir = os.path.join(tempfile.gettempdir(), "pdf_checkbox_cache")
+    cache_file = os.path.join(cache_dir, f"{key}.json")
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        result = {}
+        for k, v in raw.items():
+            result[int(k)] = [tuple(b) for b in v]
+        return result
+    except Exception:
+        return None
+
+
+def save_checkbox_cache(
+    pdf_paths: list[str],
+    page_count: int,
+    rot_code: int,
+    fine_angle: float,
+    boxes_by_page: dict[int, list[tuple[int, int, int, int]]],
+) -> None:
+    key = _checkbox_cache_key(pdf_paths, page_count, rot_code, fine_angle)
+    cache_dir = os.path.join(tempfile.gettempdir(), "pdf_checkbox_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"{key}.json")
+    try:
+        raw = {str(k): [list(b) for b in v] for k, v in boxes_by_page.items()}
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(raw, f)
+    except Exception:
+        pass

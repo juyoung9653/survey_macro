@@ -35,7 +35,14 @@ from PyQt6.QtWidgets import (
 
 from .models import Box, Field, TemplatePreset
 from .processor import generate_ui_templates, generate_ui_templates_multi, run_analysis
-from .vision import ImageAligner, apply_rotation, auto_detect_checkboxes, load_pdf_pages
+from .vision import (
+    ImageAligner,
+    apply_rotation,
+    auto_detect_checkboxes,
+    load_checkbox_cache,
+    load_pdf_pages,
+    save_checkbox_cache,
+)
 
 ROTATION_LABELS = ["원본 0°", "좌측 90°", "우측 90°", "180°"]
 ROTATION_CODES = [
@@ -1074,7 +1081,7 @@ class MainWindow(QMainWindow):
         체크박스를 자동으로 탐지하고, 수평으로 같은 라인에 있는 항목을
         Q1, Q2, Q3 등의 그룹(Field)으로 자동 할당합니다.
         """
-        if not self.pages:
+        if not self.pages or not self.file_paths:
             return
 
         def report(value: int, message: str = ""):
@@ -1084,6 +1091,28 @@ class MainWindow(QMainWindow):
         self.selected_boxes.clear()
         self.pending_boxes.clear()
         self.preset.fields.clear()
+
+        # ── 캐시 확인 ──
+        cached = load_checkbox_cache(
+            self.file_paths,
+            self.preset.page_count,
+            self.preset.rot_code,
+            self.preset.fine_angle,
+        )
+        if cached is not None:
+            report(0, "캐시된 체크박스 불러오는 중...")
+            question_number = 1
+            for page_idx in sorted(cached.keys()):
+                boxes = [Box(page_idx, *b) for b in cached[page_idx]]
+                rows = self._group_boxes_by_row(boxes)
+                for row in rows:
+                    row.sort(key=lambda b: b.x)
+                    field_name = f"Q{question_number}"
+                    self.preset.fields.append(Field(name=field_name, boxes=row))
+                    question_number += 1
+            report(100, "체크박스 탐지 완료 (캐시)")
+            self.update_canvas()
+            return
 
         question_number = 1
 
@@ -1112,6 +1141,8 @@ class MainWindow(QMainWindow):
         total_pages = len(self.pages)
         report(70, "체크박스 탐지 중...")
 
+        detected_cache: dict[int, list[tuple[int, int, int, int]]] = {}
+
         for i, page in enumerate(self.pages):
             if templates and i in templates:
                 img = templates[i]
@@ -1119,6 +1150,7 @@ class MainWindow(QMainWindow):
                 img = apply_rotation(page, self.preset.rot_code, self.preset.fine_angle)
 
             detected = auto_detect_checkboxes(img)
+            detected_cache[i] = detected
 
             # Box 객체로 변환
             boxes = [Box(i, b[0], b[1], b[2], b[3]) for b in detected]
@@ -1137,6 +1169,15 @@ class MainWindow(QMainWindow):
             if total_pages > 0:
                 progress_value = 70 + int((i + 1) / total_pages * 30)
                 report(progress_value, f"체크박스 탐지 중... ({i + 1}/{total_pages})")
+
+        # ── 캐시 저장 ──
+        save_checkbox_cache(
+            self.file_paths,
+            self.preset.page_count,
+            self.preset.rot_code,
+            self.preset.fine_angle,
+            detected_cache,
+        )
 
         report(100, "체크박스 탐지 완료")
         self.update_canvas()

@@ -22,6 +22,152 @@ def _try_number(s: str):
         return s
 
 
+def _compute_field_stats(results: list[dict], field, config: TemplatePreset):
+    """field 하나에 대한 카운트·미응답 수를 반환"""
+    n_opts = len(field.boxes)
+    raw_labels = []
+    for i in range(n_opts):
+        if i < len(field.value_map) and field.value_map[i].strip():
+            v = field.value_map[i].strip()
+            raw_labels.append(_try_number(v))
+        else:
+            raw_labels.append(i + 1)
+    option_labels = raw_labels
+
+    if config.reverse_numbering:
+        option_labels = list(reversed(option_labels))
+
+    label_keys = [str(lbl) for lbl in option_labels]
+    counts = {k: 0 for k in label_keys}
+    non_resp = 0
+
+    for item in results:
+        raw = str(item.get(field.name, "")).strip()
+        if not raw:
+            non_resp += 1
+        else:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            for p in parts:
+                if p in counts:
+                    counts[p] += 1
+
+    return option_labels, label_keys, counts, non_resp
+
+
+# ── 스타일 상수 ──
+_header_font = Font(bold=True, size=11, color="FFFFFF")
+_header_fill = PatternFill("solid", fgColor="4472C4")
+_group_font = Font(bold=True, size=11, color="1F4E79")
+_group_fill = PatternFill("solid", fgColor="D6E4F0")
+_count_fill = PatternFill("solid", fgColor="F2F2F2")
+_pct_fill = PatternFill("solid", fgColor="E2EFDA")
+_non_resp_fill = PatternFill("solid", fgColor="FCE4D6")
+_red_font = Font(bold=True, size=11, color="FFFFFF")
+_red_fill = PatternFill("solid", fgColor="C00000")
+_thin_border = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
+_center_align = Alignment(horizontal="center", vertical="center")
+
+
+def _write_stats_rows(
+    ws,
+    config: TemplatePreset,
+    results: list[dict],
+    start_row: int = 1,
+) -> int:
+    """통계 행을 쓰고 마지막 사용 행 번호를 반환"""
+    total_responses = len(results)
+    row = start_row
+
+    for field in config.fields:
+        if field.is_comment:
+            continue
+
+        option_labels, label_keys, counts, non_resp = _compute_field_stats(
+            results, field, config
+        )
+        last_col = len(option_labels) + 2
+
+        # ── 첫 번째 행: 그룹명 + 옵션 레이블 + 미응답 ──
+        cell = ws.cell(row=row, column=1, value=field.name)
+        cell.font = _group_font
+        cell.fill = _group_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        for ci, label in enumerate(option_labels):
+            c = ci + 2
+            cell = ws.cell(row=row, column=c, value=label)
+            cell.font = _header_font
+            cell.fill = _header_fill
+            cell.border = _thin_border
+            cell.alignment = _center_align
+
+        cell = ws.cell(row=row, column=last_col, value="미응답")
+        cell.font = _red_font
+        cell.fill = _red_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        # ── 두 번째 행: 갯수 ──
+        row += 1
+        cell = ws.cell(row=row, column=1, value="갯수")
+        cell.font = Font(bold=True, size=10)
+        cell.fill = _count_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        for ci, key in enumerate(label_keys):
+            c = ci + 2
+            cell = ws.cell(row=row, column=c, value=counts[key])
+            cell.fill = _count_fill
+            cell.border = _thin_border
+            cell.alignment = _center_align
+
+        cell = ws.cell(row=row, column=last_col, value=non_resp)
+        cell.fill = _non_resp_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        # ── 세 번째 행: 응답률 ──
+        row += 1
+        cell = ws.cell(row=row, column=1, value="응답률")
+        cell.font = Font(bold=True, size=10)
+        cell.fill = _pct_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        for ci, key in enumerate(label_keys):
+            c = ci + 2
+            val = counts[key] / total_responses if total_responses else 0
+            cell = ws.cell(row=row, column=c, value=val)
+            cell.number_format = "0.0%"
+            cell.fill = _pct_fill
+            cell.border = _thin_border
+            cell.alignment = _center_align
+
+        val_non = non_resp / total_responses if total_responses else 0
+        cell = ws.cell(row=row, column=last_col, value=val_non)
+        cell.number_format = "0.0%"
+        cell.fill = _non_resp_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+        # 빈 구분 행
+        row += 2
+
+    # 열 너비
+    ws.column_dimensions["A"].width = 18
+    for ci in range(2, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(ci)].width = 12
+
+    return row
+
+
 def export_to_excel(
     results: list[dict],
     config: Optional[TemplatePreset] = None,
@@ -33,7 +179,7 @@ def export_to_excel(
     try:
         wb = openpyxl.Workbook()
 
-        # ── 결과 시트 ──
+        # ── 1. 결과 시트 (첫 번째) ──
         ws_result = wb.active
         ws_result.title = "결과"
 
@@ -44,9 +190,24 @@ def export_to_excel(
             row = [_try_number(str(item.get(header, ""))) for header in headers]
             ws_result.append(row)
 
-        # ── 통계 시트 ──
+        # ── 2. 전체 통계 시트 (두 번째) ──
         if config and config.fields:
-            _build_stats_sheet(wb, results, config)
+            ws_overall = wb.create_sheet("전체 통계")
+            _write_stats_rows(ws_overall, config, results)
+
+            # ── 3. 파일별 통계 시트 ──
+            # 파일명별로 결과 묶기
+            fname_to_results: dict[str, list[dict]] = {}
+            for item in results:
+                fn = str(item.get("파일명", "")).strip()
+                if not fn:
+                    fn = "기타"
+                fname_to_results.setdefault(fn, []).append(item)
+
+            for fname, f_results in fname_to_results.items():
+                sheet_name = fname[:31]  # 엑셀 시트명 31자 제한
+                ws_f = wb.create_sheet(sheet_name)
+                _write_stats_rows(ws_f, config, f_results)
 
         wb.save(out_path)
         return True
@@ -54,131 +215,3 @@ def export_to_excel(
     except Exception as e:
         print(f"엑셀 저장 실패: {e}")
         return False
-
-
-def _build_stats_sheet(
-    wb: openpyxl.Workbook, results: list[dict], config: "TemplatePreset"
-) -> None:
-    ws = wb.create_sheet("통계")
-
-    # 스타일 정의
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="4472C4")
-    group_font = Font(bold=True, size=11, color="1F4E79")
-    group_fill = PatternFill("solid", fgColor="D6E4F0")
-    count_fill = PatternFill("solid", fgColor="F2F2F2")
-    pct_fill = PatternFill("solid", fgColor="E2EFDA")
-    thin_border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
-    )
-    center_align = Alignment(horizontal="center", vertical="center")
-
-    total_responses = len(results)
-    row = 1
-
-    for field in config.fields:
-        if field.is_comment:
-            continue
-
-        # 옵션 레이블: position별로 value_map에 실값이 있으면 쓰고, 없으면 숫자
-        n_opts = len(field.boxes)
-        raw_labels = []
-        for i in range(n_opts):
-            if i < len(field.value_map) and field.value_map[i].strip():
-                v = field.value_map[i].strip()
-                raw_labels.append(_try_number(v))
-            else:
-                raw_labels.append(i + 1)
-        option_labels = raw_labels
-
-        if config.reverse_numbering:
-            option_labels = list(reversed(option_labels))
-
-        # key는 문자열 (데이터 매칭용)
-        label_keys = [str(lbl) for lbl in option_labels]
-        counts = {k: 0 for k in label_keys}
-        non_resp = 0
-
-        for item in results:
-            raw = str(item.get(field.name, "")).strip()
-            if not raw:
-                non_resp += 1
-            else:
-                parts = [p.strip() for p in raw.split(",") if p.strip()]
-                for p in parts:
-                    if p in counts:
-                        counts[p] += 1
-
-        # ── 첫 번째 행: 그룹명 + 옵션 레이블 + 미응답 ──
-        ws.cell(row=row, column=1, value=field.name).font = group_font
-        ws.cell(row=row, column=1).fill = group_fill
-        ws.cell(row=row, column=1).border = thin_border
-        ws.cell(row=row, column=1).alignment = center_align
-
-        for ci, label in enumerate(option_labels):
-            c = ci + 2
-            cell = ws.cell(row=row, column=c, value=label)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.border = thin_border
-            cell.alignment = center_align
-
-        last_col = len(option_labels) + 2
-        cell = ws.cell(row=row, column=last_col, value="미응답")
-        cell.font = Font(bold=True, size=11, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="C00000")
-        cell.border = thin_border
-        cell.alignment = center_align
-
-        # ── 두 번째 행: 갯수 ──
-        row += 1
-        ws.cell(row=row, column=1, value="갯수").font = Font(bold=True, size=10)
-        ws.cell(row=row, column=1).fill = count_fill
-        ws.cell(row=row, column=1).border = thin_border
-        ws.cell(row=row, column=1).alignment = center_align
-
-        for ci, key in enumerate(label_keys):
-            c = ci + 2
-            cell = ws.cell(row=row, column=c, value=counts[key])
-            cell.fill = count_fill
-            cell.border = thin_border
-            cell.alignment = center_align
-
-        cell = ws.cell(row=row, column=last_col, value=non_resp)
-        cell.fill = PatternFill("solid", fgColor="FCE4D6")
-        cell.border = thin_border
-        cell.alignment = center_align
-
-        # ── 세 번째 행: 응답률 ──
-        row += 1
-        ws.cell(row=row, column=1, value="응답률").font = Font(bold=True, size=10)
-        ws.cell(row=row, column=1).fill = pct_fill
-        ws.cell(row=row, column=1).border = thin_border
-        ws.cell(row=row, column=1).alignment = center_align
-
-        for ci, key in enumerate(label_keys):
-            c = ci + 2
-            val = counts[key] / total_responses if total_responses else 0
-            cell = ws.cell(row=row, column=c, value=val)
-            cell.number_format = "0.0%"
-            cell.fill = pct_fill
-            cell.border = thin_border
-            cell.alignment = center_align
-
-        val_non = non_resp / total_responses if total_responses else 0
-        cell = ws.cell(row=row, column=last_col, value=val_non)
-        cell.number_format = "0.0%"
-        cell.fill = PatternFill("solid", fgColor="FCE4D6")
-        cell.border = thin_border
-        cell.alignment = center_align
-
-        # 빈 구분 행
-        row += 2
-
-    # 열 너비
-    ws.column_dimensions["A"].width = 18
-    for ci in range(2, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(ci)].width = 12

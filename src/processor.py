@@ -127,13 +127,13 @@ def expand_isolated_boxes(
                 if dist_x > 0:
                     max_dw = min(max_dw, dist_x / 2.1)
                 else:
-                    max_dw = 0
+                    max_dw = min(max_dw, 2)
 
             if abs(cx1 - cx2) < (box.w + other.w) / 2 + 15:
                 if dist_y > 0:
                     max_dh = min(max_dh, dist_y / 2.1)
                 else:
-                    max_dh = 0
+                    max_dh = min(max_dh, 2)
 
         max_dw = max(0, max_dw)
         max_dh = max(0, max_dh)
@@ -427,7 +427,9 @@ def _collect_ink_data(
 def process_survey_data(
     survey_data: dict, config: TemplatePreset, dynamic_templates: dict[int, np.ndarray]
 ) -> tuple[dict, dict, dict, dict, dict, dict]:
-    row_data = {"페이지": survey_data["row_title"]}
+    fname = survey_data.get("fname", "")
+    survey_label = survey_data["row_title"]
+    row_data = {"파일명": fname, "페이지": survey_label}
     survey_gray_pages = survey_data["gray_pages"]
     # PNG 압축 해제 (메모리 절감: raw numpy 대신 PNG bytes로 저장됨)
     if survey_gray_pages:
@@ -627,7 +629,7 @@ def run_analysis(
             surveys_data.append(
                 {
                     "fname": fname,
-                    "row_title": f"Page{survey_idx + 1}",
+                    "row_title": f"{fname}_{survey_idx + 1}p",
                     "gray_pages": {
                         k: cv2.imencode(".png", v)[1].tobytes()
                         for k, v in survey_gray_pages.items()
