@@ -34,8 +34,8 @@ from PyQt6.QtWidgets import (
 )
 
 from .models import Box, Field, TemplatePreset
-from .processor import generate_ui_templates, run_analysis
-from .vision import apply_rotation, auto_detect_checkboxes, load_pdf_pages
+from .processor import generate_ui_templates, generate_ui_templates_multi, run_analysis
+from .vision import ImageAligner, apply_rotation, auto_detect_checkboxes, load_pdf_pages
 
 ROTATION_LABELS = ["원본 0°", "좌측 90°", "우측 90°", "180°"]
 ROTATION_CODES = [
@@ -682,7 +682,7 @@ class MainWindow(QMainWindow):
 
         self._sync_view_toggle_text()
 
-    def _apply_loaded_preset(self, data: dict):
+    def _apply_loaded_preset(self, data: dict, preset_name: str = ""):
         self.preset = TemplatePreset(
             page_count=int(data.get("page_count", 1)),
             fine_angle=float(data.get("fine_angle", 0.0)),
@@ -697,11 +697,31 @@ class MainWindow(QMainWindow):
         self._sync_rotation_index()
         self._sync_reverse_numbering_state()
 
+        saved_templates = self._load_template_images(preset_name) if preset_name else []
+
         if self.file_paths:
-            self.pages = load_pdf_pages(self.file_paths[0])[: self.preset.page_count]
-            if len(self.pages) < self.preset.page_count:
-                self.preset.page_count = len(self.pages)
+            raw_pages = load_pdf_pages(self.file_paths[0])[: self.preset.page_count]
+            if len(raw_pages) < self.preset.page_count:
+                self.preset.page_count = len(raw_pages)
+
+            if saved_templates and len(saved_templates) >= self.preset.page_count:
+                # 저장된 템플릿 기준으로 새 PDF 페이지 정렬
+                aligned = []
+                for i in range(self.preset.page_count):
+                    aligner = ImageAligner(saved_templates[i])
+                    img = apply_rotation(
+                        raw_pages[i], self.preset.rot_code, self.preset.fine_angle
+                    )
+                    aligned.append(aligner.align(img))
+                self.pages = aligned
+            else:
+                self.pages = raw_pages
+
             self._filter_boxes_outside_page_count()
+            self._update_page_size()
+        elif saved_templates:
+            # PDF 없이 프리셋만 로드한 경우: 저장된 템플릿을 표시
+            self.pages = saved_templates[: self.preset.page_count]
             self._update_page_size()
 
         self.update_canvas()
@@ -725,6 +745,31 @@ class MainWindow(QMainWindow):
             return
         self._save_preset_to_name(name)
 
+    def _save_template_images(self, name: str):
+        if not self.pages:
+            return
+        for i, page in enumerate(self.pages):
+            img = apply_rotation(page, self.preset.rot_code, self.preset.fine_angle)
+            success, buf = cv2.imencode(".png", img)
+            if success:
+                tpl_path = self.preset_dir / f"{name}_tpl_p{i}.png"
+                tpl_path.write_bytes(buf.tobytes())
+
+    def _load_template_images(self, name: str) -> list:
+        pages = []
+        i = 0
+        while True:
+            tpl_path = self.preset_dir / f"{name}_tpl_p{i}.png"
+            if not tpl_path.exists():
+                break
+            img = cv2.imdecode(
+                np.frombuffer(tpl_path.read_bytes(), np.uint8), cv2.IMREAD_COLOR
+            )
+            if img is not None:
+                pages.append(img)
+            i += 1
+        return pages
+
     def _save_preset_to_name(self, name: str):
         data = self._serialize_config()
         path = self.preset_dir / f"{name}.json"
@@ -734,6 +779,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "오류", f"프리셋 저장 실패: {exc}")
             return
+        self._save_template_images(name)
         self.current_preset_name = name
 
     def _list_config_names(self) -> list[str]:
@@ -748,7 +794,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "오류", f"프리셋 불러오기 실패: {exc}")
             return
         self.current_preset_name = name
-        self._apply_loaded_preset(data)
+        self._apply_loaded_preset(data, preset_name=name)
 
     def load_preset_dialog(self):
         names = self._list_config_names()
@@ -774,30 +820,54 @@ class MainWindow(QMainWindow):
         page_count, ok = QInputDialog.getInt(
             self, "템플릿 설정", "설문지 1부당 페이지 수를 입력하세요:", 1, 1, 10
         )
-        if ok:
-            progress = self._show_progress_dialog("PDF 로드", "PDF 로딩 중...")
-            progress_cb = self._make_progress_cb(progress)
+        if not ok:
+            return
 
-            self.preset.page_count = page_count
-            self.pages = load_pdf_pages(
-                self.file_paths[0],
-                progress_cb=self._wrap_progress(0, 60, "PDF 로딩 중...", progress_cb),
-            )[:page_count]
+        progress = self._show_progress_dialog("PDF 로드", "PDF 로딩 중...")
+        progress_cb = self._make_progress_cb(progress)
 
-            self._reset_state_for_new_pdf()
+        self.preset.page_count = page_count
 
-            self._update_page_size()
-            self.update_canvas()
-            self._sync_view_toggle_text()
+        # 첫 PDF로 기본 페이지 로드 (초기 표시용)
+        self.pages = load_pdf_pages(
+            self.file_paths[0],
+            progress_cb=self._wrap_progress(0, 40, "PDF 로딩 중...", progress_cb),
+        )[:page_count]
 
-            self.auto_detect(
+        self._reset_state_for_new_pdf()
+        self._update_page_size()
+        self.update_canvas()
+        self._sync_view_toggle_text()
+
+        # 다중 PDF 템플릿 생성 (더 정확한 템플릿)
+        if len(self.file_paths) > 1:
+            multi_templates = generate_ui_templates_multi(
+                self.file_paths,
+                page_count,
+                self.preset.rot_code,
+                self.preset.fine_angle,
                 progress_cb=self._wrap_progress(
-                    60, 40, "체크박스 탐지 중...", progress_cb
-                )
+                    40, 30, "템플릿 병합 중...", progress_cb
+                ),
             )
-            progress_cb(100, "PDF 로드 완료")
-            progress.close()
-            QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
+            if multi_templates:
+                # 병합된 템플릿으로 self.pages 교체
+                new_pages = []
+                for i in range(page_count):
+                    if i in multi_templates:
+                        new_pages.append(multi_templates[i])
+                    elif i < len(self.pages):
+                        new_pages.append(self.pages[i])
+                if new_pages:
+                    self.pages = new_pages
+                    self._update_page_size()
+
+        self.auto_detect(
+            progress_cb=self._wrap_progress(70, 30, "체크박스 탐지 중...", progress_cb)
+        )
+        progress_cb(100, "PDF 로드 완료")
+        progress.close()
+        QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
 
     def change_rotation(self, index: int):
         """메뉴에서 회전 방향을 선택하면 동작합니다."""
@@ -1022,13 +1092,22 @@ class MainWindow(QMainWindow):
             report(mapped, message or "템플릿 생성 중...")
 
         report(0, "템플릿 생성 중...")
-        templates = generate_ui_templates(
-            self.file_paths[0],
-            self.preset.page_count,
-            self.preset.rot_code,
-            self.preset.fine_angle,
-            progress_cb=template_progress,
-        )
+        if len(self.file_paths) > 1:
+            templates = generate_ui_templates_multi(
+                self.file_paths,
+                self.preset.page_count,
+                self.preset.rot_code,
+                self.preset.fine_angle,
+                progress_cb=template_progress,
+            )
+        else:
+            templates = generate_ui_templates(
+                self.file_paths[0],
+                self.preset.page_count,
+                self.preset.rot_code,
+                self.preset.fine_angle,
+                progress_cb=template_progress,
+            )
 
         total_pages = len(self.pages)
         report(70, "체크박스 탐지 중...")

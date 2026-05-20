@@ -224,6 +224,67 @@ def generate_ui_templates(
     return bgr_templates
 
 
+def generate_ui_templates_multi(
+    pdf_paths: list[str],
+    page_count: int,
+    rot_code: int,
+    fine_angle: float,
+    progress_cb=None,
+) -> dict[int, np.ndarray]:
+    """여러 PDF에서 템플릿을 생성하고 병합하여 더 정확한 템플릿을 만듭니다."""
+    if not pdf_paths:
+        return {}
+
+    all_by_local_idx = {i: [] for i in range(page_count)}
+    ref_aligners = None
+
+    for f_i, fpath in enumerate(pdf_paths):
+        try:
+            pages = load_pdf_pages(fpath, gray=True)
+        except Exception:
+            continue
+
+        if not pages or page_count <= 0:
+            continue
+
+        if ref_aligners is None:
+            ref_aligners = [
+                ImageAligner(apply_rotation(p, rot_code, fine_angle))
+                for p in pages[:page_count]
+            ]
+
+        survey_count = _survey_count(len(pages), page_count)
+
+        for survey_idx in range(survey_count):
+            for local_p in range(page_count):
+                global_p = survey_idx * page_count + local_p
+                if global_p >= len(pages):
+                    break
+
+                orig = apply_rotation(pages[global_p], rot_code, fine_angle)
+                aligner = (
+                    ref_aligners[local_p]
+                    if local_p < len(ref_aligners)
+                    else ref_aligners[-1]
+                )
+                aligned = aligner.align(orig)
+                if len(all_by_local_idx[local_p]) < 31:
+                    all_by_local_idx[local_p].append(
+                        cv2.imencode(".png", aligned)[1].tobytes()
+                    )
+
+        if progress_cb:
+            progress_cb(int((f_i + 1) / len(pdf_paths) * 100), "템플릿 병합 중...")
+
+    dynamic_templates = generate_dynamic_templates(all_by_local_idx)
+
+    bgr_templates = {}
+    for k, v in dynamic_templates.items():
+        bgr_templates[k] = cv2.cvtColor(v, cv2.COLOR_GRAY2BGR)
+
+    return bgr_templates
+
+
 def extract_pure_ink_mask(
     target_gray: np.ndarray, template_gray: np.ndarray
 ) -> np.ndarray:
@@ -265,7 +326,7 @@ def extract_ink_info_from_mask(pure_ink_mask: np.ndarray, box: Box) -> tuple[int
 
 
 def evaluate_marks(
-    inks: list[int], areas: list[int], is_contiguous: bool
+    inks: list[int], areas: list[int], is_contiguous: bool, strict: bool = False
 ) -> list[bool]:
     if not inks:
         return []
@@ -275,10 +336,17 @@ def evaluate_marks(
         net_inks = [max(0, ink - min_ink) for ink in inks]
         max_net = max(net_inks)
 
-        if is_contiguous:
-            return [(net > 15) and (net >= max_net * 0.3) for net in net_inks]
+        if strict:
+            # 중복 허용 모드: 꼬리 침범 방지를 위해 임계값 상향
+            abs_thresh = 20
+            rel_thresh = 0.45 if is_contiguous else 0.30
         else:
-            return [(net > 5) and (net >= max_net * 0.15) for net in net_inks]
+            abs_thresh = 15 if is_contiguous else 5
+            rel_thresh = 0.3 if is_contiguous else 0.15
+
+        return [
+            (net > abs_thresh) and (net >= max_net * rel_thresh) for net in net_inks
+        ]
 
     ink, area = inks[0], areas[0]
     is_ticked = (ink > 10) or (area > 0 and (ink / area) >= 0.01)
@@ -322,7 +390,7 @@ def _survey_count(total_pages: int, page_count: int) -> int:
 def _select_working_boxes(
     field, z_sorted_boxes: list[Box], is_contiguous: bool, all_boxes: list[Box]
 ) -> list[Box]:
-    if field.is_comment or is_contiguous:
+    if field.is_comment or is_contiguous or field.allow_duplicates:
         return [copy.copy(b) for b in z_sorted_boxes]
 
     return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=3.0)
@@ -404,7 +472,9 @@ def process_survey_data(
                 for ink, area in zip(inks, areas)
             ]
         else:
-            check_results = evaluate_marks(inks, areas, is_contiguous)
+            check_results = evaluate_marks(
+                inks, areas, is_contiguous, strict=field.allow_duplicates
+            )
 
         if field.is_comment:
             has_comment = False
