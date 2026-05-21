@@ -1,0 +1,463 @@
+﻿<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>3. PDF 불러오기</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+                background: #f5f7fa;
+                color: #222;
+                line-height: 1.8;
+            }
+            .wrap {
+                max-width: 860px;
+                margin: 0 auto;
+                padding: 30px 20px 80px;
+            }
+            .nav {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 24px;
+            }
+            .nav a {
+                color: #3f51b5;
+                text-decoration: none;
+                font-size: 14px;
+                padding: 6px 14px;
+                border-radius: 8px;
+                border: 1px solid #c5cae9;
+            }
+            .nav a:hover {
+                background: #e8eaf6;
+            }
+            .card {
+                background: #fff;
+                border-radius: 16px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+                padding: 32px;
+                margin-bottom: 28px;
+            }
+            .card h2 {
+                font-size: 22px;
+                color: #1a237e;
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .card h2 .num {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                background: #1a237e;
+                color: #fff;
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+            .card h3 {
+                font-size: 17px;
+                color: #333;
+                margin: 20px 0 8px;
+            }
+            .card p,
+            .card li {
+                font-size: 15px;
+                color: #444;
+            }
+            .card ul,
+            .card ol {
+                padding-left: 22px;
+                margin: 8px 0;
+            }
+            .card li {
+                margin-bottom: 6px;
+            }
+            .good {
+                background: #e8f5e9;
+                border-left: 4px solid #4caf50;
+                padding: 14px 18px;
+                border-radius: 8px;
+                margin: 14px 0;
+                font-size: 14px;
+            }
+            .fig {
+                text-align: center;
+                margin: 18px 0;
+                background: #fafbfc;
+                border-radius: 12px;
+                padding: 16px;
+                border: 1px solid #e8ecf0;
+            }
+            .fig svg {
+                max-width: 100%;
+                height: auto;
+            }
+            .fig .cap {
+                margin-top: 8px;
+                font-size: 13px;
+                color: #777;
+            }
+            .footer {
+                text-align: center;
+                color: #999;
+                font-size: 13px;
+                margin-top: 40px;
+            }
+            .btn-blue {
+                fill: #2196f3;
+            }
+            .btn-green {
+                fill: #4caf50;
+            }
+            @media (max-width: 600px) {
+                .card {
+                    padding: 20px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="nav">
+                <a href="2_실행_방법.html">◀ 이전: 실행 방법</a>
+                <a href="../설명서.html">목차</a>
+                <a href="4_체크박스_자동_찾기.html">다음: 체크박스 자동 찾기 ▶</a>
+            </div>
+
+            <div class="card">
+                <h2><span class="num">3</span> PDF 불러오기</h2>
+
+                <h3>PDF 준비하기</h3>
+                <p>
+                    스캔한 설문지 PDF 파일들을 <code>설문지 스캔</code> 폴더나
+                    다른 폴더에 모아주세요.
+                </p>
+
+                <div class="good">
+                    <strong>PDF 준비 꿀팁:</strong><br />
+                    모든 설문지는 <strong>같은 양식</strong>(같은 문항, 같은
+                    위치)이어야 합니다.<br />
+                    스캔은 <strong>200 DPI 이상</strong>으로 해주세요
+                    (선명할수록 인식 잘 됨).<br />
+                    PDF 페이지는 설문지 1장 단위로 끊어주세요.
+                </div>
+
+                <h3>프로그램에서 불러오는 순서</h3>
+                <ol>
+                    <li>
+                        프로그램 왼쪽 위 <strong>파일</strong> 버튼을
+                        클릭합니다.
+                    </li>
+                    <li><strong>PDF 불러오기</strong>를 클릭합니다.</li>
+                    <li>
+                        컴퓨터에서 PDF 파일을 <strong>선택</strong>하고 열기
+                        버튼을 누릅니다.<br />
+                        <span style="font-size: 13px; color: #888"
+                            >Ctrl 키를 누르면 여러 파일을 한 번에 선택할 수
+                            있습니다.</span
+                        >
+                    </li>
+                    <li>
+                        팝업창에 <strong>설문지 1부당 페이지 수</strong>를
+                        입력합니다.<br />
+                        <span style="font-size: 13px; color: #888"
+                            >예: 1장짜리 = 1, 2장짜리 = 2, 앞뒷면 = 2</span
+                        >
+                    </li>
+                    <li>잠시 기다리면 PDF가 화면에 나타납니다!</li>
+                </ol>
+
+                <div class="fig">
+                    <svg viewBox="0 0 600 210" style="max-width: 600px">
+                        <rect
+                            x="10"
+                            y="10"
+                            width="580"
+                            height="190"
+                            rx="12"
+                            fill="#fff"
+                            stroke="#ddd"
+                            stroke-width="1.5"
+                        />
+                        <rect
+                            x="10"
+                            y="10"
+                            width="580"
+                            height="32"
+                            rx="12"
+                            fill="#1a237e"
+                        />
+                        <rect
+                            x="10"
+                            y="30"
+                            width="580"
+                            height="12"
+                            fill="#1a237e"
+                        />
+                        <text
+                            x="30"
+                            y="31"
+                            font-size="13"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            설문지 자동 분석기
+                        </text>
+
+                        <rect
+                            x="20"
+                            y="52"
+                            width="50"
+                            height="24"
+                            rx="5"
+                            fill="#e0e0e0"
+                        />
+                        <text
+                            x="33"
+                            y="68"
+                            font-size="11"
+                            fill="#333"
+                            font-weight="bold"
+                        >
+                            파일
+                        </text>
+
+                        <rect
+                            x="75"
+                            y="52"
+                            width="110"
+                            height="24"
+                            rx="5"
+                            fill="#e3f2fd"
+                            stroke="#1565c0"
+                            stroke-width="1"
+                        />
+                        <text x="87" y="68" font-size="11" fill="#1565c0">
+                            PDF 불러오기
+                        </text>
+                        <line
+                            x1="22"
+                            y1="82"
+                            x2="180"
+                            y2="82"
+                            stroke="#aaa"
+                            stroke-width=".5"
+                        />
+
+                        <rect
+                            x="20"
+                            y="88"
+                            width="95"
+                            height="26"
+                            rx="5"
+                            fill="#2196F3"
+                        />
+                        <text x="38" y="105" font-size="11" fill="#fff">
+                            선택 묶기
+                        </text>
+                        <rect
+                            x="120"
+                            y="88"
+                            width="70"
+                            height="26"
+                            rx="5"
+                            fill="#e0e0e0"
+                        />
+                        <text x="139" y="105" font-size="11" fill="#333">
+                            값 매핑
+                        </text>
+                        <rect
+                            x="195"
+                            y="88"
+                            width="70"
+                            height="26"
+                            rx="5"
+                            fill="#e0e0e0"
+                        />
+                        <text x="214" y="105" font-size="11" fill="#333">
+                            의견 칸
+                        </text>
+                        <rect
+                            x="270"
+                            y="88"
+                            width="70"
+                            height="26"
+                            rx="5"
+                            fill="#f44336"
+                        />
+                        <text x="292" y="105" font-size="11" fill="#fff">
+                            삭제
+                        </text>
+
+                        <rect
+                            x="440"
+                            y="85"
+                            width="130"
+                            height="32"
+                            rx="6"
+                            fill="#4CAF50"
+                        />
+                        <text
+                            x="475"
+                            y="106"
+                            font-size="13"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            분석 실행
+                        </text>
+
+                        <text
+                            x="295"
+                            y="145"
+                            text-anchor="middle"
+                            font-size="11"
+                            fill="#999"
+                        >
+                            ──────────────────────────
+                        </text>
+                        <text
+                            x="295"
+                            y="165"
+                            text-anchor="middle"
+                            font-size="11"
+                            fill="#bbb"
+                        >
+                            여기에 PDF 설문지 이미지가 나타납니다
+                        </text>
+                        <text
+                            x="295"
+                            y="183"
+                            text-anchor="middle"
+                            font-size="11"
+                            fill="#999"
+                        >
+                            ──────────────────────────
+                        </text>
+                    </svg>
+                    <div class="cap">파일 &gt; PDF 불러오기 순서로 선택</div>
+                </div>
+
+                <h3>페이지 수 설정 화면</h3>
+                <div class="fig">
+                    <svg viewBox="0 0 400 140" style="max-width: 400px">
+                        <rect
+                            x="10"
+                            y="10"
+                            width="380"
+                            height="120"
+                            rx="10"
+                            fill="#fff"
+                            stroke="#ccc"
+                            stroke-width="1.5"
+                        />
+                        <rect
+                            x="10"
+                            y="10"
+                            width="380"
+                            height="30"
+                            rx="10"
+                            fill="#1a237e"
+                        />
+                        <rect
+                            x="10"
+                            y="30"
+                            width="380"
+                            height="10"
+                            fill="#1a237e"
+                        />
+                        <text
+                            x="200"
+                            y="31"
+                            text-anchor="middle"
+                            font-size="12"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            템플릿 설정
+                        </text>
+                        <text x="30" y="68" font-size="13" fill="#333">
+                            설문지 1부당 페이지 수:
+                        </text>
+                        <rect
+                            x="270"
+                            y="55"
+                            width="50"
+                            height="26"
+                            rx="5"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text
+                            x="295"
+                            y="73"
+                            text-anchor="middle"
+                            font-size="13"
+                            fill="#333"
+                        >
+                            1
+                        </text>
+                        <rect
+                            x="160"
+                            y="95"
+                            width="80"
+                            height="28"
+                            rx="5"
+                            fill="#e0e0e0"
+                        />
+                        <text
+                            x="200"
+                            y="114"
+                            text-anchor="middle"
+                            font-size="12"
+                            fill="#333"
+                        >
+                            취소
+                        </text>
+                        <rect
+                            x="260"
+                            y="95"
+                            width="80"
+                            height="28"
+                            rx="5"
+                            fill="#1976d2"
+                        />
+                        <text
+                            x="300"
+                            y="114"
+                            text-anchor="middle"
+                            font-size="12"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            확인
+                        </text>
+                    </svg>
+                    <div class="cap">팝업창 예시 - 보통 1 또는 2 입력</div>
+                </div>
+            </div>
+
+            <div class="nav">
+                <a href="2_실행_방법.html">◀ 이전: 실행 방법</a>
+                <a href="../설명서.html">목차</a>
+                <a href="4_체크박스_자동_찾기.html">다음: 체크박스 자동 찾기 ▶</a>
+            </div>
+
+            <div class="footer">
+                설문지 자동 분석기 &middot; 3. PDF 불러오기
+            </div>
+        </div>
+    </body>
+</html>

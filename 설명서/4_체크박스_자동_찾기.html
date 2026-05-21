@@ -1,0 +1,130 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4</title>. 체크박스 자동 찾기</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
+  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
+  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
+  .nav a:hover{background:#e8eaf6}
+  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
+  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
+  .card h3{font-size:17px;color:#333;margin:20px 0 8px}
+  .card p,.card li{font-size:15px;color:#444}
+  .card ul,.card ol{padding-left:22px;margin:8px 0}
+  .card li{margin-bottom:6px}
+  .tip{background:#e8eaf6;border-left:4px solid #3f51b5;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .fig{text-align:center;margin:18px 0;background:#fafbfc;border-radius:12px;padding:16px;border:1px solid #e8ecf0}
+  .fig svg{max-width:100%;height:auto}
+  .fig .cap{margin-top:8px;font-size:13px;color:#777}
+  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
+  @media(max-width:600px){.card{padding:20px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="nav">
+  <a href="3_PDF_불러오기.html">◀ 이전: PDF 불러오기</a>
+  <a href="../설명서.html">목차</a>
+  <a href="5_그룹_만들기_문항_묶기.html">다음: 그룹 만들기 ▶</a>
+</div>
+
+<div class="card">
+  <h2><span class="num">4</span> 체크박스 자동 찾기</h2>
+
+  <p>PDF를 불러오면 프로그램이 <strong>자동으로 설문지 안의 체크박스(네모 칸)를 찾아</strong> 파란색 실선 박스로 표시합니다.</p>
+
+  <div class="fig">
+    <svg view</p>Box="0 0 500 250" style="max-width:500px">
+</strong>      <rect x="60" y="15" width="380" height="220" rx="6" fill="#fafafa" stroke="#ddd" stroke-width="1.5"/>
+      <text x="250" y="45" text-anchor="middle" font-size="14" fill="#333" font-weight="bold">2025년 만족도 설문</text>
+      <line x1="100" y1="55" x2="400" y2="55" stroke="#ddd" stroke-width="1"/>
+
+      <text x="80" y="80" font-size="12" fill="#333">1. 서비스에 만족하십니까?</text>
+      <rect x="85" y="90" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <text x="108" y="104" font-size="10" fill="#666">매우만족</text>
+      <rect x="175" y="90" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <text x="198" y="104" font-size="10" fill="#666">만족</text>
+      <rect x="240" y="90" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <text x="263" y="104" font-size="10" fill="#666">보통</text>
+      <rect x="305" y="90" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <text x="328" y="104" font-size="10" fill="#666">불만족</text>
+
+      <line x1="80" y1="120" x2="420" y2="120" stroke="#eee" stroke-width=".5"/>
+
+      <text x="80" y="142" font-size="12" fill="#333">2. 시설 청결도는 어떻습니까?</text>
+      <rect x="85" y="152" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <rect x="175" y="152" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <rect x="240" y="152" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <rect x="305" y="152" width="18" height="18" rx="2" fill="none" stroke="#2196F3" stroke-width="2"/>
+
+      <text x="85" y="200" font-size="10" fill="#2196F3" font-style="italic">파란색 박스 = 프로그램이 자동으로 찾은 체크박스</text>
+    </svg>
+    <div class="cap">실제 화면에서는 파란색 실선 박스로 표시됩니다</div>
+  </div>
+
+  <h3>자동 그룹화 (문항 묶기)</h3>
+  <p>체크박스를 찾은 후, 프로그램이 <strong>자동으로 가까운 체크박스끼리 묶어</strong> 그룹(문항)으로 만들어줍니다.<br>
+  예: 1번 문항의 체크칸 4개가 자동으로 하나의 그룹으로 묶입니다.</p>
+
+  <ul>
+    <li>자동 그룹화된 박스는 <strong>초록색 실선</strong>으로 표시됩니다.</li>
+    <li>그룹명은 자동으로 <strong>"문항 1", "문항 2"</strong> 형식으로 생성됩니다.</li>
+    <li>자동 그룹화가 잘못되었다면 직접 그룹을 수정하거나 다시 묶을 수 있습니다. (다음 페이지 참고)</li>
+  </ul>
+
+  <div class="tip">
+    <strong>자동 그룹화 기준:</strong> 체크박스 사이의 거리와 위치를 분석하여 같은 줄에 가까이 있는 박스끼리 묶습니다.<br>
+    설문지가 깔끔할수록 정확도가 높아집니다.
+  </div>
+
+  <h3>자동 탐지 실패 시 직접 추가</h3>
+  <p>프로그램이 일부 체크박스를 못 찾았다면 <strong>직접 추가</strong>할 수 있습니다:</p>
+  <ul>
+    <li><strong>마우스 왼쪽 버튼</strong>을 누른 채로 드래그하면 파란색 박스가 그려집니다.</li>
+    <li>박스가 체크박스를 덮도록 적당한 크기로 그려주세요.</li>
+    <li>잘못 그린 박스는 <strong>우클릭 드래그</strong>로 영역을 선택한 후 <strong>선택 박스 삭제</strong> 버튼을 누르면 지울 수 있습니다.</li>
+  </ul>
+
+  <div class="fig">
+    <svg viewBox="0 0 400 100" style="max-width:400px">
+      <rect x="10" y="10" width="380" height="80" rx="8" fill="#fafafa" stroke="#ddd" stroke-width="1"/>
+      <text x="40" y="40" font-size="12" fill="#333">좌클릭 드래그 → 새 박스 추가</text>
+      <rect x="220" y="22" width="40" height="30" rx="3" fill="none" stroke="#2196F3" stroke-width="2"/>
+      <text x="270" y="42" font-size="11" fill="#888">파란 박스 생성</text>
+      <text x="40" y="68" font-size="12" fill="#333">우클릭 드래그 → 영역 선택 → 선택 박스 삭제 버튼</text>
+    </svg>
+    <div class="cap">좌클릭 드래그로 박스 추가 / 우클릭 드래그로 영역 선택 후 삭제</div>
+  </div>
+
+  <h3>선택된 박스 색상</h3>
+  <ul>
+    <li><strong>파란색 실선:</strong> 자동 탐지되었거나 직접 추가한 미그룹 박스</li>
+    <li><strong>초록색 실선:</strong> 그룹(문항)으로 묶인 박스</li>
+    <li><strong>노란색 굵은선:</strong> 현재 선택된 박스 (삭제/그룹화 대상)</li>
+  </ul>
+
+  <div class="tip">
+    <strong>화면 확대/축소:</strong> <strong>Ctrl 키</strong>를 누른 채로 마우스 휠을 돌리면 화면을 확대/축소할 수 있습니다.<br>
+    정밀하게 박스를 그리고 싶을 때 유용합니다.
+  </div>
+</div>
+
+<div class="nav">
+  <a href="3_PDF_불러오기.html">◀ 이전: PDF 불러오기</a>
+  <a href="../설명서.html">목차</a>
+  <a href="5_그룹_만들기_문항_묶기.html">다음: 그룹 만들기 ▶</a>
+</div>
+
+<div class="footer">설문지 자동 분석기 &middot; 4. 체크박스 자동 찾기</div>
+
+</div>
+</body>
+</html>
+</h3></p></strong></strong></li></li></strong></strong></h3></strong></strong></strong></strong></strong>

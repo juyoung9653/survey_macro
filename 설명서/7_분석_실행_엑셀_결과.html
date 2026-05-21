@@ -1,0 +1,170 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. 분석 실행 &amp; 엑셀 결과</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
+  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
+  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
+  .nav a:hover{background:#e8eaf6}
+  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
+  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
+  .card h3{font-size:17px;color:#333;margin:20px 0 8px}
+  .card p,.card li{font-size:15px;color:#444}
+  .card ul,.card ol{padding-left:22px;margin:8px 0}
+  .card li{margin-bottom:6px}
+  .good{background:#e8f5e9;border-left:4px solid #4caf50;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .fig{text-align:center;margin:18px 0;background:#fafbfc;border-radius:12px;padding:16px;border:1px solid #e8ecf0}
+  .fig svg{max-width:100%;height:auto}
+  .fig .cap{margin-top:8px;font-size:13px;color:#777}
+  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
+  @media(max-width:600px){.card{padding:20px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="nav">
+  <a href="6_값_매핑_보기_입력.html">◀ 이전: 값 매핑</a>
+  <a href="../설명서.html">목차</a>
+  <a href="8_프리셋_저장_불러오기.html">다음: 프리셋 저장 ▶</a>
+</div>
+
+<div class="card">
+  <h2><span class="num">7</span> 분석 실행 &amp; 엑셀 결과</h2>
+
+  <p>모든 설정(그룹, 값 매핑)이 끝났으면 이제 <strong>실제 분석</strong>을 실행할 차례입니다!</p>
+
+  <h3>분석 실행</h3>
+  <ol>
+    <li>오른쪽 위 <strong>분석 실행</strong> 버튼(초록색)을 클릭합니다.</li>
+    <li>프로그램이 불러온 <strong>모든 PDF 파일</strong>을 하나씩 분석합니다.<br>
+    <span style="font-size:13px;color:#888;">PDF 개수에 따라 1~5분 정도 소요됩니다.</span></li>
+    <li>분석 진행 상황이 프로그레스 바로 표시됩니다.</li>
+    <li>분석이 끝나면 <code>설문지 스캔</code> 폴더 안에 <strong>설문결과.xlsx</strong> 파일이 생성됩니다!</li>
+  </ol>
+
+  <div class="fig">
+    <svg viewBox="0 0 500 130" style="max-width:500px">
+      <rect x="10" y="15" width="480" height="100" rx="12" fill="#fff" stroke="#ddd" stroke-width="1.5"/>
+
+      <rect x="20" y="88" width="95" height="26" rx="5" fill="#e0e0e0"/>
+      <text x="38" y="105" font-size="11" fill="#333">선택 묶기</text>
+      <rect x="120" y="88" width="75" height="26" rx="5" fill="#e0e0e0"/>
+      <text x="139" y="105" font-size="11" fill="#333">값 매핑</text>
+
+      <rect x="370" y="85" width="120" height="32" rx="6" fill="#4CAF50" stroke="#2e7d32" stroke-width="2"/>
+      <text x="400" y="106" font-size="13" fill="#fff" font-weight="bold">▶ 분석 실행</text>
+
+      <text x="250" y="55" text-anchor="middle" font-size="14" fill="#4caf50" font-weight="bold">👉 이 버튼!</text>
+    </svg>
+    <div class="cap">오른쪽 상단의 초록색 분석 실행 버튼</div>
+  </div>
+
+  <h3>엑셀 결과 파일 내용</h3>
+  <p><code>설문결과.xlsx</code> 파일을 열어보면 다음과 같은 시트들이 있습니다:</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 550 260" style="max-width:550px">
+      <rect x="10" y="10" width="530" height="235" rx="10" fill="#fff" stroke="#ccc" stroke-width="1.5"/>
+
+      <rect x="15" y="15" width="120" height="24" rx="4" fill="#4472C4"/>
+      <text x="33" y="32" font-size="11" fill="#fff" font-weight="bold">결과</text>
+      <rect x="140" y="15" width="120" height="24" rx="4" fill="#4472C4"/>
+      <text x="158" y="32" font-size="11" fill="#fff" font-weight="bold">전체 통계</text>
+      <rect x="265" y="15" width="120" height="24" rx="4" fill="#4472C4"/>
+      <text x="283" y="32" font-size="11" fill="#fff" font-weight="bold">급식</text>
+      <rect x="390" y="15" width="120" height="24" rx="4" fill="#4472C4"/>
+      <text x="408" y="32" font-size="11" fill="#fff" font-weight="bold">도서관</text>
+
+      <rect x="15" y="50" width="510" height="180" rx="4" fill="#fff" stroke="#4472C4" stroke-width="1.5"/>
+
+      <rect x="15" y="50" width="510" height="24" rx="4" fill="#4472C4"/>
+      <rect x="15" y="66" width="510" height="8" fill="#4472C4"/>
+      <text x="270" y="67" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">결과 시트</text>
+
+      <line x1="15" y1="80" x2="525" y2="80" stroke="#4472C4" stroke-width="1"/>
+
+      <rect x="15" y="80" width="120" height="24" fill="#d6e4f0" stroke="#4472C4" stroke-width=".5"/>
+      <text x="40" y="96" font-size="11" fill="#1a237e" font-weight="bold">파일명</text>
+      <rect x="135" y="80" width="130" height="24" fill="#d6e4f0" stroke="#4472C4" stroke-width=".5"/>
+      <text x="155" y="96" font-size="11" fill="#1a237e" font-weight="bold">만족도</text>
+      <rect x="265" y="80" width="130" height="24" fill="#d6e4f0" stroke="#4472C4" stroke-width=".5"/>
+      <text x="285" y="96" font-size="11" fill="#1a237e" font-weight="bold">청결도</text>
+      <rect x="395" y="80" width="130" height="24" fill="#d6e4f0" stroke="#4472C4" stroke-width=".5"/>
+      <text x="415" y="96" font-size="11" fill="#1a237e" font-weight="bold">재방문의사</text>
+
+      <line x1="15" y1="104" x2="525" y2="104" stroke="#ddd" stroke-width=".5"/>
+
+      <rect x="15" y="104" width="120" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="30" y="120" font-size="11" fill="#333">급식_1</text>
+      <rect x="135" y="104" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="155" y="120" font-size="11" fill="#333">매우만족</text>
+      <rect x="265" y="104" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="285" y="120" font-size="11" fill="#333">만족</text>
+      <rect x="395" y="104" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="415" y="120" font-size="11" fill="#333">예</text>
+
+      <rect x="15" y="128" width="120" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="30" y="144" font-size="11" fill="#333">급식_2</text>
+      <rect x="135" y="128" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="155" y="144" font-size="11" fill="#333">만족</text>
+      <rect x="265" y="128" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="285" y="144" font-size="11" fill="#333">보통</text>
+      <rect x="395" y="128" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="415" y="144" font-size="11" fill="#333">예</text>
+
+      <rect x="15" y="152" width="120" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="30" y="168" font-size="11" fill="#333">도서관_1</text>
+      <rect x="135" y="152" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="155" y="168" font-size="11" fill="#333">보통</text>
+      <rect x="265" y="152" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="285" y="168" font-size="11" fill="#333">불만족</text>
+      <rect x="395" y="152" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="415" y="168" font-size="11" fill="#333">아니요</text>
+
+      <rect x="15" y="176" width="120" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <text x="30" y="192" font-size="11" fill="#999">...</text>
+      <rect x="135" y="176" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <rect x="265" y="176" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+      <rect x="395" y="176" width="130" height="24" fill="#fff" stroke="#ddd" stroke-width=".5"/>
+
+      <line x1="15" y1="200" x2="525" y2="200" stroke="#4472C4" stroke-width="1"/>
+    </svg>
+    <div class="cap">엑셀 결과 시트 예시 (파일별, 문항별로 정리됨)</div>
+  </div>
+
+  <h3>엑셀 시트별 설명</h3>
+  <ul>
+    <li><strong>결과:</strong> 모든 응답을 파일별로 한 줄씩 나열한 원시 데이터</li>
+    <li><strong>전체 통계:</strong> 모든 응답을 합친 문항별 선택 갯수와 비율(%)</li>
+    <li><strong>파일별 시트:</strong> 각 파일 이름으로 된 시트 - 해당 파일의 응답 통계만 별도로 확인</li>
+  </ul>
+
+  <div class="good">
+    <strong>통계가 자동 계산됩니다!</strong><br>
+    엑셀 파일에는 SUM, COUNTIF 같은 함수가 미리 입력되어 있어서,<br>
+    데이터만 바뀌어도 통계가 자동으로 업데이트됩니다.<br><br>
+    <strong>주의:</strong> <strong>결과</strong> 시트의 데이터를 수정하면<br>
+    <strong>전체 통계</strong> 시트와 <strong>파일별 시트</strong>의 통계도 함께 자동으로 반영됩니다.<br>
+    결과 시트가 모든 시트의 기준이 됩니다.
+  </div>
+</div>
+
+<div class="nav">
+  <a href="6_값_매핑_보기_입력.html">◀ 이전: 값 매핑</a>
+  <a href="../설명서.html">목차</a>
+  <a href="8_프리셋_저장_불러오기.html">다음: 프리셋 저장 ▶</a>
+</div>
+
+<div class="footer">설문지 자동 분석기 &middot; 7. 분석 실행 &amp; 엑셀 결과</div>
+
+</div>
+</body>
+</html>
+</title></p></strong></h3></li></strong></li></strong></li></li></code></strong></h3></code></h3></strong></strong></strong></strong>

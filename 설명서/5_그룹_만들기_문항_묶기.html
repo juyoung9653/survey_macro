@@ -1,0 +1,327 @@
+﻿<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>5. 그룹 만들기 (문항 묶기)</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+                background: #f5f7fa;
+                color: #222;
+                line-height: 1.8;
+            }
+            .wrap {
+                max-width: 860px;
+                margin: 0 auto;
+                padding: 30px 20px 80px;
+            }
+            .nav {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 24px;
+            }
+            .nav a {
+                color: #3f51b5;
+                text-decoration: none;
+                font-size: 14px;
+                padding: 6px 14px;
+                border-radius: 8px;
+                border: 1px solid #c5cae9;
+            }
+            .nav a:hover {
+                background: #e8eaf6;
+            }
+            .card {
+                background: #fff;
+                border-radius: 16px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+                padding: 32px;
+                margin-bottom: 28px;
+            }
+            .card h2 {
+                font-size: 22px;
+                color: #1a237e;
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .card h2 .num {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                background: #1a237e;
+                color: #fff;
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+            .card h3 {
+                font-size: 17px;
+                color: #333;
+                margin: 20px 0 8px;
+            }
+            .card p,
+            .card li {
+                font-size: 15px;
+                color: #444;
+            }
+            .card ul,
+            .card ol {
+                padding-left: 22px;
+                margin: 8px 0;
+            }
+            .card li {
+                margin-bottom: 6px;
+            }
+            .good {
+                background: #e8f5e9;
+                border-left: 4px solid #4caf50;
+                padding: 14px 18px;
+                border-radius: 8px;
+                margin: 14px 0;
+                font-size: 14px;
+            }
+            .fig {
+                text-align: center;
+                margin: 18px 0;
+                background: #fafbfc;
+                border-radius: 12px;
+                padding: 16px;
+                border: 1px solid #e8ecf0;
+            }
+            .fig svg {
+                max-width: 100%;
+                height: auto;
+            }
+            .fig .cap {
+                margin-top: 8px;
+                font-size: 13px;
+                color: #777;
+            }
+            .footer {
+                text-align: center;
+                color: #999;
+                font-size: 13px;
+                margin-top: 40px;
+            }
+            @media (max-width: 600px) {
+                .card {
+                    padding: 20px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="nav">
+                <a href="4_체크박스_자동_찾기.html">◀ 이전: 체크박스 자동 찾기</a>
+                <a href="../설명서.html">목차</a>
+                <a href="6_값_매핑_보기_입력.html">다음: 값 매핑 ▶</a>
+            </div>
+
+            <div class="card">
+                <h2><span class="num">5</span> 그룹 만들기 (문항 묶기)</h2>
+
+                <p>
+                    자동 찾은 체크박스들을
+                    <strong>같은 문항끼리 묶어서</strong> 그룹으로 만들어야
+                    합니다.<br />
+                    예: "만족도" 문항의 4개 체크칸을 하나로 묶기
+                </p>
+
+                <h3>그룹 만드는 순서</h3>
+                <ol>
+                    <li>
+                        묶고 싶은 체크박스들을 <strong>좌클릭</strong>(작은 영역
+                        드래그 또는 클릭)해서 선택합니다.<br />
+                        <span style="font-size: 13px; color: #888"
+                            >선택된 박스는 노란색 굵은선으로 변합니다.</span
+                        >
+                    </li>
+                    <li>
+                        여러 개를 선택할 때는 <strong>Shift 키</strong>를 누른
+                        상태로 좌클릭(작은 영역)하거나
+                        <strong>우클릭 드래그</strong>로 영역을 지정하면 추가
+                        선택됩니다.
+                    </li>
+                    <li>
+                        원하는 박스를 모두 선택했으면
+                        <strong>선택 묶기 (그룹화)</strong> 버튼을 클릭합니다.
+                    </li>
+                    <li>
+                        팝업창에 <strong>그룹 이름</strong>을 입력합니다.<br />
+                        <span style="font-size: 13px; color: #888"
+                            >예: "만족도", "청결도", "재방문의사" 등</span
+                        >
+                    </li>
+                    <li>
+                        확인을 누르면 하나의 그룹(문항)으로 묶입니다!<br />
+                        <span style="font-size: 13px; color: #888"
+                            >묶인 박스들은 초록색 실선으로 표시되고 그룹명이
+                            보입니다.</span
+                        >
+                    </li>
+                </ol>
+
+                <div class="fig">
+                    <svg viewBox="0 0 520 180" style="max-width: 520px">
+                        <rect
+                            x="10"
+                            y="10"
+                            width="500"
+                            height="160"
+                            rx="10"
+                            fill="#fff"
+                            stroke="#ddd"
+                            stroke-width="1.5"
+                        />
+
+                        <text
+                            x="30"
+                            y="40"
+                            font-size="13"
+                            fill="#333"
+                            font-weight="bold"
+                        >
+                            1. 서비스에 만족하십니까?
+                        </text>
+
+                        <rect
+                            x="35"
+                            y="55"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#ffc107"
+                            stroke-width="3"
+                        />
+                        <text x="62" y="72" font-size="11" fill="#666">①</text>
+
+                        <rect
+                            x="95"
+                            y="55"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#ffc107"
+                            stroke-width="3"
+                        />
+                        <text x="122" y="72" font-size="11" fill="#666">②</text>
+
+                        <rect
+                            x="155"
+                            y="55"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#ffc107"
+                            stroke-width="3"
+                        />
+                        <text x="182" y="72" font-size="11" fill="#666">③</text>
+
+                        <rect
+                            x="215"
+                            y="55"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#ffc107"
+                            stroke-width="3"
+                        />
+                        <text x="242" y="72" font-size="11" fill="#666">④</text>
+
+                        <text x="290" y="72" font-size="12" fill="#ffc107">
+                            ← 4개 모두 선택 (좌클릭 또는 Shift+클릭)
+                        </text>
+
+                        <text x="30" y="105" font-size="13" fill="#333">
+                            👇 선택 묶기 (그룹화) 버튼 클릭
+                        </text>
+
+                        <rect
+                            x="30"
+                            y="120"
+                            width="140"
+                            height="28"
+                            rx="5"
+                            fill="#2196F3"
+                        />
+                        <text
+                            x="50"
+                            y="139"
+                            font-size="12"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            선택 묶기 (그룹화)
+                        </text>
+
+                        <text
+                            x="185"
+                            y="139"
+                            font-size="12"
+                            fill="#4caf50"
+                            font-weight="bold"
+                        >
+                            → "만족도" 그룹 생성 완료!
+                        </text>
+                    </svg>
+                    <div class="cap">
+                        선택 → 선택 묶기 (그룹화) → 그룹명 입력
+                    </div>
+                </div>
+
+                <div class="good">
+                    <strong>이해가 안 된다면 이렇게 생각하세요:</strong><br />
+                    설문지 1번 문항에 체크칸이 4개(매우만족/만족/보통/불만족)
+                    있죠?<br />
+                    이 4개의 체크칸을 하나로 묶어서 "이건 1번 문항이야"라고
+                    알려주는 겁니다.
+                </div>
+
+                <h3>의견 칸 지정하기</h3>
+                <p>
+                    체크박스 대신 글로 쓰는 <strong>의견란</strong>이 있다면,
+                    해당 그룹을 의견 칸으로 지정할 수 있습니다.
+                </p>
+                <ul>
+                    <li>
+                        <strong>의견 칸으로 지정</strong> 버튼을 누르고 목록에서
+                        그룹을 선택하세요.
+                    </li>
+                    <li>
+                        엑셀 결과 시트에는 해당 문항의 <strong>유무</strong>(작성 있음/없음)가
+                        <strong>"O" / "X"</strong>로 기록됩니다.
+                    </li>
+                    <li>
+                        실제 작성된 의견 텍스트는 <strong>의견.pdf</strong> 파일로
+                        따로 저장됩니다.
+                    </li>
+                </ul>
+            </div>
+
+            <div class="nav">
+                <a href="4_체크박스_자동_찾기.html">◀ 이전: 체크박스 자동 찾기</a>
+                <a href="../설명서.html">목차</a>
+                <a href="6_값_매핑_보기_입력.html">다음: 값 매핑 ▶</a>
+            </div>
+
+            <div class="footer">설문지 자동 분석기 &middot; 5. 그룹 만들기</div>
+        </div>
+    </body>
+</html>
+</title></p></strong></h3></li></strong></li></strong></strong></li></strong></li></strong></li></strong></h3></p></strong></strong></li></strong>

@@ -1,0 +1,120 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8. 프리셋 저장 / 불러오기</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
+  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
+  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
+  .nav a:hover{background:#e8eaf6}
+  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
+  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
+  .card h3{font-size:17px;color:#333;margin:20px 0 8px}
+  .card p,.card li{font-size:15px;color:#444}
+  .card ul,.card ol{padding-left:22px;margin:8px 0}
+  .card li{margin-bottom:6px}
+  .good{background:#e8f5e9;border-left:4px solid #4caf50;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .fig{text-align:center;margin:18px 0;background:#fafbfc;border-radius:12px;padding:16px;border:1px solid #e8ecf0}
+  .fig svg{max-width:100%;height:auto}
+  .fig .cap{margin-top:8px;font-size:13px;color:#777}
+  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
+  @media(max-width:600px){.card{padding:20px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="nav">
+  <a href="7_분석_실행_엑셀_결과.html">◀ 이전: 분석 실행</a>
+  <a href="../설명서.html">목차</a>
+  <a href="9_검토용_폴더.html">다음: 검토용 폴더 ▶</a>
+</div>
+
+<div class="card">
+  <h2><span class="num">8</span> 프리셋 저장 / 불러오기</h2>
+
+  <p>한 번 만든 <strong>그룹 설정과 값 매핑을 저장</strong>해두면, 다음에 같은 설문지를 분석할 때 다시 설정할 필요가 없습니다.</p>
+
+  <h3>프리셋 저장하기</h3>
+  <ol>
+    <li>메뉴에서 <strong>파일 &gt; 프리셋 &gt; 저장</strong> 또는 <strong>다른 이름으로 저장</strong>을 선택합니다.</li>
+    <li>프리셋 이름을 입력합니다. (예: "급식 만족도", "도서관 이용자 조사")</li>
+    <li>저장을 누르면 설정이 저장됩니다.</li>
+  </ol>
+
+  <div class="good">
+    <strong>저장되는 내용:</strong><br>
+    그룹(문항) 구성, 값 매핑, 체크박스 위치, 회전 설정, 페이지 수<br>
+    즉, PDF 불러오기 + 분석 실행만 하면 바로 결과가 나옵니다!
+  </div>
+
+  <h3>프리셋 불러오기</h3>
+  <ol>
+    <li><strong>파일 &gt; 프리셋 &gt; 불러오기</strong>를 선택합니다.</li>
+    <li>목록에서 원하는 프리셋을 선택합니다.</li>
+    <li>프리셋이 적용된 상태로 <strong>PDF 불러오기</strong>만 하면 바로 분석 준비 완료!</li>
+  </ol>
+
+  <div class="fig">
+    <svg viewBox="0 0 420 180" style="max-width:420px">
+      <rect x="10" y="10" width="400" height="160" rx="10" fill="#fff" stroke="#ddd" stroke-width="1.5"/>
+
+      <rect x="20" y="20" width="50" height="24" rx="5" fill="#e0e0e0"/>
+      <text x="33" y="36" font-size="11" fill="#333" font-weight="bold">파일</text>
+
+      <rect x="75" y="20" width="90" height="24" rx="5" fill="#fff" stroke="#bbb" stroke-width=".5"/>
+      <text x="90" y="36" font-size="11" fill="#333">PDF 불러오기</text>
+
+      <rect x="75" y="48" width="90" height="24" rx="5" fill="#fff" stroke="#bbb" stroke-width=".5"/>
+      <text x="90" y="64" font-size="11" fill="#333">페이지 설정  ▸</text>
+
+      <rect x="75" y="76" width="90" height="28" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1"/>
+      <text x="90" y="94" font-size="11" fill="#1565c0" font-weight="bold">프리셋  ▸</text>
+
+      <rect x="170" y="76" width="100" height="28" rx="5" fill="#fff" stroke="#bbb" stroke-width=".5"/>
+      <text x="182" y="94" font-size="11" fill="#333">저장</text>
+
+      <line x1="172" y1="108" x2="268" y2="108" stroke="#ddd" stroke-width=".5"/>
+
+      <rect x="170" y="108" width="100" height="24" rx="5" fill="#fff" stroke="#bbb" stroke-width=".5"/>
+      <text x="182" y="124" font-size="11" fill="#333">다른 이름으로 저장</text>
+
+      <rect x="170" y="136" width="100" height="24" rx="5" fill="#fff" stroke="#bbb" stroke-width=".5"/>
+      <text x="182" y="152" font-size="11" fill="#333">불러오기</text>
+
+      <text x="290" y="120" font-size="11" fill="#888">← 프리셋 메뉴</text>
+    </svg>
+    <div class="cap">파일 &gt; 프리셋 메뉴</div>
+  </div>
+
+  <h3>언제 프리셋을 쓰면 좋을까?</h3>
+  <ul>
+    <li><strong>매월/매주 정기 설문</strong>을 할 때 (양식이 같으면 설정 재사용)</li>
+    <li><strong>여러 장소</strong>에서 같은 설문지를 수집할 때</li>
+    <li><strong>작년과 같은 설문</strong>을 올해도 할 때</li>
+  </ul>
+
+  <div class="good">
+    <strong>프리셋 활용 팁:</strong><br>
+    프리셋 이름을 설문지 종류별로 저장해두세요.<br>
+    예: "급식_2025", "도서관_2025", "만족도_분기별" 등
+  </div>
+</div>
+
+<div class="nav">
+  <a href="7_분석_실행_엑셀_결과.html">◀ 이전: 분석 실행</a>
+  <a href="../설명서.html">목차</a>
+  <a href="9_검토용_폴더.html">다음: 검토용 폴더 ▶</a>
+</div>
+
+<div class="footer">설문지 자동 분석기 &middot; 8. 프리셋 저장/불러오기</div>
+
+</div>
+</body>
+</html>
+</title></p></strong></h3></li></strong></strong></li></li></strong></h3></strong></li></li></strong></h3></strong></strong></strong></strong>

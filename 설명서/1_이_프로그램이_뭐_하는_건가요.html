@@ -1,0 +1,111 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1. 이 프로그램이 뭐 하는 건가요?</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
+  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
+  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
+  .nav a:hover{background:#e8eaf6}
+  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
+  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
+  .card h3{font-size:17px;color:#333;margin:20px 0 8px}
+  .card p,.card li{font-size:15px;color:#444}
+  .card ul,.card ol{padding-left:22px;margin:8px 0}
+  .card li{margin-bottom:6px}
+  .good{background:#e8f5e9;border-left:4px solid #4caf50;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .tip{background:#e8eaf6;border-left:4px solid #3f51b5;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .warn{background:#fff3e0;border-left:4px solid #ff9800;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
+  .fig{text-align:center;margin:18px 0;background:#fafbfc;border-radius:12px;padding:16px;border:1px solid #e8ecf0}
+  .fig svg{max-width:100%;height:auto}
+  .fig .cap{margin-top:8px;font-size:13px;color:#777}
+  .steps{display:flex;align-items:center;justify-content:center;gap:4px;margin:18px 0;flex-wrap:wrap}
+  .steps .s{background:#e8eaf6;border-radius:10px;padding:8px 14px;font-size:13px;text-align:center;min-width:70px}
+  .steps .arrow{font-size:20px;color:#9fa8da}
+  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
+  @media(max-width:600px){.card{padding:20px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="nav">
+  <a href="../설명서.html">◀ 목차로</a>
+  <a href="2_실행_방법.html">다음: 실행 방법 ▶</a>
+</div>
+
+<div class="card">
+  <h2><span class="num">1</span> 이 프로그램이 뭐 하는 건가요?</h2>
+
+  <p>종이 설문지(OMR 카드처럼 체크하는 양식)를 <strong>스캔해서 PDF</strong>로 만들면, 이 프로그램이 대신 읽어서 결과를 엑셀 파일로 정리해줍니다.</p>
+
+  <div class="steps">
+    <span class="s">스캔 PDF 준비</span>
+    <span class="arrow">→</span>
+    <span class="s">체크박스 자동 탐지</span>
+    <span class="arrow">→</span>
+    <span class="s">문항 그룹핑</span>
+    <span class="arrow">→</span>
+    <span class="s">보기 입력</span>
+    <span class="arrow">→</span>
+    <span class="s">분석 실행</span>
+    <span class="arrow">→</span>
+    <span class="s">엑셀 결과!</span>
+  </div>
+
+  <div class="good">
+    <strong>이런 분들께 딱이에요:</strong><br>
+    종이 만족도 설문지를 많이 돌렸는데 일일이 세기 힘든 분<br>
+    여러 장의 스캔 PDF가 쌓여 있는데 분석이 막막한 분<br>
+    엑셀 함수 다루기 어려워서 자동으로 정리되길 원하는 분
+  </div>
+
+  <div class="fig">
+    <svg viewBox="0 0 700 180" style="max-width:700px">
+      <rect x="10" y="20" width="90" height="60" rx="10" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.5"/>
+      <text x="55" y="47" text-anchor="middle" font-size="12" fill="#1565c0" font-weight="bold">스캔 PDF</text>
+      <text x="55" y="65" text-anchor="middle" font-size="10" fill="#555">여러 파일</text>
+      <line x1="100" y1="50" x2="140" y2="50" stroke="#90caf9" stroke-width="2" marker-end="url(#a)"/>
+      <rect x="140" y="20" width="100" height="60" rx="10" fill="#fff3e0" stroke="#e65100" stroke-width="1.5"/>
+      <text x="190" y="44" text-anchor="middle" font-size="12" fill="#e65100" font-weight="bold">템플릿 만들기</text>
+      <text x="190" y="62" text-anchor="middle" font-size="10" fill="#555">한 번만 설정</text>
+      <line x1="240" y1="50" x2="280" y2="50" stroke="#90caf9" stroke-width="2" marker-end="url(#a)"/>
+      <rect x="280" y="20" width="100" height="60" rx="10" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+      <text x="330" y="44" text-anchor="middle" font-size="12" fill="#2e7d32" font-weight="bold">일괄 분석</text>
+      <text x="330" y="62" text-anchor="middle" font-size="10" fill="#555">모든 PDF 처리</text>
+      <line x1="380" y1="50" x2="420" y2="50" stroke="#90caf9" stroke-width="2" marker-end="url(#a)"/>
+      <rect x="420" y="20" width="100" height="60" rx="10" fill="#fce4ec" stroke="#c62828" stroke-width="1.5"/>
+      <text x="470" y="44" text-anchor="middle" font-size="12" fill="#c62828" font-weight="bold">엑셀 결과</text>
+      <text x="470" y="62" text-anchor="middle" font-size="10" fill="#555">갯수 비율 자동</text>
+      <rect x="560" y="10" width="130" height="155" rx="10" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="1" stroke-dasharray="4"/>
+      <text x="625" y="30" text-anchor="middle" font-size="11" fill="#7b1fa2" font-weight="bold">필요한 것</text>
+      <text x="575" y="52" font-size="10" fill="#333">1. 스캔 PDF 파일</text>
+      <text x="575" y="72" font-size="10" fill="#333">2. 인터넷 연결</text>
+      <text x="575" y="92" font-size="10" fill="#888">(첫 실행 시만 필요)</text>
+      <text x="575" y="115" font-size="10" fill="#333">3. Windows 컴퓨터</text>
+      <text x="575" y="138" font-size="10" fill="#333">4. Python 설치됨</text>
+      <defs><marker id="a" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#90caf9"/></marker></defs>
+    </svg>
+    <div class="cap">전체 작업 흐름</div>
+  </div>
+
+  <h3>실제 활용 예시</h3>
+  <p>학교 급식 만족도 설문, 도서관 이용자 조사, 직원 만족도 조사 등 <strong>체크박스 형태의 설문지</strong>라면 무엇이든 가능합니다.</p>
+  <p>검토용 폴더에 예시 결과물(PDF)이 들어 있으니 참고하세요.</p>
+</div>
+
+<div class="nav">
+  <a href="../설명서.html">◀ 목차로</a>
+  <a href="2_실행_방법.html">다음: 실행 방법 ▶</a>
+</div>
+
+<div class="footer">설문지 자동 분석기 &middot; 1. 소개</div>
+
+</div>
+</body>
+</html>

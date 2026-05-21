@@ -1,0 +1,212 @@
+﻿<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>설문지 자동 분석기 - 사용 설명서</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+                background: #f5f7fa;
+                color: #222;
+                line-height: 1.8;
+            }
+            .wrap {
+                max-width: 860px;
+                margin: 0 auto;
+                padding: 30px 20px 80px;
+            }
+            .hero {
+                background: linear-gradient(135deg, #1a237e, #283593);
+                color: #fff;
+                border-radius: 20px;
+                padding: 50px 40px;
+                margin-bottom: 40px;
+                text-align: center;
+            }
+            .hero h1 {
+                font-size: 32px;
+                margin-bottom: 10px;
+            }
+            .hero p {
+                font-size: 16px;
+                opacity: 0.85;
+            }
+            .hero .icon {
+                font-size: 56px;
+                margin-bottom: 12px;
+            }
+            .card {
+                background: #fff;
+                border-radius: 16px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+                padding: 32px;
+                margin-bottom: 28px;
+            }
+            .card h2 {
+                font-size: 22px;
+                color: #1a237e;
+                margin-bottom: 16px;
+            }
+            .steps {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                margin: 18px 0;
+                flex-wrap: wrap;
+            }
+            .steps .s {
+                background: #e8eaf6;
+                border-radius: 10px;
+                padding: 10px 16px;
+                font-size: 14px;
+                text-align: center;
+                min-width: 80px;
+            }
+            .steps .arrow {
+                font-size: 22px;
+                color: #9fa8da;
+            }
+            .toc-item {
+                display: flex;
+                align-items: center;
+                padding: 14px 16px;
+                border-radius: 12px;
+                margin-bottom: 8px;
+                text-decoration: none;
+                color: #333;
+                transition: all 0.15s;
+                border: 1px solid #e8ecf0;
+            }
+            .toc-item:hover {
+                background: #e8eaf6;
+                border-color: #3f51b5;
+                transform: translateX(4px);
+            }
+            .toc-item .num {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                background: #1a237e;
+                color: #fff;
+                font-size: 14px;
+                flex-shrink: 0;
+                margin-right: 14px;
+            }
+            .toc-item .title {
+                font-size: 16px;
+                font-weight: 600;
+                flex: 1;
+            }
+            .toc-item .sub {
+                font-size: 13px;
+                color: #888;
+            }
+            .footer {
+                text-align: center;
+                color: #999;
+                font-size: 13px;
+                margin-top: 40px;
+            }
+            @media (max-width: 600px) {
+                .hero {
+                    padding: 30px 20px;
+                }
+                .hero h1 {
+                    font-size: 24px;
+                }
+                .card {
+                    padding: 20px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="hero">
+                <div class="icon">📋</div>
+                <h1>설문지 자동 분석기<br />사용 설명서</h1>
+                <p>종이 설문지 스캔 PDF → 체크박스 자동 인식 → 엑셀 결과</p>
+            </div>
+
+            <div class="card">
+                <h2>📑 전체 목차</h2>
+                <p style="margin-bottom: 16px; color: #666">
+                    아래 항목을 클릭하면 해당 설명으로 이동합니다.
+                </p>
+
+                <a
+                    class="toc-item"
+                    href="설명서/1_이_프로그램이_뭐_하는_건가요.html"
+                >
+                    <span class="num">1</span>
+                    <span class="title">이 프로그램이 뭐 하는 건가요?</span>
+                    <span class="sub">전체 흐름 한눈에 보기</span>
+                </a>
+                <a class="toc-item" href="설명서/2_실행_방법.html">
+                    <span class="num">2</span>
+                    <span class="title">실행 방법</span>
+                    <span class="sub">더블클릭만 하면 끝!</span>
+                </a>
+                <a class="toc-item" href="설명서/3_PDF_불러오기.html">
+                    <span class="num">3</span>
+                    <span class="title">PDF 불러오기</span>
+                    <span class="sub">스캔 파일을 프로그램에 올리기</span>
+                </a>
+                <a class="toc-item" href="설명서/4_체크박스_자동_찾기.html">
+                    <span class="num">4</span>
+                    <span class="title">체크박스 자동 찾기</span>
+                    <span class="sub">프로그램이 알아서 체크칸을 찾아줌</span>
+                </a>
+                <a class="toc-item" href="설명서/5_그룹_만들기_문항_묶기.html">
+                    <span class="num">5</span>
+                    <span class="title">그룹 만들기 (문항 묶기)</span>
+                    <span class="sub">같은 문항의 체크박스를 하나로 묶기</span>
+                </a>
+                <a class="toc-item" href="설명서/6_값_매핑_보기_입력.html">
+                    <span class="num">6</span>
+                    <span class="title">값 매핑 (보기 입력)</span>
+                    <span class="sub">①=매우만족, ②=만족... 이름 붙이기</span>
+                </a>
+                <a class="toc-item" href="설명서/7_분석_실행_엑셀_결과.html">
+                    <span class="num">7</span>
+                    <span class="title">분석 실행 &amp; 엑셀 결과</span>
+                    <span class="sub">모든 PDF 분석 → 엑셀 파일 생성</span>
+                </a>
+                <a class="toc-item" href="설명서/8_프리셋_저장_불러오기.html">
+                    <span class="num">8</span>
+                    <span class="title">프리셋 저장 / 불러오기</span>
+                    <span class="sub">한 번 만든 설정을 저장해서 재사용</span>
+                </a>
+                <a class="toc-item" href="설명서/9_검토용_폴더.html">
+                    <span class="num">9</span>
+                    <span class="title">검토용 폴더</span>
+                    <span class="sub">분석 결과물 PDF로 육안 확인</span>
+                </a>
+                <a class="toc-item" href="설명서/10_자주_묻는_질문_FAQ.html">
+                    <span class="num">10</span>
+                    <span class="title">자주 묻는 질문 (FAQ)</span>
+                    <span class="sub">문제 해결 &amp; 꿀팁</span>
+                </a>
+            </div>
+
+            <div class="card" style="text-align: center">
+                <p style="font-size: 24px; margin-bottom: 10px">👇</p>
+                <p style="font-size: 15px; color: #666">
+                    시작하려면 위 1번부터 차례로 읽어보세요!
+                </p>
+            </div>
+
+            <div class="footer">설문지 자동 분석기 &middot; 사용 설명서</div>
+        </div>
+    </body>
+</html>

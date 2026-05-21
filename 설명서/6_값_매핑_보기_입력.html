@@ -1,0 +1,550 @@
+﻿<!doctype html>
+<html lang="ko">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>6. 값 매핑 (보기 입력)</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+                background: #f5f7fa;
+                color: #222;
+                line-height: 1.8;
+            }
+            .wrap {
+                max-width: 860px;
+                margin: 0 auto;
+                padding: 30px 20px 80px;
+            }
+            .nav {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 24px;
+            }
+            .nav a {
+                color: #3f51b5;
+                text-decoration: none;
+                font-size: 14px;
+                padding: 6px 14px;
+                border-radius: 8px;
+                border: 1px solid #c5cae9;
+            }
+            .nav a:hover {
+                background: #e8eaf6;
+            }
+            .card {
+                background: #fff;
+                border-radius: 16px;
+                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+                padding: 32px;
+                margin-bottom: 28px;
+            }
+            .card h2 {
+                font-size: 22px;
+                color: #1a237e;
+                margin-bottom: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .card h2 .num {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                background: #1a237e;
+                color: #fff;
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+            .card h3 {
+                font-size: 17px;
+                color: #333;
+                margin: 20px 0 8px;
+            }
+            .card p,
+            .card li {
+                font-size: 15px;
+                color: #444;
+            }
+            .card ul,
+            .card ol {
+                padding-left: 22px;
+                margin: 8px 0;
+            }
+            .card li {
+                margin-bottom: 6px;
+            }
+            .tip {
+                background: #e8eaf6;
+                border-left: 4px solid #3f51b5;
+                padding: 14px 18px;
+                border-radius: 8px;
+                margin: 14px 0;
+                font-size: 14px;
+            }
+            .fig {
+                text-align: center;
+                margin: 18px 0;
+                background: #fafbfc;
+                border-radius: 12px;
+                padding: 16px;
+                border: 1px solid #e8ecf0;
+            }
+            .fig svg {
+                max-width: 100%;
+                height: auto;
+            }
+            .fig .cap {
+                margin-top: 8px;
+                font-size: 13px;
+                color: #777;
+            }
+            .footer {
+                text-align: center;
+                color: #999;
+                font-size: 13px;
+                margin-top: 40px;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 14px 0;
+                font-size: 14px;
+            }
+            table th,
+            table td {
+                border: 1px solid #ddd;
+                padding: 8px 12px;
+                text-align: center;
+            }
+            table th {
+                background: #1a237e;
+                color: #fff;
+            }
+            table tr:nth-child(even) {
+                background: #f5f5f5;
+            }
+            @media (max-width: 600px) {
+                .card {
+                    padding: 20px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="nav">
+                <a href="5_그룹_만들기_문항_묶기.html">◀ 이전: 그룹 만들기</a>
+                <a href="../설명서.html">목차</a>
+                <a href="7_분석_실행_엑셀_결과.html">다음: 분석 실행 ▶</a>
+            </div>
+
+            <div class="card">
+                <h2><span class="num">6</span> 값 매핑 (보기 입력)</h2>
+
+                <p>
+                    그룹으로 묶은 체크박스 각각에
+                    <strong>어떤 보기인지 이름을 붙이는</strong>
+                    작업입니다.<br />
+                    예: ①=매우만족, ②=만족, ③=보통, ④=불만족
+                </p>
+
+                <h3>값 매핑 순서</h3>
+                <ol>
+                    <li><strong>값 매핑</strong> 버튼을 클릭합니다.</li>
+                    <li>
+                        창이 열리면 왼쪽 위에서 <strong>그룹(문항)</strong>을
+                        선택합니다.
+                    </li>
+                    <li>
+                        각 번호 옆의 빈 칸에
+                        <strong>보기 값을 입력</strong>합니다.<br />
+                        <span style="font-size: 13px; color: #888"
+                            >예: "매우만족", "만족", "보통", "불만족"</span
+                        >
+                    </li>
+                    <li>그룹명도 수정할 수 있습니다.</li>
+                    <li>
+                        모든 그룹의 값을 입력했으면 <strong>확인</strong>을
+                        누릅니다.
+                    </li>
+                </ol>
+
+                <div class="fig">
+                    <svg viewBox="0 0 460 260" style="max-width: 460px">
+                        <rect
+                            x="10"
+                            y="10"
+                            width="440"
+                            height="240"
+                            rx="10"
+                            fill="#fff"
+                            stroke="#ccc"
+                            stroke-width="1.5"
+                        />
+                        <rect
+                            x="10"
+                            y="10"
+                            width="440"
+                            height="30"
+                            rx="10"
+                            fill="#1a237e"
+                        />
+                        <rect
+                            x="10"
+                            y="30"
+                            width="440"
+                            height="10"
+                            fill="#1a237e"
+                        />
+                        <text
+                            x="230"
+                            y="31"
+                            text-anchor="middle"
+                            font-size="12"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            값 매핑
+                        </text>
+
+                        <text x="25" y="62" font-size="11" fill="#555">
+                            그룹 선택:
+                        </text>
+                        <rect
+                            x="95"
+                            y="50"
+                            width="110"
+                            height="22"
+                            rx="4"
+                            fill="#e3f2fd"
+                            stroke="#1565c0"
+                            stroke-width="1"
+                        />
+                        <text x="120" y="65" font-size="11" fill="#1565c0">
+                            만족도
+                        </text>
+
+                        <text x="25" y="92" font-size="11" fill="#555">
+                            그룹명:
+                        </text>
+                        <rect
+                            x="75"
+                            y="80"
+                            width="100"
+                            height="22"
+                            rx="4"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text x="95" y="95" font-size="11" fill="#333">
+                            만족도
+                        </text>
+
+                        <line
+                            x1="25"
+                            y1="112"
+                            x2="435"
+                            y2="112"
+                            stroke="#eee"
+                            stroke-width=".5"
+                        />
+
+                        <text
+                            x="30"
+                            y="132"
+                            font-size="11"
+                            fill="#888"
+                            font-weight="bold"
+                        >
+                            번호
+                        </text>
+                        <text
+                            x="120"
+                            y="132"
+                            font-size="11"
+                            fill="#888"
+                            font-weight="bold"
+                        >
+                            값
+                        </text>
+
+                        <text x="40" y="155" font-size="12" fill="#333">1</text>
+                        <rect
+                            x="90"
+                            y="143"
+                            width="120"
+                            height="22"
+                            rx="4"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text x="105" y="158" font-size="11" fill="#333">
+                            매우만족
+                        </text>
+
+                        <text x="40" y="182" font-size="12" fill="#333">2</text>
+                        <rect
+                            x="90"
+                            y="170"
+                            width="120"
+                            height="22"
+                            rx="4"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text x="105" y="185" font-size="11" fill="#333">
+                            만족
+                        </text>
+
+                        <text x="40" y="209" font-size="12" fill="#333">3</text>
+                        <rect
+                            x="90"
+                            y="197"
+                            width="120"
+                            height="22"
+                            rx="4"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text x="105" y="212" font-size="11" fill="#333">
+                            보통
+                        </text>
+
+                        <text x="40" y="236" font-size="12" fill="#333">4</text>
+                        <rect
+                            x="90"
+                            y="224"
+                            width="120"
+                            height="22"
+                            rx="4"
+                            fill="#fff"
+                            stroke="#bbb"
+                            stroke-width="1"
+                        />
+                        <text x="105" y="239" font-size="11" fill="#333">
+                            불만족
+                        </text>
+
+                        <rect
+                            x="300"
+                            y="220"
+                            width="60"
+                            height="24"
+                            rx="4"
+                            fill="#e0e0e0"
+                        />
+                        <text
+                            x="330"
+                            y="237"
+                            text-anchor="middle"
+                            font-size="11"
+                            fill="#333"
+                        >
+                            취소
+                        </text>
+                        <rect
+                            x="370"
+                            y="220"
+                            width="60"
+                            height="24"
+                            rx="4"
+                            fill="#1976d2"
+                        />
+                        <text
+                            x="400"
+                            y="237"
+                            text-anchor="middle"
+                            font-size="11"
+                            fill="#fff"
+                            font-weight="bold"
+                        >
+                            확인
+                        </text>
+                    </svg>
+                    <div class="cap">
+                        값 매핑 창 - 번호 옆 빈 칸에 보기 값 입력
+                    </div>
+                </div>
+
+                <div class="tip">
+                    <strong>값을 입력하지 않아도 됩니다.</strong> 빈 칸으로 두면
+                    번호(1, 2, 3...)가 그대로 값으로 사용됩니다.<br />
+                    예: 값을 입력하지 않으면 엑셀에 "1", "2", "3", "4" 로
+                    기록됩니다.<br />
+                    꼭 이름이 필요할 때만 입력하세요.
+                </div>
+
+                <h3>번호 순서 (Z순서)</h3>
+                <p>
+                    체크박스 번호는 화면에서
+                    <strong>위→아래, 왼쪽→오른쪽</strong> 순서(Z순서)로
+                    매겨집니다.
+                </p>
+
+                <div class="fig">
+                    <svg viewBox="0 0 460 140" style="max-width: 460px">
+                        <rect
+                            x="10"
+                            y="10"
+                            width="440"
+                            height="120"
+                            rx="10"
+                            fill="#fff"
+                            stroke="#ccc"
+                            stroke-width="1.5"
+                        />
+                        <text x="30" y="38" font-size="13" fill="#333">
+                            1. 서비스에 만족하십니까?
+                        </text>
+
+                        <rect
+                            x="35"
+                            y="50"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#4caf50"
+                            stroke-width="2"
+                        />
+                        <text
+                            x="62"
+                            y="66"
+                            font-size="12"
+                            fill="#4caf50"
+                            font-weight="bold"
+                        >
+                            1
+                        </text>
+
+                        <rect
+                            x="95"
+                            y="50"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#4caf50"
+                            stroke-width="2"
+                        />
+                        <text
+                            x="122"
+                            y="66"
+                            font-size="12"
+                            fill="#4caf50"
+                            font-weight="bold"
+                        >
+                            2
+                        </text>
+
+                        <rect
+                            x="155"
+                            y="50"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#4caf50"
+                            stroke-width="2"
+                        />
+                        <text
+                            x="182"
+                            y="66"
+                            font-size="12"
+                            fill="#4caf50"
+                            font-weight="bold"
+                        >
+                            3
+                        </text>
+
+                        <rect
+                            x="215"
+                            y="50"
+                            width="22"
+                            height="22"
+                            rx="3"
+                            fill="none"
+                            stroke="#4caf50"
+                            stroke-width="2"
+                        />
+                        <text
+                            x="242"
+                            y="66"
+                            font-size="12"
+                            fill="#4caf50"
+                            font-weight="bold"
+                        >
+                            4
+                        </text>
+
+                        <text x="290" y="66" font-size="11" fill="#888">
+                            ← 위→아래, 왼쪽→오른쪽 순
+                        </text>
+                    </svg>
+                    <div class="cap">
+                        Z순서: 같은 줄 왼쪽부터 차례로 번호 부여
+                    </div>
+                </div>
+
+                <h3>값 매핑 예시</h3>
+                <table>
+                    <tr>
+                        <th>체크 위치</th>
+                        <th>입력할 값</th>
+                    </tr>
+                    <tr>
+                        <td>첫 번째 칸</td>
+                        <td>매우만족</td>
+                    </tr>
+                    <tr>
+                        <td>두 번째 칸</td>
+                        <td>만족</td>
+                    </tr>
+                    <tr>
+                        <td>세 번째 칸</td>
+                        <td>보통</td>
+                    </tr>
+                    <tr>
+                        <td>네 번째 칸</td>
+                        <td>불만족</td>
+                    </tr>
+                </table>
+
+                <h3>중복 허용 (다중 선택)</h3>
+                <p>
+                    하나의 문항에
+                    <strong>여러 개를 체크할 수 있는 경우</strong> (예:
+                    "해당하는 항목을 모두 골라주세요"), 값 매핑 창에서
+                    <strong>중복 허용</strong> 체크박스를 켜주세요.
+                </p>
+
+                <div class="tip">
+                    <strong>팁:</strong> 번호 역순 기능을 켜면 체크박스 순서가
+                    반대로 매핑됩니다. 설문지에 따라 활용하세요.
+                </div>
+            </div>
+
+            <div class="nav">
+                <a href="5_그룹_만들기_문항_묶기.html">◀ 이전: 그룹 만들기</a>
+                <a href="../설명서.html">목차</a>
+                <a href="7_분석_실행_엑셀_결과.html">다음: 분석 실행 ▶</a>
+            </div>
+
+            <div class="footer">설문지 자동 분석기 &middot; 6. 값 매핑</div>
+        </div>
+    </body>
+</html>
