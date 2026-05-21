@@ -555,7 +555,7 @@ def process_survey_data(
 
         if checked_labels:
             output_values = [mv if mv else lbl for lbl, mv in checked_labels]
-            row_data[field.name] = ", ".join(output_values)
+            row_data[field.name] = ",".join(output_values)
         else:
             row_data[field.name] = ""
 
