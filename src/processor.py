@@ -774,7 +774,7 @@ def run_analysis(
         doc_ink.close()
 
     if len(comment_doc) > 0:
-        comment_doc.save(review_folder / "의견.pdf")
+        comment_doc.save("의견.pdf")
     comment_doc.close()
 
     success = export_to_excel(all_results, config)
