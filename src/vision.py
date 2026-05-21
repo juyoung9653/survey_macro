@@ -47,7 +47,9 @@ def load_pdf_pages(
     # 1. 고유 캐시 키 생성 (파일 경로 + 파일 크기 + 마지막 수정 시간 + DPI)
     # 원본 PDF 파일이 수정되거나 해상도(DPI) 설정이 바뀌면 자동으로 새로운 캐시를 생성합니다.
     stat = os.stat(pdf_path)
-    unique_str = f"{os.path.abspath(pdf_path)}_{stat.st_size}_{stat.st_mtime}_{dpi}"
+    unique_str = (
+        f"{os.path.abspath(pdf_path)}_{stat.st_size}_{stat.st_mtime}_{dpi}_{gray}"
+    )
     cache_key = hashlib.md5(unique_str.encode("utf-8")).hexdigest()
 
     # OS의 기본 Temp 폴더 (Windows의 경우 %TEMP%) 내에 전용 캐시 폴더 생성
@@ -141,10 +143,36 @@ class ImageAligner:
 
         # affine transform: rotation + translation + scale, no perspective (no twisting)
         M, _ = cv2.estimateAffine2D(pts2, pts1, ransacReprojThreshold=3.0)
-        if M is not None:
-            return cv2.warpAffine(img, M, (self.ref_w, self.ref_h))
+        if M is None:
+            return self._resize_to_ref(img)
 
-        return self._resize_to_ref(img)
+        # --- ECC 정밀 정합 (sub-pixel refinement) ---
+        # ORB 특징점 기반 affine을 초기값으로, ECC로 픽셀 단위 미세 조정
+        try:
+            criteria = (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                50,
+                1e-6,
+            )
+            # 입력 크기를 ref에 맞춰 resize (ECC는 같은 크기 요구)
+            if gray.shape[:2] != (self.ref_h, self.ref_w):
+                gray = cv2.resize(
+                    gray, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA
+                )
+            M_refined, _ = cv2.findTransformECC(
+                self.ref_gray,
+                gray,
+                M.copy(),
+                cv2.MOTION_AFFINE,
+                criteria,
+                None,
+                5,
+            )
+            M = M_refined
+        except Exception:
+            pass  # ECC 실패 시 ORB 결과 그대로 사용
+
+        return cv2.warpAffine(img, M, (self.ref_w, self.ref_h))
 
 
 def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndarray:

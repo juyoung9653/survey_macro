@@ -75,6 +75,8 @@ class MainCanvas(QGraphicsView):
         self.select_rect = None  # 범위선택용 빨간 점선 박스
 
     def set_image(self, cv_img):
+        if cv_img.ndim == 2:
+            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
         h, w, c = cv_img.shape
         # numpy 배열의 메모리가 QImage에 제대로 유지되도록 복사본 사용
         bytes_per_line = w * c

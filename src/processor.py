@@ -160,18 +160,41 @@ def generate_dynamic_templates(
     for local_p, pages in pages_by_local_idx.items():
         if not pages:
             continue
-        sample_data = pages[:31]
+        sample_data = pages  # 상위에서 이미 50장으로 제한됨
         # PNG 압축된 bytes면 디코딩, raw array면 그대로 사용
         if isinstance(sample_data[0], bytes):
             decoded = [
                 cv2.imdecode(np.frombuffer(d, np.uint8), cv2.IMREAD_GRAYSCALE)
                 for d in sample_data
             ]
+            # 밝기 outlier 필터: 지나치게 어두운 페이지(체크多) 제외
+            decoded = _filter_blank_pages(decoded)
+            if not decoded:
+                continue
             stack = np.stack(decoded, axis=0)
         else:
-            stack = np.stack(sample_data, axis=0)
+            filtered = _filter_blank_pages(sample_data)
+            if not filtered:
+                continue
+            stack = np.stack(filtered, axis=0)
         templates[local_p] = np.median(stack, axis=0).astype(np.uint8)
     return templates
+
+
+def _filter_blank_pages(
+    images: list[np.ndarray], std_thresh: float = 1.5
+) -> list[np.ndarray]:
+    """평균보다 현저히 어두운(잉크 많은) 이미지를 제외하고 깨끗한 페이지만 반환."""
+    if len(images) <= 3:
+        return images  # 표본 적으면 필터 의미 없음
+    means = np.array([np.mean(img) for img in images])
+    mean_of_means = np.mean(means)
+    std_of_means = np.std(means)
+    if std_of_means == 0:
+        return images
+    # 밝기 임계값: 평균 - N*표준편차 보다 어두우면 outlier
+    threshold = mean_of_means - std_thresh * std_of_means
+    return [img for img, m in zip(images, means) if m >= threshold]
 
 
 def generate_ui_templates(
@@ -209,7 +232,7 @@ def generate_ui_templates(
             aligner = aligners[local_p] if local_p < len(aligners) else aligners[-1]
 
             aligned = aligner.align(orig)
-            if len(pages_by_local_idx[local_p]) < 31:
+            if len(pages_by_local_idx[local_p]) < 50:
                 pages_by_local_idx[local_p].append(
                     cv2.imencode(".png", aligned)[1].tobytes()
                 )
@@ -268,7 +291,7 @@ def generate_ui_templates_multi(
                     else ref_aligners[-1]
                 )
                 aligned = aligner.align(orig)
-                if len(all_by_local_idx[local_p]) < 31:
+                if len(all_by_local_idx[local_p]) < 50:
                     all_by_local_idx[local_p].append(
                         cv2.imencode(".png", aligned)[1].tobytes()
                     )
@@ -294,7 +317,7 @@ def extract_pure_ink_mask(
 
     diff = cv2.absdiff(blur_template, blur_target)
 
-    _, pure_ink_mask = cv2.threshold(diff, 70, 255, cv2.THRESH_BINARY)
+    _, pure_ink_mask = cv2.threshold(diff, 60, 255, cv2.THRESH_BINARY)
 
     pure_ink_mask = cv2.erode(pure_ink_mask, np.ones((2, 2), np.uint8), iterations=1)
     pure_ink_mask = cv2.dilate(pure_ink_mask, np.ones((3, 3), np.uint8), iterations=1)
@@ -388,9 +411,9 @@ def _survey_count(total_pages: int, page_count: int) -> int:
 
 
 def _select_working_boxes(
-    field, z_sorted_boxes: list[Box], is_contiguous: bool, all_boxes: list[Box]
+    field, z_sorted_boxes: list[Box], all_boxes: list[Box]
 ) -> list[Box]:
-    if field.is_comment or is_contiguous or field.allow_duplicates:
+    if field.is_comment or field.allow_duplicates:
         return [copy.copy(b) for b in z_sorted_boxes]
 
     return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=2.0)
@@ -463,7 +486,7 @@ def process_survey_data(
         is_contiguous = is_contiguous_group(z_sorted_boxes)
 
         working_boxes = _select_working_boxes(
-            field, z_sorted_boxes, is_contiguous, all_boxes_in_config
+            field, z_sorted_boxes, all_boxes_in_config
         )
 
         inks, areas, valid_boxes = _collect_ink_data(working_boxes, pure_ink_masks)
