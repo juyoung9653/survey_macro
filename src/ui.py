@@ -159,6 +159,45 @@ class MainCanvas(QGraphicsView):
             super().mouseReleaseEvent(event)
 
 
+class _BatchApplyDialog(QDialog):
+    def __init__(self, parent, src_name: str, candidates: list[tuple[int, str]]):
+        super().__init__(parent)
+        self.selected_indices: list[int] = []
+        self.setWindowTitle("일괄 적용 대상 선택")
+        self.setMinimumWidth(350)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"현재 그룹: {src_name}"))
+        layout.addWidget(QLabel("번호 개수가 같은 그룹 (일괄 적용 대상):"))
+
+        self.checkboxes: list[tuple[QCheckBox, int]] = []
+        for idx, name in candidates:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            layout.addWidget(cb)
+            self.checkboxes.append((cb, idx))
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_btn:
+            ok_btn.setText("적용")
+        if cancel_btn:
+            cancel_btn.setText("취소")
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _on_accept(self):
+        self.selected_indices = [idx for cb, idx in self.checkboxes if cb.isChecked()]
+        if not self.selected_indices:
+            QMessageBox.warning(self, "알림", "선택된 그룹이 없습니다.")
+            return
+        self.accept()
+
+
 class ValueMappingDialog(QDialog):
     def __init__(self, parent, fields: list[Field], reverse_numbering: bool):
         super().__init__(parent)
@@ -206,6 +245,13 @@ class ValueMappingDialog(QDialog):
             1, QHeaderView.ResizeMode.Stretch
         )
         layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        self.batch_apply_btn = QPushButton("일괄 적용")
+        self.batch_apply_btn.clicked.connect(self._batch_apply)
+        btn_layout.addWidget(self.batch_apply_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -299,6 +345,29 @@ class ValueMappingDialog(QDialog):
         self.current_group_index = index
         self._load_group(index)
 
+    def _batch_apply(self):
+        self._save_current_group()
+        src_idx = self.current_group_index
+        src_box_count = len(self.fields[src_idx].boxes)
+        src_values = self.working_maps[src_idx]
+
+        candidates = []
+        for i, f in enumerate(self.fields):
+            if i == src_idx:
+                continue
+            if len(f.boxes) == src_box_count:
+                candidates.append((i, f.name))
+
+        if not candidates:
+            QMessageBox.information(self, "알림", "번호 개수가 같은 그룹이 없습니다.")
+            return
+
+        dialog = _BatchApplyDialog(self, self.fields[src_idx].name, candidates)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            for idx in dialog.selected_indices:
+                self.working_maps[idx] = list(src_values)
+            self._load_group(self.current_group_index)
+
     def accept(self):
         self._save_current_group()
         for idx, field in enumerate(self.fields):
@@ -391,6 +460,8 @@ class MainWindow(QMainWindow):
         save_as_action.triggered.connect(self.save_preset_as)
         load_preset_action = preset_menu.addAction("불러오기")
         load_preset_action.triggered.connect(self.load_preset_dialog)
+        delete_preset_action = preset_menu.addAction("삭제")
+        delete_preset_action.triggered.connect(self.delete_preset)
 
         settings_menu = file_menu.addMenu("설정")
         dup_action = settings_menu.addAction("중복 허용")
@@ -804,6 +875,50 @@ class MainWindow(QMainWindow):
             return
         self.current_preset_name = name
         self._apply_loaded_preset(data, preset_name=name)
+
+    def delete_preset(self):
+        names = self._list_config_names()
+        if not names:
+            QMessageBox.information(self, "알림", "저장된 프리셋이 없습니다.")
+            return
+
+        name, ok = QInputDialog.getItem(
+            self, "프리셋 삭제", "삭제할 프리셋 선택:", names, 0, False
+        )
+        if not ok or not name:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "확인",
+            f"프리셋 '{name}'을(를) 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # JSON 파일 삭제
+        json_path = self.preset_dir / f"{name}.json"
+        try:
+            json_path.unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "오류", f"프리셋 삭제 실패: {exc}")
+            return
+
+        # 템플릿 이미지 파일 삭제
+        i = 0
+        while True:
+            tpl_path = self.preset_dir / f"{name}_tpl_p{i}.png"
+            if not tpl_path.exists():
+                break
+            tpl_path.unlink()
+            i += 1
+
+        if self.current_preset_name == name:
+            self.current_preset_name = None
+
+        QMessageBox.information(self, "완료", f"프리셋 '{name}'이(가) 삭제되었습니다.")
 
     def load_preset_dialog(self):
         names = self._list_config_names()

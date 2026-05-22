@@ -3,7 +3,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-# 双击 실행 시 현재 디렉토리가 main.py 위치가 아닐 수 있음
 # src/ 모듈 import를 위해 경로 추가
 _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
