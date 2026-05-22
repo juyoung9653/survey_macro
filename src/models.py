@@ -31,6 +31,7 @@ class Field:
     value_map: list[str] = field(default_factory=list)
     is_comment: bool = False
     allow_duplicates: bool = False
+    show_average: bool = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -39,12 +40,14 @@ class Field:
         value_map = [str(v) for v in raw_map] if isinstance(raw_map, list) else []
         is_comment = bool(data.get("is_comment", False))
         allow_duplicates = bool(data.get("allow_duplicates", False))
+        show_average = bool(data.get("show_average", False))
         return cls(
             name=str(data.get("name", "")),
             boxes=boxes,
             value_map=value_map,
             is_comment=is_comment,
             allow_duplicates=allow_duplicates,
+            show_average=show_average,
         )
 
     def to_dict(self):
@@ -54,6 +57,7 @@ class Field:
             "value_map": self.value_map,
             "is_comment": self.is_comment,
             "allow_duplicates": self.allow_duplicates,
+            "show_average": self.show_average,
         }
 
 

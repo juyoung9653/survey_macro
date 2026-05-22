@@ -39,6 +39,9 @@ if __name__ == "__main__":
     from PyQt6.QtWidgets import QApplication
 
     from src.ui import MainWindow
+    from src.vision import cleanup_old_cache
+
+    cleanup_old_cache()
 
     app = QApplication(sys.argv)
     window = MainWindow()

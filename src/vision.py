@@ -286,3 +286,22 @@ def save_checkbox_cache(
             json.dump(raw, f)
     except Exception:
         pass
+
+
+def cleanup_old_cache(max_days: int = 30):
+    """temp 폴더 내 PDF 캐시 중 max_d일 지난 파일 삭제"""
+    import time
+
+    now = time.time()
+    cutoff = now - max_days * 86400
+    for cache_dir_name in ("pdf_vision_cache", "pdf_checkbox_cache"):
+        cache_dir = os.path.join(tempfile.gettempdir(), cache_dir_name)
+        if not os.path.isdir(cache_dir):
+            continue
+        for fname in os.listdir(cache_dir):
+            fpath = os.path.join(cache_dir, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+            except Exception:
+                pass

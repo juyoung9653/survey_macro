@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGraphicsScene,
     QGraphicsView,
@@ -207,6 +208,7 @@ class ValueMappingDialog(QDialog):
         self.working_maps = [list(f.value_map) for f in fields]
         self.working_names = [f.name for f in fields]
         self.working_allow_duplicates = [f.allow_duplicates for f in fields]
+        self.working_show_average = [f.show_average for f in fields]
         self.row_index_order = []
 
         self.setWindowTitle("값 매핑")
@@ -231,8 +233,12 @@ class ValueMappingDialog(QDialog):
         self.reverse_label = QLabel(f"현재 번호 역순: {reverse_text}")
         layout.addWidget(self.reverse_label)
 
+        check_layout = QHBoxLayout()
         self.duplicate_check = QCheckBox("중복 허용 (다중 선택 가능)")
-        layout.addWidget(self.duplicate_check)
+        check_layout.addWidget(self.duplicate_check)
+        self.average_check = QCheckBox("평균 보기")
+        check_layout.addWidget(self.average_check)
+        layout.addLayout(check_layout)
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
@@ -288,6 +294,13 @@ class ValueMappingDialog(QDialog):
         )
         self.duplicate_check.setChecked(bool(dup))
 
+        avg = (
+            self.working_show_average[index]
+            if index < len(self.working_show_average)
+            else False
+        )
+        self.average_check.setChecked(bool(avg))
+
         values = self.working_maps[index] if index < len(self.working_maps) else []
         self.row_index_order = list(range(box_count))
         if self.reverse_numbering:
@@ -340,6 +353,12 @@ class ValueMappingDialog(QDialog):
             )
         self.working_allow_duplicates[idx] = self.duplicate_check.isChecked()
 
+        if idx >= len(self.working_show_average):
+            self.working_show_average.extend(
+                [False] * (idx - len(self.working_show_average) + 1)
+            )
+        self.working_show_average[idx] = self.average_check.isChecked()
+
     def _on_group_changed(self, index: int):
         self._save_current_group()
         self.current_group_index = index
@@ -366,6 +385,12 @@ class ValueMappingDialog(QDialog):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             for idx in dialog.selected_indices:
                 self.working_maps[idx] = list(src_values)
+                if src_idx < len(self.working_allow_duplicates):
+                    self.working_allow_duplicates[idx] = self.working_allow_duplicates[
+                        src_idx
+                    ]
+                if src_idx < len(self.working_show_average):
+                    self.working_show_average[idx] = self.working_show_average[src_idx]
             self._load_group(self.current_group_index)
 
     def accept(self):
@@ -392,6 +417,13 @@ class ValueMappingDialog(QDialog):
                 else False
             )
             field.allow_duplicates = bool(dup)
+
+            avg = (
+                self.working_show_average[idx]
+                if idx < len(self.working_show_average)
+                else False
+            )
+            field.show_average = bool(avg)
         super().accept()
 
 
@@ -504,6 +536,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "file_menu_btn"):
             self.file_menu_btn.setFixedHeight(group_btn.sizeHint().height())
             btn_layout.addWidget(self.file_menu_btn)
+
+        # 미세 회전 각도 조절
+        btn_layout.addWidget(QLabel("미세 회전:"))
+        self.fine_angle_spin = QDoubleSpinBox()
+        self.fine_angle_spin.setRange(-10.0, 10.0)
+        self.fine_angle_spin.setSingleStep(0.5)
+        self.fine_angle_spin.setDecimals(1)
+        self.fine_angle_spin.setValue(0.0)
+        self.fine_angle_spin.setSuffix("°")
+        self.fine_angle_spin.setFixedWidth(80)
+        self.fine_angle_spin.valueChanged.connect(self.change_fine_angle)
+        btn_layout.addWidget(self.fine_angle_spin)
 
         btn_layout.addWidget(group_btn)
         btn_layout.addWidget(self.value_map_btn)
@@ -731,6 +775,12 @@ class MainWindow(QMainWindow):
             ]
         self.preset.fields = [f for f in self.preset.fields if f.boxes]
 
+    def _sync_fine_angle_spin(self):
+        if hasattr(self, "fine_angle_spin"):
+            self.fine_angle_spin.blockSignals(True)
+            self.fine_angle_spin.setValue(self.preset.fine_angle)
+            self.fine_angle_spin.blockSignals(False)
+
     def _sync_rotation_index(self):
         if self.preset.rot_code in self.ROT_CYCLE:
             self.rot_idx = self.ROT_CYCLE.index(self.preset.rot_code)
@@ -775,6 +825,7 @@ class MainWindow(QMainWindow):
         self.is_a_view = bool(data.get("is_a_view", False))
         self.selected_boxes.clear()
         self._sync_rotation_index()
+        self._sync_fine_angle_spin()
         self._sync_reverse_numbering_state()
 
         saved_templates = self._load_template_images(preset_name) if preset_name else []
@@ -992,6 +1043,14 @@ class MainWindow(QMainWindow):
         progress_cb(100, "PDF 로드 완료")
         progress.close()
         QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
+
+    def change_fine_angle(self, angle: float):
+        """미세 회전 각도 조절 시 동작합니다."""
+        self.preset.fine_angle = angle
+        if not self.pages:
+            return
+        self._update_page_size()
+        self.auto_detect()
 
     def change_rotation(self, index: int):
         """메뉴에서 회전 방향을 선택하면 동작합니다."""

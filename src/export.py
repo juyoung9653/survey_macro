@@ -27,6 +27,27 @@ def _escape_excel_string(s: str) -> str:
     return s.replace('"', '""')
 
 
+def _wrap_text_elements(text: str) -> str:
+    """공백 split → 토큰 글자 수 합(공백 미포함) ≤5 까지 한 줄, 초과 시 줄바꿈."""
+    tokens = text.split()
+    if not tokens:
+        return text
+    lines = []
+    cur = [tokens[0]]
+    cur_len = len(tokens[0])
+    for t in tokens[1:]:
+        if cur_len + len(t) <= 5:
+            cur.append(t)
+            cur_len += len(t)
+        else:
+            lines.append(" ".join(cur))
+            cur = [t]
+            cur_len = len(t)
+    if cur:
+        lines.append(" ".join(cur))
+    return "\n".join(lines)
+
+
 # ── 스타일 상수 ──
 _header_font = Font(bold=True, size=11, color="FFFFFF")
 _header_fill = PatternFill("solid", fgColor="4472C4")
@@ -44,6 +65,7 @@ _thin_border = Border(
     bottom=Side(style="thin"),
 )
 _center_align = Alignment(horizontal="center", vertical="center")
+_wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 RESULT_SHEET = "'결과'"
 OVERALL_SHEET = "'전체 통계'"
@@ -79,7 +101,6 @@ def _write_stats_formulas(
     ws["B1"] = total_formula
     ws["B1"].font = Font(bold=True, size=11, color="1F4E79")
 
-    total_ref = "$B$1"
     row = 3  # 1행=제목, 2행=빈 줄
 
     for field in config.fields:
@@ -118,12 +139,12 @@ def _write_stats_formulas(
             nr_label_formula = f"={OVERALL_SHEET}!${get_column_letter(last_col)}${row}"
             ws.cell(row=row, column=last_col, value=nr_label_formula)
         else:
-            # 전체 통계: 결과 시트 헤더 + 하드코딩 레이블
-            group_formula = f"={RESULT_SHEET}!${col_letter}$1"
-            ws.cell(row=row, column=1, value=group_formula)
+            # 전체 통계: 줄바꿈 적용한 직접 값
+            display_name = _wrap_text_elements(field.name)
+            ws.cell(row=row, column=1, value=display_name)
             for ci, label in enumerate(option_labels):
                 c = ci + 2
-                ws.cell(row=row, column=c, value=label)
+                ws.cell(row=row, column=c, value=_wrap_text_elements(str(label)))
             ws.cell(row=row, column=last_col, value="미응답")
 
         # 스타일
@@ -131,14 +152,14 @@ def _write_stats_formulas(
         cell.font = _group_font
         cell.fill = _group_fill
         cell.border = _thin_border
-        cell.alignment = _center_align
+        cell.alignment = _wrap_align
         for ci in range(n_opts):
             c = ci + 2
             cell = ws.cell(row=row, column=c)
             cell.font = _header_font
             cell.fill = _header_fill
             cell.border = _thin_border
-            cell.alignment = _center_align
+            cell.alignment = _wrap_align
         cell = ws.cell(row=row, column=last_col)
         cell.font = _red_font
         cell.fill = _red_fill
@@ -160,10 +181,11 @@ def _write_stats_formulas(
         for ci in range(n_opts):
             c = ci + 2
             label_ref = f"${get_column_letter(c)}${label_header_row}"
+            label_clean = f'SUBSTITUTE({label_ref},CHAR(10)," ")'
 
             if field.allow_duplicates:
                 inner = (
-                    f'ISNUMBER(SEARCH("," & {label_ref} & ",",'
+                    f'ISNUMBER(SEARCH("," & {label_clean} & ",",'
                     f' "," & ""&{result_col_range} & ","))'
                 )
                 if file_filter:
@@ -176,9 +198,9 @@ def _write_stats_formulas(
             else:
                 if file_filter:
                     escaped_fn = _escape_excel_string(file_filter)
-                    formula = f'=COUNTIFS({result_col_range},{label_ref},{file_col_range},"{escaped_fn}")'
+                    formula = f'=COUNTIFS({result_col_range},{label_clean},{file_col_range},"{escaped_fn}")'
                 else:
-                    formula = f"=COUNTIF({result_col_range},{label_ref})"
+                    formula = f"=COUNTIF({result_col_range},{label_clean})"
 
             cell = ws.cell(row=row, column=c, value=formula)
             cell.fill = _count_fill
@@ -199,9 +221,8 @@ def _write_stats_formulas(
         cell.border = _thin_border
         cell.alignment = _center_align
 
-        # ────────── 행 3: 응답률 ──────────
+        # ────────── 행 3: 응답률 (그룹 내 합계 기준) ──────────
         row += 1
-        pct_row = row
         ws.cell(row=row, column=1, value="응답률")
         cell = ws.cell(row=row, column=1)
         cell.font = Font(bold=True, size=10)
@@ -209,10 +230,14 @@ def _write_stats_formulas(
         cell.border = _thin_border
         cell.alignment = _center_align
 
+        group_sum_ref = (
+            f"SUM($B${count_row}:${get_column_letter(last_col)}${count_row})"
+        )
+
         for ci in range(n_opts):
             c = ci + 2
             count_ref = f"${get_column_letter(c)}${count_row}"
-            formula = f"=IF({total_ref}=0,0,{count_ref}/{total_ref})"
+            formula = f"=IF({group_sum_ref}=0,0,{count_ref}/{group_sum_ref})"
             cell = ws.cell(row=row, column=c, value=formula)
             cell.number_format = "0.0%"
             cell.fill = _pct_fill
@@ -221,7 +246,7 @@ def _write_stats_formulas(
 
         # 미응답률
         nr_count_ref = f"${get_column_letter(last_col)}${count_row}"
-        formula = f"=IF({total_ref}=0,0,{nr_count_ref}/{total_ref})"
+        formula = f"=IF({group_sum_ref}=0,0,{nr_count_ref}/{group_sum_ref})"
         cell = ws.cell(row=row, column=last_col, value=formula)
         cell.number_format = "0.0%"
         cell.fill = _non_resp_fill
@@ -229,11 +254,6 @@ def _write_stats_formulas(
         cell.alignment = _center_align
 
         row += 2  # 빈 구분 행
-
-    # 열 너비
-    ws.column_dimensions["A"].width = 18
-    for ci in range(2, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(ci)].width = 12
 
     return row
 
@@ -295,6 +315,55 @@ def export_to_excel(
                     last_data_row,
                     file_filter=fname,
                 )
+
+            # ── 4. 평균 시트 (평균 보기 필드) ──
+            avg_fields = [
+                f for f in config.fields if f.show_average and not f.is_comment
+            ]
+            if avg_fields:
+                ws_avg = wb.create_sheet("평균")
+                ws_avg.cell(row=1, column=1, value="그룹명")
+                ws_avg.cell(row=1, column=2, value="평균")
+                for c in [1, 2]:
+                    cell = ws_avg.cell(row=1, column=c)
+                    cell.font = _header_font
+                    cell.fill = _header_fill
+                    cell.border = _thin_border
+                    cell.alignment = _center_align
+
+                headers = list(results[0].keys())
+                row = 2
+                for field in avg_fields:
+                    nums = []
+                    for item in results:
+                        val = str(item.get(field.name, "")).strip()
+                        if not val:
+                            continue
+                        try:
+                            idx = field.value_map.index(val)
+                            num = idx + 1
+                        except ValueError:
+                            num = _try_number(val)
+                            if not isinstance(num, (int, float)):
+                                continue
+                        nums.append(num)
+
+                    avg_val = sum(nums) / len(nums) if nums else 0
+                    if avg_val == int(avg_val):
+                        avg_val = int(avg_val)
+                    else:
+                        avg_val = round(avg_val, 2)
+
+                    ws_avg.cell(row=row, column=1, value=field.name)
+                    ws_avg.cell(row=row, column=2, value=avg_val)
+                    for c in [1, 2]:
+                        cell = ws_avg.cell(row=row, column=c)
+                        cell.border = _thin_border
+                        cell.alignment = _center_align
+                    row += 1
+
+                ws_avg.column_dimensions["A"].width = 18
+                ws_avg.column_dimensions["B"].width = 12
 
         wb.save(out_path)
         return True
