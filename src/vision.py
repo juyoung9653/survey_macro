@@ -229,7 +229,78 @@ def auto_detect_checkboxes(
             if 0.1 <= aspect_ratio <= 10.0:
                 boxes.append((int(x), int(y), int(w), int(h)))
 
+    # 8. 중첩 박스 제거 (더 큰 박스 안에 완전히 포함된 작은 박스 삭제)
+    boxes = _remove_nested_boxes(boxes)
+
+    # 9. 고립 박스 제거 (중심에서 선 뻤을 때 만나는 박스 없으면 삭제)
+    boxes = _filter_isolated_boxes(boxes)
+
     return boxes
+
+
+def _remove_nested_boxes(
+    boxes: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """다른 박스 안에 완전히 포함된 내부 박스를 제거합니다."""
+    if len(boxes) <= 1:
+        return boxes
+
+    # 면적 큰 순으로 정렬 (큰 박스가 먼저 오도록)
+    sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    keep = []
+    for box in sorted_boxes:
+        x, y, w, h = box
+        contained = False
+        for other in keep:
+            ox, oy, ow, oh = other
+            if ox <= x and oy <= y and ox + ow >= x + w and oy + oh >= y + h:
+                contained = True
+                break
+        if not contained:
+            keep.append(box)
+    return keep
+
+
+def _filter_isolated_boxes(
+    boxes: list[tuple[int, int, int, int]],
+    size_ratio: float = 0.1,
+) -> list[tuple[int, int, int, int]]:
+    """
+    각 박스 중심에서 x축(가로), y축(세로)으로 선을 뻗어
+    처음 만난 박스와 크기를 비교. 크기 비슷한 박스가 하나도 없으면 제거.
+
+    size_ratio: w/h 각각 이 비율 이내 차이면 크기 비슷한 것으로 간주.
+    """
+    if len(boxes) <= 1:
+        return boxes
+
+    def _size_similar(w, h, w2, h2):
+        return (
+            abs(w - w2) / max(w, w2) <= size_ratio
+            and abs(h - h2) / max(h, h2) <= size_ratio
+        )
+
+    valid = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        cx, cy = x + w / 2, y + h / 2
+
+        hit_x = False  # x축 선이 크기 비슷한 박스를 만남
+        hit_y = False  # y축 선이 크기 비슷한 박스를 만남
+
+        for j, (x2, y2, w2, h2) in enumerate(boxes):
+            if i == j:
+                continue
+            if y2 <= cy <= y2 + h2 and _size_similar(w, h, w2, h2):
+                hit_x = True
+            if x2 <= cx <= x2 + w2 and _size_similar(w, h, w2, h2):
+                hit_y = True
+            if hit_x and hit_y:
+                break
+
+        if hit_x or hit_y:
+            valid.append((x, y, w, h))
+
+    return valid
 
 
 def _checkbox_cache_key(

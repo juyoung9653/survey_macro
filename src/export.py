@@ -321,21 +321,30 @@ def export_to_excel(
                 f for f in config.fields if f.show_average and not f.is_comment
             ]
             if avg_fields:
+                # 파일 목록 수집
+                fname_list: list[str] = []
+                for item in results:
+                    fn = str(item.get("파일명", "")).strip()
+                    if not fn:
+                        fn = "기타"
+                    if fn not in fname_list:
+                        fname_list.append(fn)
+                fname_list.sort()
+
                 ws_avg = wb.create_sheet("평균")
-                ws_avg.cell(row=1, column=1, value="그룹명")
-                ws_avg.cell(row=1, column=2, value="평균")
-                for c in [1, 2]:
-                    cell = ws_avg.cell(row=1, column=c)
+
+                # 헤더 행
+                avg_headers = ["그룹명", "전체 평균"] + fname_list
+                for ci, h in enumerate(avg_headers, 1):
+                    cell = ws_avg.cell(row=1, column=ci, value=h)
                     cell.font = _header_font
                     cell.fill = _header_fill
                     cell.border = _thin_border
                     cell.alignment = _center_align
 
-                headers = list(results[0].keys())
-                row = 2
-                for field in avg_fields:
+                def _calc_avg(items_subset, field) -> int | float:
                     nums = []
-                    for item in results:
+                    for item in items_subset:
                         val = str(item.get(field.name, "")).strip()
                         if not val:
                             continue
@@ -347,23 +356,43 @@ def export_to_excel(
                             if not isinstance(num, (int, float)):
                                 continue
                         nums.append(num)
-
                     avg_val = sum(nums) / len(nums) if nums else 0
                     if avg_val == int(avg_val):
                         avg_val = int(avg_val)
                     else:
                         avg_val = round(avg_val, 2)
+                    return avg_val
 
-                    ws_avg.cell(row=row, column=1, value=field.name)
-                    ws_avg.cell(row=row, column=2, value=avg_val)
-                    for c in [1, 2]:
-                        cell = ws_avg.cell(row=row, column=c)
+                row = 2
+                for field in avg_fields:
+                    cell = ws_avg.cell(row=row, column=1, value=field.name)
+                    cell.border = _thin_border
+                    cell.alignment = _center_align
+
+                    # 전체 평균
+                    overall = _calc_avg(results, field)
+                    cell = ws_avg.cell(row=row, column=2, value=overall)
+                    cell.border = _thin_border
+                    cell.alignment = _center_align
+
+                    # 파일별 평균
+                    for fi, fname in enumerate(fname_list):
+                        items_f = [
+                            item
+                            for item in results
+                            if str(item.get("파일명", "")).strip() == fname
+                        ]
+                        f_avg = _calc_avg(items_f, field)
+                        cell = ws_avg.cell(row=row, column=fi + 3, value=f_avg)
                         cell.border = _thin_border
                         cell.alignment = _center_align
+
                     row += 1
 
                 ws_avg.column_dimensions["A"].width = 18
                 ws_avg.column_dimensions["B"].width = 12
+                for fi in range(len(fname_list)):
+                    ws_avg.column_dimensions[get_column_letter(fi + 3)].width = 14
 
         wb.save(out_path)
         return True

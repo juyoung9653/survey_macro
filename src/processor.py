@@ -731,7 +731,10 @@ def run_analysis(
         row_data, debug_base, ink_base, debug_ann, ink_ann, comment_pages = (
             process_survey_data(survey, config, f_template)
         )
-        all_results.append(row_data)
+        # 모든 항목(파일명/페이지 제외)이 빈 값이면 빈 페이지로 간주하고 결과에서 제외
+        field_values = [v for k, v in row_data.items() if k not in ("파일명", "페이지")]
+        if any(v.strip() for v in field_values):
+            all_results.append(row_data)
 
         for local_p in sorted(debug_base.keys()):
             _build_vector_page(
