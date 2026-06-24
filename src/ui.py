@@ -250,6 +250,7 @@ class ValueMappingDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.Stretch
         )
+        self.table.cellChanged.connect(self._on_cell_changed)
         layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
@@ -299,13 +300,13 @@ class ValueMappingDialog(QDialog):
             if index < len(self.working_show_average)
             else False
         )
-        self.average_check.setChecked(bool(avg))
 
         values = self.working_maps[index] if index < len(self.working_maps) else []
         self.row_index_order = list(range(box_count))
         if self.reverse_numbering:
             self.row_index_order = list(reversed(self.row_index_order))
 
+        self.table.blockSignals(True)
         for row_idx, map_idx in enumerate(self.row_index_order):
             num_item = QTableWidgetItem(str(map_idx + 1))
             num_item.setFlags(num_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -313,6 +314,27 @@ class ValueMappingDialog(QDialog):
 
             value = values[map_idx] if map_idx < len(values) else ""
             self.table.setItem(row_idx, 1, QTableWidgetItem(value))
+        self.table.blockSignals(False)
+
+        # 값이 하나도 없으면 기본적으로 평균 보기 체크
+        all_empty = all(
+            not (self.table.item(r, 1) and self.table.item(r, 1).text().strip())
+            for r in range(box_count)
+        )
+        if all_empty:
+            avg = True
+        self.average_check.setChecked(bool(avg))
+
+    def _on_cell_changed(self, row: int, col: int):
+        if col != 1:
+            return
+        # 값이 하나라도 입력되면 평균 보기 해제
+        has_value = any(
+            (self.table.item(r, 1) and self.table.item(r, 1).text().strip())
+            for r in range(self.table.rowCount())
+        )
+        if has_value:
+            self.average_check.setChecked(False)
 
     def _save_current_group(self):
         if not self.fields:
