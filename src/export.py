@@ -297,26 +297,7 @@ def export_to_excel(
             ws_overall = wb.create_sheet("전체 통계")
             _write_stats_formulas(ws_overall, config, field_col_map, last_data_row)
 
-            # ── 3. 파일별 통계 시트 ──
-            fname_set: set[str] = set()
-            for item in results:
-                fn = str(item.get("파일명", "")).strip()
-                if not fn:
-                    fn = "기타"
-                fname_set.add(fn)
-
-            for fname in sorted(fname_set):
-                sheet_name = fname[:31]
-                ws_f = wb.create_sheet(sheet_name)
-                _write_stats_formulas(
-                    ws_f,
-                    config,
-                    field_col_map,
-                    last_data_row,
-                    file_filter=fname,
-                )
-
-            # ── 4. 평균 시트 (평균 보기 필드) ──
+            # ── 3. 평균 시트 (평균 보기 필드) ──
             avg_fields = [
                 f for f in config.fields if f.show_average and not f.is_comment
             ]
@@ -331,7 +312,7 @@ def export_to_excel(
                         fname_list.append(fn)
                 fname_list.sort()
 
-                ws_avg = wb.create_sheet("평균")
+                ws_avg = wb.create_sheet("평균", index=2)
 
                 # 헤더 행
                 avg_headers = ["그룹명", "전체 평균"] + fname_list
@@ -393,6 +374,25 @@ def export_to_excel(
                 ws_avg.column_dimensions["B"].width = 12
                 for fi in range(len(fname_list)):
                     ws_avg.column_dimensions[get_column_letter(fi + 3)].width = 14
+
+            # ── 4. 파일별 통계 시트 ──
+            fname_set: set[str] = set()
+            for item in results:
+                fn = str(item.get("파일명", "")).strip()
+                if not fn:
+                    fn = "기타"
+                fname_set.add(fn)
+
+            for fname in sorted(fname_set):
+                sheet_name = fname[:31]
+                ws_f = wb.create_sheet(sheet_name)
+                _write_stats_formulas(
+                    ws_f,
+                    config,
+                    field_col_map,
+                    last_data_row,
+                    file_filter=fname,
+                )
 
         wb.save(out_path)
         return True
