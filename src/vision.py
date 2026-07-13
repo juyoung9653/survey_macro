@@ -37,7 +37,7 @@ def _render_single_page(
 
 def load_pdf_pages(
     pdf_path: str,
-    dpi: int = 200,
+    dpi: int = 300,
     max_workers: int = 4,
     progress_cb=None,
     gray: bool = False,
@@ -188,7 +188,7 @@ def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndar
 
 
 def auto_detect_checkboxes(
-    image: np.ndarray, min_w=10, max_w=600, min_h=10, max_h=200
+    image: np.ndarray, min_w=20, max_w=600, min_h=20, max_h=200
 ) -> list[tuple[int, int, int, int]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -308,7 +308,7 @@ def _checkbox_cache_key(
     page_count: int,
     rot_code: int,
     fine_angle: float,
-    dpi: int = 200,
+    dpi: int = 300,
 ) -> str:
     parts = []
     for p in pdf_paths:

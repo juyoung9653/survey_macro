@@ -1,5 +1,6 @@
 import copy
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -575,6 +576,193 @@ def process_survey_data(
     )
 
 
+# ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
+# ── 페이지 렌더링 + 정합 헬퍼 (inner pool에서 호출) ──
+def _render_aligned_page(
+    doc,
+    global_p: int,
+    local_p: int,
+    aligners: list,
+    rot_code: int,
+    fine_angle: float,
+    dpi: int,
+) -> tuple[int, np.ndarray]:
+    page = doc[global_p]
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    page_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+    orig = apply_rotation(page_img, rot_code, fine_angle)
+    a = aligners[local_p] if local_p < len(aligners) else aligners[-1]
+    return local_p, a.align(orig)
+
+
+def _render_survey_pages(
+    doc,
+    survey_idx: int,
+    page_count: int,
+    aligners: list,
+    rot_code: int,
+    fine_angle: float,
+    dpi: int,
+    inner_pool: ThreadPoolExecutor | None,
+) -> dict[int, np.ndarray]:
+    """한 설문의 모든 페이지를 렌더링+정합. inner_pool이 있으면 병렬 처리."""
+    if inner_pool and page_count > 1:
+        futures = {}
+        for local_p in range(page_count):
+            global_p = survey_idx * page_count + local_p
+            if global_p >= len(doc):
+                break
+            future = inner_pool.submit(
+                _render_aligned_page,
+                doc, global_p, local_p, aligners, rot_code, fine_angle, dpi,
+            )
+            futures[future] = local_p
+
+        result: dict[int, np.ndarray] = {}
+        for future in as_completed(futures):
+            local_p, aligned = future.result()
+            result[local_p] = aligned
+        return result
+
+    # 순차 처리 (page_count == 1 또는 pool 미제공)
+    result: dict[int, np.ndarray] = {}
+    for local_p in range(page_count):
+        global_p = survey_idx * page_count + local_p
+        if global_p >= len(doc):
+            break
+        _, aligned = _render_aligned_page(
+            doc, global_p, local_p, aligners, rot_code, fine_angle, dpi
+        )
+        result[local_p] = aligned
+    return result
+
+
+# ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
+def _collect_template_samples(
+    fpath: str,
+    config: TemplatePreset,
+    aligners: list,
+    dpi: int = 300,
+    sample_limit: int = 31,
+) -> tuple[str, dict[int, list[bytes]]]:
+    fname = Path(fpath).stem
+    try:
+        doc = fitz.open(fpath)
+    except Exception as e:
+        print(f"파일 로드 실패 ({fname}): {e}")
+        return fname, {}
+
+    page_count = config.page_count
+    f_pages: dict[int, list[bytes]] = {i: [] for i in range(page_count)}
+    survey_count = _survey_count(len(doc), page_count)
+    limit = min(survey_count, sample_limit)
+
+    # 설문 내 페이지 병렬 처리를 위한 inner pool
+    inner_workers = min(4, page_count)
+    inner_pool = ThreadPoolExecutor(max_workers=inner_workers) if inner_workers > 1 else None
+
+    try:
+        for survey_idx in range(limit):
+            pages = _render_survey_pages(
+                doc, survey_idx, page_count, aligners,
+                config.rot_code, config.fine_angle, dpi, inner_pool,
+            )
+            for local_p, aligned in pages.items():
+                if len(f_pages[local_p]) < sample_limit:
+                    f_pages[local_p].append(cv2.imencode(".png", aligned)[1].tobytes())
+    finally:
+        if inner_pool:
+            inner_pool.shutdown(wait=False)
+        doc.close()
+
+    return fname, f_pages
+
+
+# ── Phase 2 Worker: 파일 1개 전체 분석 (스레드 안전) ──
+def _analyze_single_file(
+    fpath: str,
+    config: TemplatePreset,
+    file_templates: dict[str, dict[int, np.ndarray]],
+    reference_templates: dict[int, np.ndarray],
+    aligners: list,
+    review_folder: Path,
+    dpi: int = 300,
+) -> tuple[str, list[dict], dict[int, np.ndarray]]:
+    fname = Path(fpath).stem
+    try:
+        doc = fitz.open(fpath)
+    except Exception as e:
+        print(f"파일 로드 실패 ({fname}): {e}")
+        return fname, [], {}
+
+    survey_count = _survey_count(len(doc), config.page_count)
+    f_template = file_templates.get(fname, reference_templates)
+    page_count = config.page_count
+    rot_code = config.rot_code
+    fine_angle = config.fine_angle
+
+    out_orig = fitz.open()
+    out_ink = fitz.open()
+    file_results: list[dict] = []
+    comment_pages: dict[int, np.ndarray] = {}
+
+    # 설문 내 페이지 병렬 처리를 위한 inner pool
+    inner_workers = min(4, page_count)
+    inner_pool = ThreadPoolExecutor(max_workers=inner_workers) if inner_workers > 1 else None
+
+    try:
+        for survey_idx in range(survey_count):
+            survey_gray_pages = _render_survey_pages(
+                doc, survey_idx, page_count, aligners,
+                rot_code, fine_angle, dpi, inner_pool,
+            )
+
+            survey_data = {
+                "fname": fname,
+                "row_title": f"{fname}_{survey_idx + 1}p",
+                "gray_pages": survey_gray_pages,
+            }
+
+            row_data, debug_base, ink_base, debug_ann, ink_ann, cp = (
+                process_survey_data(survey_data, config, f_template)
+            )
+
+            field_values = [
+                v for k, v in row_data.items() if k not in ("파일명", "페이지")
+            ]
+            if any(v.strip() for v in field_values):
+                file_results.append(row_data)
+
+            for local_p in sorted(debug_base.keys()):
+                _build_vector_page(
+                    out_orig, debug_base[local_p], debug_ann.get(local_p, [])
+                )
+            for local_p in sorted(ink_base.keys()):
+                _build_vector_page(
+                    out_ink, ink_base[local_p], ink_ann.get(local_p, [])
+                )
+            for local_p in sorted(cp.keys()):
+                comment_pages[local_p] = cp[local_p]
+
+            del row_data, debug_base, ink_base, debug_ann, ink_ann, cp
+            del survey_gray_pages, survey_data
+            gc.collect()
+    finally:
+        if inner_pool:
+            inner_pool.shutdown(wait=False)
+        doc.close()
+
+    # 파일별 출력 PDF 저장 + 해제
+    if len(out_orig) > 0:
+        out_orig.save(review_folder / f"{fname}_원본포함.pdf")
+    out_orig.close()
+    if len(out_ink) > 0:
+        out_ink.save(review_folder / f"{fname}_잉크추출.pdf")
+    out_ink.close()
+
+    return fname, file_results, comment_pages
+
+
 def run_analysis(
     file_paths: list[str],
     template_pages: list,
@@ -590,196 +778,149 @@ def run_analysis(
 
     report_progress(0, "분석 준비 중...")
 
+    # ── 전체 설문 개수 파악 (진행률 표시용) ──
     total_surveys = 0
     for fpath in file_paths:
         try:
             doc = fitz.open(fpath)
-            total_pages = len(doc)
+            total_surveys += _survey_count(len(doc), config.page_count)
             doc.close()
         except Exception:
             continue
-
-        total_surveys += _survey_count(total_pages, config.page_count)
-
     if total_surveys <= 0:
         total_surveys = 1
 
+    num_files = len(file_paths)
+    if num_files == 0:
+        return False
+
+    # ── 페이지 정합기 (모든 스레드에서 읽기 전용으로 공유) ──
     aligners = [
         ImageAligner(apply_rotation(p, config.rot_code, config.fine_angle))
         for p in template_pages[: config.page_count]
     ]
 
-    surveys_data = []
-    # 파일별 템플릿 생성용 데이터: fname -> {local_p: [bytes]}
-    file_pages = {}  # dict[str, dict[int, list[bytes]]]
-    prepared_surveys = 0
+    # ══════════════════════════════════════
+    # Phase 1: 템플릿 샘플 병렬 수집
+    # ══════════════════════════════════════
+    report_progress(0, "템플릿 샘플 수집 중...")
+    sample_results: dict[str, dict[int, list[bytes]]] = {}
+    max_workers = min(8, num_files)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _collect_template_samples, fpath, config, aligners
+            ): fpath
+            for fpath in file_paths
+        }
+        completed = 0
+        for future in as_completed(futures):
+            fname, f_pages = future.result()
+            if f_pages:
+                sample_results[fname] = f_pages
+            completed += 1
+            report_progress(
+                int(completed / num_files * 8),
+                f"템플릿 샘플 수집 중... ({completed}/{num_files})",
+            )
+
+    # ── 템플릿 빌드 + 정렬 (원본 순서 유지) ──
+    report_progress(8, "템플릿 생성 중...")
+    reference_templates: dict[int, np.ndarray] | None = None
+    file_templates: dict[str, dict[int, np.ndarray]] = {}
 
     for fpath in file_paths:
         fname = Path(fpath).stem
-        try:
-            doc = fitz.open(fpath)
-        except Exception as e:
-            print(f"파일 로드 실패 ({fname}): {e}")
+        f_pages = sample_results.get(fname, {})
+        if not f_pages:
+            file_templates[fname] = {}
             continue
 
-        survey_count = _survey_count(len(doc), config.page_count)
-        f_pages = file_pages.setdefault(
-            fname, {i: [] for i in range(config.page_count)}
-        )
-
-        for survey_idx in range(survey_count):
-            survey_gray_pages = {}
-
-            for local_p in range(config.page_count):
-                global_p = survey_idx * config.page_count + local_p
-                if global_p >= len(doc):
-                    break
-
-                # 단일 페이지 렌더링 (직접 gray로 → BGR 대비 1/3 메모리)
-                page = doc[global_p]
-                pix = page.get_pixmap(dpi=200, colorspace=fitz.csGRAY)
-                page_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                    pix.h, pix.w
-                )
-
-                orig = apply_rotation(page_img, config.rot_code, config.fine_angle)
-                aligner = aligners[local_p] if local_p < len(aligners) else aligners[-1]
-                aligned = aligner.align(orig)
-
-                survey_gray_pages[local_p] = aligned
-
-                # 파일별 템플릿용 수집 (파일당 최대 31장)
-                if len(f_pages[local_p]) < 31:
-                    f_pages[local_p].append(cv2.imencode(".png", aligned)[1].tobytes())
-
-            surveys_data.append(
-                {
-                    "fname": fname,
-                    "row_title": f"{fname}_{survey_idx + 1}p",
-                    "gray_pages": {
-                        k: cv2.imencode(".png", v)[1].tobytes()
-                        for k, v in survey_gray_pages.items()
-                    },
-                }
-            )
-            prepared_surveys += 1
-            report_progress(
-                int(prepared_surveys / total_surveys * 40),
-                f"분석 준비 중... ({prepared_surveys}/{total_surveys})",
-            )
-
-        doc.close()
-
-    # 파일별 템플릿 생성 + 첫 파일 기준 정렬
-    report_progress(40, "템플릿 생성 중...")
-    reference_templates = None  # 첫 번째 유효 파일의 템플릿 (gray)
-    file_templates = {}  # fname -> dict[local_p, np.ndarray] (gray)
-
-    for fname, f_pages in file_pages.items():
         file_template = generate_dynamic_templates(f_pages)
         if not file_template:
+            file_templates[fname] = {}
             continue
 
         if reference_templates is None:
             reference_templates = file_template
             file_templates[fname] = file_template
         else:
-            # reference 템플릿에 각 local_p 정렬
-            aligned = {}
+            aligned_tpl: dict[int, np.ndarray] = {}
             for local_p, tpl in file_template.items():
                 if local_p in reference_templates:
-                    aligner = ImageAligner(reference_templates[local_p])
-                    aligned[local_p] = aligner.align(tpl)
+                    a = ImageAligner(reference_templates[local_p])
+                    aligned_tpl[local_p] = a.align(tpl)
                 else:
-                    aligned[local_p] = tpl
-            file_templates[fname] = aligned
+                    aligned_tpl[local_p] = tpl
+            file_templates[fname] = aligned_tpl
+
+    del sample_results
+    gc.collect()
 
     if reference_templates is None:
         print("템플릿 생성에 실패했습니다.")
         return False
 
-    # 템플릿이 없는 파일은 reference로 대체
-    for fname in file_pages:
-        if fname not in file_templates or not file_templates[fname]:
+    for fname in file_templates:
+        if not file_templates[fname]:
             file_templates[fname] = reference_templates
 
-    report_progress(45, "분석 시작 중...")
-
-    # 검토용 템플릿 PDF 저장 (reference 기준)
+    # ── 검토용 템플릿 PDF 저장 ──
     template_pdf = fitz.open()
     for local_p in sorted(reference_templates.keys()):
         _insert_img_into_pdf(template_pdf, reference_templates[local_p], quality=90)
-
     if len(template_pdf) > 0:
         template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
     template_pdf.close()
 
-    all_results = []
-    out_pdfs_original = {}
-    out_pdfs_ink_only = {}
+    # ══════════════════════════════════════
+    # Phase 2: 파일별 분석 병렬 처리
+    # ══════════════════════════════════════
+    report_progress(10, "분석 시작 중...")
+    all_results: list[dict] = []
+    all_comment_pages: list[dict[int, np.ndarray]] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _analyze_single_file,
+                fpath,
+                config,
+                file_templates,
+                reference_templates,
+                aligners,
+                review_folder,
+            ): fpath
+            for fpath in file_paths
+        }
+        completed = 0
+        for future in as_completed(futures):
+            try:
+                fname, file_results, cp = future.result()
+                all_results.extend(file_results)
+                if cp:
+                    all_comment_pages.append(cp)
+            except Exception as e:
+                print(f"분석 실패: {e}")
+            completed += 1
+            report_progress(
+                10 + int(completed / num_files * 88),
+                f"분석 중... ({completed}/{num_files})",
+            )
+
+    # ── 의견 PDF 병합 저장 ──
     comment_doc = fitz.open()
-    processed_surveys = 0
-
-    for survey in surveys_data:
-        fname = survey["fname"]
-        if fname not in out_pdfs_original:
-            out_pdfs_original[fname] = fitz.open()
-            out_pdfs_ink_only[fname] = fitz.open()
-
-        # 파일별 템플릿 적용
-        f_template = file_templates.get(fname, reference_templates)
-        row_data, debug_base, ink_base, debug_ann, ink_ann, comment_pages = (
-            process_survey_data(survey, config, f_template)
-        )
-        # 모든 항목(파일명/페이지 제외)이 빈 값이면 빈 페이지로 간주하고 결과에서 제외
-        field_values = [v for k, v in row_data.items() if k not in ("파일명", "페이지")]
-        if any(v.strip() for v in field_values):
-            all_results.append(row_data)
-
-        for local_p in sorted(debug_base.keys()):
-            _build_vector_page(
-                out_pdfs_original[fname],
-                debug_base[local_p],
-                debug_ann.get(local_p, []),
-            )
-
-        for local_p in sorted(ink_base.keys()):
-            _build_vector_page(
-                out_pdfs_ink_only[fname],
-                ink_base[local_p],
-                ink_ann.get(local_p, []),
-            )
-
-        for local_p in sorted(comment_pages.keys()):
-            _insert_img_into_pdf(comment_doc, comment_pages[local_p])
-
-        del row_data, debug_base, ink_base, debug_ann, ink_ann, comment_pages
-        gc.collect()
-
-        processed_surveys += 1
-        report_progress(
-            45 + int(processed_surveys / total_surveys * 45),
-            f"분석 중... ({processed_surveys}/{total_surveys})",
-        )
-
-    report_progress(95, "결과 저장 중...")
-
-    # 파일별로 바로바로 저장 (fitz.Document가 메모리에 페이지를 계속 쌓지 않도록)
-    for fname in out_pdfs_original.keys():
-        doc_orig = out_pdfs_original[fname]
-        if len(doc_orig) > 0:
-            doc_orig.save(review_folder / f"{fname}_원본포함.pdf")
-        doc_orig.close()
-
-        doc_ink = out_pdfs_ink_only[fname]
-        if len(doc_ink) > 0:
-            doc_ink.save(review_folder / f"{fname}_잉크추출.pdf")
-        doc_ink.close()
-
+    for cp in all_comment_pages:
+        for local_p in sorted(cp.keys()):
+            _insert_img_into_pdf(comment_doc, cp[local_p])
     if len(comment_doc) > 0:
         comment_doc.save("의견.pdf")
     comment_doc.close()
+    del all_comment_pages
 
+    # ── 엑셀 저장 ──
+    report_progress(98, "엑셀 저장 중...")
     success = export_to_excel(all_results, config)
     report_progress(100, "완료")
     return success
