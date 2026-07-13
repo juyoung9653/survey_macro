@@ -965,10 +965,10 @@ class MainWindow(QMainWindow):
             self,
             "확인",
             f"프리셋 '{name}'을(를) 삭제하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         # JSON 파일 삭제
