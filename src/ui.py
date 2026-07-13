@@ -40,6 +40,7 @@ from .vision import (
     ImageAligner,
     apply_rotation,
     auto_detect_checkboxes,
+    clear_all_cache,
     load_checkbox_cache,
     load_pdf_pages,
     save_checkbox_cache,
@@ -521,6 +522,9 @@ class MainWindow(QMainWindow):
         dup_action = settings_menu.addAction("중복 허용")
         dup_action.triggered.connect(self.open_value_mapping)
 
+        cache_action = file_menu.addAction("캐시 삭제")
+        cache_action.triggered.connect(self.clear_cache)
+
         self._sync_rotation_actions()
         self._sync_reverse_numbering_state()
         self._sync_view_toggle_text()
@@ -780,6 +784,7 @@ class MainWindow(QMainWindow):
             "fine_angle": self.preset.fine_angle,
             "rot_code": self.preset.rot_code,
             "reverse_numbering": self.preset.reverse_numbering,
+            "template_dilate_pct": self.preset.template_dilate_pct,
             "is_a_view": self.is_a_view,
             "fields": [f.to_dict() for f in self.preset.fields],
             "pending_boxes": [b.to_dict() for b in self.pending_boxes],
@@ -840,6 +845,7 @@ class MainWindow(QMainWindow):
             fine_angle=float(data.get("fine_angle", 0.0)),
             rot_code=int(data.get("rot_code", -1)),
             reverse_numbering=bool(data.get("reverse_numbering", False)),
+            template_dilate_pct=float(data.get("template_dilate_pct", 0.3)),
             fields=[],
         )
         self.preset.fields = [Field.from_dict(f) for f in data.get("fields", [])]
@@ -1037,6 +1043,7 @@ class MainWindow(QMainWindow):
         self._sync_view_toggle_text()
 
         # 다중 PDF 템플릿 생성 (더 정확한 템플릿)
+        multi_templates = None
         if len(self.file_paths) > 1:
             multi_templates = generate_ui_templates_multi(
                 self.file_paths,
@@ -1060,11 +1067,30 @@ class MainWindow(QMainWindow):
                     self._update_page_size()
 
         self.auto_detect(
-            progress_cb=self._wrap_progress(70, 30, "체크박스 탐지 중...", progress_cb)
+            progress_cb=self._wrap_progress(70, 30, "체크박스 탐지 중...", progress_cb),
+            prebuilt_templates=multi_templates,
         )
         progress_cb(100, "PDF 로드 완료")
         progress.close()
         QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
+
+    def clear_cache(self):
+        """체크박스 탐지 캐시를 모두 삭제하고 재탐지를 수행합니다."""
+        reply = QMessageBox.question(
+            self,
+            "캐시 삭제",
+            "탐지 캐시를 삭제하고 체크박스를 다시 탐지할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        clear_all_cache()
+
+        if self.pages and self.file_paths:
+            self.auto_detect()
+        else:
+            QMessageBox.information(self, "완료", "캐시가 삭제되었습니다.")
 
     def change_fine_angle(self, angle: float):
         """미세 회전 각도 조절 시 동작합니다."""
@@ -1274,10 +1300,12 @@ class MainWindow(QMainWindow):
             self.selected_boxes.clear()
             self.update_canvas()
 
-    def auto_detect(self, progress_cb=None):
+    def auto_detect(self, progress_cb=None, prebuilt_templates=None):
         """
         체크박스를 자동으로 탐지하고, 수평으로 같은 라인에 있는 항목을
         Q1, Q2, Q3 등의 그룹(Field)으로 자동 할당합니다.
+
+        prebuilt_templates: load_pdf에서 이미 생성한 병합 템플릿 (중복 생성 방지)
         """
         if not self.pages or not self.file_paths:
             return
@@ -1318,23 +1346,27 @@ class MainWindow(QMainWindow):
             mapped = int(value * 0.7)
             report(mapped, message or "템플릿 생성 중...")
 
-        report(0, "템플릿 생성 중...")
-        if len(self.file_paths) > 1:
-            templates = generate_ui_templates_multi(
-                self.file_paths,
-                self.preset.page_count,
-                self.preset.rot_code,
-                self.preset.fine_angle,
-                progress_cb=template_progress,
-            )
+        if prebuilt_templates is not None:
+            templates = prebuilt_templates
+            report(0, "병합 템플릿 사용")
         else:
-            templates = generate_ui_templates(
-                self.file_paths[0],
-                self.preset.page_count,
-                self.preset.rot_code,
-                self.preset.fine_angle,
-                progress_cb=template_progress,
-            )
+            report(0, "템플릿 생성 중...")
+            if len(self.file_paths) > 1:
+                templates = generate_ui_templates_multi(
+                    self.file_paths,
+                    self.preset.page_count,
+                    self.preset.rot_code,
+                    self.preset.fine_angle,
+                    progress_cb=template_progress,
+                )
+            else:
+                templates = generate_ui_templates(
+                    self.file_paths[0],
+                    self.preset.page_count,
+                    self.preset.rot_code,
+                    self.preset.fine_angle,
+                    progress_cb=template_progress,
+                )
 
         total_pages = len(self.pages)
         report(70, "체크박스 탐지 중...")

@@ -67,4 +67,5 @@ class TemplatePreset:
     fine_angle: float = 0.0
     rot_code: int = -1
     reverse_numbering: bool = False
+    template_dilate_pct: float = 0.5
     fields: list[Field] = field(default_factory=list)

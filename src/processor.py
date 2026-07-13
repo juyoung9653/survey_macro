@@ -310,16 +310,38 @@ def generate_ui_templates_multi(
 
 
 def extract_pure_ink_mask(
-    target_gray: np.ndarray, template_gray: np.ndarray
+    target_gray: np.ndarray,
+    template_gray: np.ndarray,
+    template_dilate_pct: float = 0.3,
 ) -> np.ndarray:
+    """템플릿 영역을 마스킹 방식으로 제거하고 순수 사용자 잉크만 추출.
 
-    blur_target = cv2.GaussianBlur(target_gray, (3, 3), 0)
-    blur_template = cv2.GaussianBlur(template_gray, (3, 3), 0)
+    absdiff 비교 대신, 템플릿 선 영역을 dilate로 확장한 뒤
+    대상 이미지에서 해당 영역을 통째로 지워(흰색) 잔여물을 방지합니다.
+    """
+    # 1. 템플릿에서 선(어두운 부분) 영역 마스크 생성
+    _, template_mask = cv2.threshold(
+        template_gray, 200, 255, cv2.THRESH_BINARY_INV
+    )
 
-    diff = cv2.absdiff(blur_template, blur_target)
+    # 2. 정합 오차만큼 템플릿 마스크를 확장 (선을 n% 두껍게)
+    dilate_px = max(0, round(template_dilate_pct * 5))
+    if dilate_px > 0:
+        template_mask = cv2.dilate(
+            template_mask,
+            np.ones((3, 3), np.uint8),
+            iterations=dilate_px,
+        )
 
-    _, pure_ink_mask = cv2.threshold(diff, 60, 255, cv2.THRESH_BINARY)
+    # 3. 대상 이미지에서 템플릿 영역을 지움 (흰색=255로)
+    cleaned = target_gray.copy()
+    cleaned[template_mask > 0] = 255
 
+    # 4. 남은 어두운 픽셀이 순수 잉크
+    blur = cv2.GaussianBlur(cleaned, (3, 3), 0)
+    _, pure_ink_mask = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # 5. 모폴로지 노이즈 제거
     pure_ink_mask = cv2.erode(pure_ink_mask, np.ones((2, 2), np.uint8), iterations=1)
     pure_ink_mask = cv2.dilate(pure_ink_mask, np.ones((3, 3), np.uint8), iterations=1)
 
@@ -473,7 +495,9 @@ def process_survey_data(
     pure_ink_masks = {}
     for local_p, gray_img in survey_gray_pages.items():
         if local_p in dynamic_templates:
-            mask = extract_pure_ink_mask(gray_img, dynamic_templates[local_p])
+            mask = extract_pure_ink_mask(
+                gray_img, dynamic_templates[local_p], config.template_dilate_pct
+            )
             pure_ink_masks[local_p] = mask
 
             ink_display = cv2.bitwise_not(mask)

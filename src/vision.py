@@ -188,7 +188,7 @@ def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndar
 
 
 def auto_detect_checkboxes(
-    image: np.ndarray, min_w=20, max_w=600, min_h=20, max_h=200
+    image: np.ndarray, min_w=24, max_w=600, min_h=24, max_h=200
 ) -> list[tuple[int, int, int, int]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -338,6 +338,19 @@ def load_checkbox_cache(
         return result
     except Exception:
         return None
+
+
+def clear_all_cache():
+    """체크박스 캐시와 PDF 페이지 캐시를 모두 삭제합니다."""
+    import shutil
+
+    for cache_dir_name in ("pdf_vision_cache", "pdf_checkbox_cache"):
+        cache_dir = os.path.join(tempfile.gettempdir(), cache_dir_name)
+        if os.path.isdir(cache_dir):
+            try:
+                shutil.rmtree(cache_dir)
+            except Exception:
+                pass
 
 
 def save_checkbox_cache(
