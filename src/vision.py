@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import fitz
 import numpy as np
+from pystackreg import StackReg
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):
@@ -17,8 +18,7 @@ def _report_progress(progress_cb, value: int, message: str = ""):
 def _render_single_page(
     pdf_path: str, page_num: int, dpi: int, gray: bool = False
 ) -> np.ndarray:
-    """멀티스레딩을 위해 개별 스레드에서 문서를 열고 렌더링하는 내부 헬퍼 함수
-    gray=True 시 직접 흑백(2D)으로 렌더링 (BGR 대비 1/3 메모리)"""
+    """Render a single page using its own fitz.Document instance (thread-safe)."""
     doc = fitz.open(pdf_path)
     page = doc[page_num]
     if gray:
@@ -42,42 +42,34 @@ def load_pdf_pages(
     progress_cb=None,
     gray: bool = False,
 ) -> list[np.ndarray]:
-    """PDF를 읽어 OpenCV 이미지 리스트로 반환 (Temp 캐시 및 멀티스레딩 최적화)"""
+    """Load PDF pages as OpenCV images with temp-cache and multi-threading."""
 
-    # 1. 고유 캐시 키 생성 (파일 경로 + 파일 크기 + 마지막 수정 시간 + DPI)
-    # 원본 PDF 파일이 수정되거나 해상도(DPI) 설정이 바뀌면 자동으로 새로운 캐시를 생성합니다.
     stat = os.stat(pdf_path)
     unique_str = (
         f"{os.path.abspath(pdf_path)}_{stat.st_size}_{stat.st_mtime}_{dpi}_{gray}"
     )
     cache_key = hashlib.md5(unique_str.encode("utf-8")).hexdigest()
 
-    # OS의 기본 Temp 폴더 (Windows의 경우 %TEMP%) 내에 전용 캐시 폴더 생성
     cache_dir = os.path.join(tempfile.gettempdir(), "pdf_vision_cache")
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{cache_key}.npz")
 
-    _report_progress(progress_cb, 0, "PDF 로딩 시작")
+    _report_progress(progress_cb, 0, "PDF loading...")
 
-    # 2. 캐시가 존재하면 PDF를 다시 읽지 않고 디스크에서 바로 로드 (초고속)
     if os.path.exists(cache_file):
         try:
             with np.load(cache_file) as data:
-                # np.savez는 arr_0, arr_1 순서로 배열을 저장하므로, 순서에 맞게 정렬하여 불러옵니다.
                 keys = sorted(data.files, key=lambda x: int(x.split("_")[1]))
                 pages = [data[k] for k in keys]
-                _report_progress(progress_cb, 100, "체크박스 자동 생성 중...")
+                _report_progress(progress_cb, 100, "Generating checkboxes...")
                 return pages
         except Exception as e:
-            print(f"캐시 로드 실패, 새로 생성합니다: {e}")
+            print(f"Cache load failed, regenerating: {e}")
 
-    # 3. 캐시가 없을 경우 원본 PDF 처리 (멀티스레딩 적용)
     doc = fitz.open(pdf_path)
     num_pages = len(doc)
     doc.close()
 
-    # ThreadPoolExecutor를 사용해 여러 페이지를 동시에 렌더링합니다.
-    # max_workers는 보통 CPU 코어 수에 맞추는 것이 좋으며, 기본값 4 정도가 안정적입니다.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_render_single_page, pdf_path, p_num, dpi, gray): p_num
@@ -93,27 +85,44 @@ def load_pdf_pages(
             _report_progress(
                 progress_cb,
                 int(completed / num_pages * 100),
-                f"PDF 로딩... ({completed}/{num_pages})",
+                f"PDF loading... ({completed}/{num_pages})",
             )
 
-    # 4. 다음 실행을 위해 결과를 Temp 폴더에 저장 (.npz 확장자)
     try:
-        # 가변 인자(*pages)를 사용해 numpy 배열 리스트를 한 번에 저장합니다.
         np.savez(cache_file, *pages)
     except Exception as e:
-        print(f"캐시 저장 실패: {e}")
+        print(f"Cache save failed: {e}")
 
     return pages
 
 
 class ImageAligner:
+    """TurboReg (pystackreg) based subpixel image alignment.
+
+    Uses RIGID_BODY (rotation + translation, 3 DOF) optimized for scanned documents.
+    Registration runs on downscaled images (short side 800px) for speed,
+    then the transform is scaled up and applied at full resolution via cv2.warpAffine.
+    """
+
+    _REG_SHORT_SIDE = 800
+
     def __init__(self, ref_img: np.ndarray):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
         )
         self.ref_h, self.ref_w = self.ref_gray.shape[:2]
-        self.orb = cv2.ORB_create(2000)
-        self.kp1, self.des1 = self.orb.detectAndCompute(self.ref_gray, None)
+        self.sr = StackReg(StackReg.RIGID_BODY)
+
+        ref_short = min(self.ref_h, self.ref_w)
+        if ref_short > self._REG_SHORT_SIDE:
+            self._scale = self._REG_SHORT_SIDE / ref_short
+            self._ref_small = cv2.resize(
+                self.ref_gray, None, fx=self._scale, fy=self._scale,
+                interpolation=cv2.INTER_AREA
+            ).astype(np.float64)
+        else:
+            self._scale = 1.0
+            self._ref_small = self.ref_gray.astype(np.float64)
 
     def _resize_to_ref(self, img: np.ndarray) -> np.ndarray:
         if img.shape[:2] == (self.ref_h, self.ref_w):
@@ -121,58 +130,34 @@ class ImageAligner:
         return cv2.resize(img, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA)
 
     def align(self, img: np.ndarray) -> np.ndarray:
-        if self.des1 is None:
-            return self._resize_to_ref(img)
-
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        kp2, des2 = self.orb.detectAndCompute(gray, None)
-        if des2 is None:
-            return self._resize_to_ref(img)
 
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = sorted(matcher.match(self.des1, des2), key=lambda m: m.distance)
-        top_matches = matches[: max(4, int(len(matches) * 0.15))]
+        if gray.shape[:2] != (self.ref_h, self.ref_w):
+            gray = cv2.resize(
+                gray, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA
+            )
 
-        if len(top_matches) < 3:
-            return self._resize_to_ref(img)
-
-        pts1 = np.float32([self.kp1[m.queryIdx].pt for m in top_matches]).reshape(
-            -1, 1, 2
-        )
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in top_matches]).reshape(-1, 1, 2)
-
-        # affine transform: rotation + translation + scale, no perspective (no twisting)
-        M, _ = cv2.estimateAffine2D(pts2, pts1, ransacReprojThreshold=3.0)
-        if M is None:
-            return self._resize_to_ref(img)
-
-        # --- ECC 정밀 정합 (sub-pixel refinement) ---
-        # ORB 특징점 기반 affine을 초기값으로, ECC로 픽셀 단위 미세 조정
         try:
-            criteria = (
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                50,
-                1e-6,
-            )
-            # 입력 크기를 ref에 맞춰 resize (ECC는 같은 크기 요구)
-            if gray.shape[:2] != (self.ref_h, self.ref_w):
-                gray = cv2.resize(
-                    gray, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA
-                )
-            M_refined, _ = cv2.findTransformECC(
-                self.ref_gray,
-                gray,
-                M.copy(),
-                cv2.MOTION_AFFINE,
-                criteria,
-                None,
-                5,
-            )
-            M = M_refined
-        except Exception:
-            pass  # ECC 실패 시 ORB 결과 그대로 사용
+            if self._scale < 1.0:
+                gray_small = cv2.resize(
+                    gray, None, fx=self._scale, fy=self._scale,
+                    interpolation=cv2.INTER_AREA
+                ).astype(np.float64)
+            else:
+                gray_small = gray.astype(np.float64)
 
-        return cv2.warpAffine(img, M, (self.ref_w, self.ref_h))
+            tmat_3x3 = self.sr.register(self._ref_small, gray_small)
+
+            if self._scale < 1.0:
+                tmat_3x3[0, 2] /= self._scale
+                tmat_3x3[1, 2] /= self._scale
+
+            M = tmat_3x3[:2, :].astype(np.float32)
+            return cv2.warpAffine(
+                img, M, (self.ref_w, self.ref_h), flags=cv2.INTER_LINEAR
+            )
+        except Exception:
+            return self._resize_to_ref(img)
 
 
 def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndarray:
@@ -192,47 +177,34 @@ def auto_detect_checkboxes(
 ) -> list[tuple[int, int, int, int]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # 1. 적응형 이진화: 스캔본의 그림자나 얼룩을 무시하고 테두리 선만 뚜렷하게 추출
     binary = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 5
     )
 
-    # 2. 가로선/세로선 추출 (작은 체크박스도 잡기 위해 커널 크기를 12로 조정)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 12))
 
     h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
 
-    # 3. 선을 합쳐 표의 뼈대와 체크박스 테두리 완성
     grid = cv2.add(h_lines, v_lines)
-
-    # 4. 스캔 손실로 인해 미세하게 끊어진 선들을 이어줌
     grid = cv2.dilate(grid, np.ones((3, 3), np.uint8), iterations=1)
 
-    # 5. 윤곽선 반전 (선이 검은색, 박스 안쪽 빈 공간이 흰색이 됨)
     inv_grid = cv2.bitwise_not(grid)
 
-    # 6. 흰색 영역(박스 안쪽 공간) 찾기
     _, _, stats, _ = cv2.connectedComponentsWithStats(
         inv_grid, connectivity=4, ltype=cv2.CV_32S
     )
 
     boxes = []
-    for stat in stats[1:]:  # 0번은 보통 배경 전체이므로 건너뜀
+    for stat in stats[1:]:
         x, y, w, h, area = stat
-
-        # 7. 비율 및 크기 조건 완화
-        # 표 안의 길쭉한 직사각형 칸들도 모두 체크박스로 잡을 수 있도록 폭을 넓힘
         if (min_w <= w <= max_w) and (min_h <= h <= max_h):
             aspect_ratio = w / float(h)
             if 0.1 <= aspect_ratio <= 10.0:
                 boxes.append((int(x), int(y), int(w), int(h)))
 
-    # 8. 중첩 박스 제거 (더 큰 박스 안에 완전히 포함된 작은 박스 삭제)
     boxes = _remove_nested_boxes(boxes)
-
-    # 9. 고립 박스 제거 (중심에서 선 뻤을 때 만나는 박스 없으면 삭제)
     boxes = _filter_isolated_boxes(boxes)
 
     return boxes
@@ -241,11 +213,9 @@ def auto_detect_checkboxes(
 def _remove_nested_boxes(
     boxes: list[tuple[int, int, int, int]],
 ) -> list[tuple[int, int, int, int]]:
-    """다른 박스 안에 완전히 포함된 내부 박스를 제거합니다."""
     if len(boxes) <= 1:
         return boxes
 
-    # 면적 큰 순으로 정렬 (큰 박스가 먼저 오도록)
     sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
     keep = []
     for box in sorted_boxes:
@@ -265,12 +235,6 @@ def _filter_isolated_boxes(
     boxes: list[tuple[int, int, int, int]],
     size_ratio: float = 0.1,
 ) -> list[tuple[int, int, int, int]]:
-    """
-    각 박스 중심에서 x축(가로), y축(세로)으로 선을 뻗어
-    처음 만난 박스와 크기를 비교. 크기 비슷한 박스가 하나도 없으면 제거.
-
-    size_ratio: w/h 각각 이 비율 이내 차이면 크기 비슷한 것으로 간주.
-    """
     if len(boxes) <= 1:
         return boxes
 
@@ -284,8 +248,8 @@ def _filter_isolated_boxes(
     for i, (x, y, w, h) in enumerate(boxes):
         cx, cy = x + w / 2, y + h / 2
 
-        hit_x = False  # x축 선이 크기 비슷한 박스를 만남
-        hit_y = False  # y축 선이 크기 비슷한 박스를 만남
+        hit_x = False
+        hit_y = False
 
         for j, (x2, y2, w2, h2) in enumerate(boxes):
             if i == j:
@@ -341,7 +305,6 @@ def load_checkbox_cache(
 
 
 def clear_all_cache():
-    """체크박스 캐시와 PDF 페이지 캐시를 모두 삭제합니다."""
     import shutil
 
     for cache_dir_name in ("pdf_vision_cache", "pdf_checkbox_cache"):
@@ -373,7 +336,6 @@ def save_checkbox_cache(
 
 
 def cleanup_old_cache(max_days: int = 30):
-    """temp 폴더 내 PDF 캐시 중 max_d일 지난 파일 삭제"""
     import time
 
     now = time.time()

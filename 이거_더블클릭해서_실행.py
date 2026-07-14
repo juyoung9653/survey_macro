@@ -17,6 +17,7 @@ def ensure_packages() -> bool:
         ("numpy", "numpy"),
         ("openpyxl", "openpyxl"),
         ("PIL", "Pillow"),
+        ("pystackreg", "pystackreg"),
     ]
 
     for import_name, pip_name in required_packages:
