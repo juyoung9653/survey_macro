@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import fitz
@@ -9,7 +10,9 @@ import numpy as np
 
 from src.processor import (
     _build_file_labels,
+    _build_file_templates,
     _decode_sampled_survey,
+    _file_key,
     _load_ui_template_cache,
     _median_uint8_inplace,
     _save_ui_template_cache,
@@ -68,6 +71,31 @@ class PipelineOptimizationTests(unittest.TestCase):
         self.assertTrue(np.array_equal(decoded[0], second))
         self.assertIsNone(
             _decode_sampled_survey(samples, survey_idx=2, expected_pages=1)
+        )
+
+    def test_batch_templates_keep_their_existing_alignment(self):
+        first_path = "first.pdf"
+        second_path = "second.pdf"
+        first = np.full((30, 20), 220, np.uint8)
+        second = np.full((30, 20), 180, np.uint8)
+        first_bytes = cv2.imencode(".png", first)[1].tobytes()
+        second_bytes = cv2.imencode(".png", second)[1].tobytes()
+        sample_results = {
+            _file_key(first_path): {0: [first_bytes]},
+            _file_key(second_path): {0: [second_bytes]},
+        }
+
+        with patch("src.processor.ImageAligner") as aligner_cls:
+            reference, templates = _build_file_templates(
+                [first_path, second_path], sample_results
+            )
+
+        aligner_cls.assert_not_called()
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertTrue(np.array_equal(reference[0], first))
+        self.assertTrue(
+            np.array_equal(templates[_file_key(second_path)][0], second)
         )
 
     def test_ui_template_cache_round_trip(self):

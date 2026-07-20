@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 from src.processor import _align_template_mask_by_coverage, extract_pure_ink_mask
-from src.vision import auto_detect_checkboxes
+from src.vision import ImageAligner, auto_detect_checkboxes
 
 
 def _make_form(height: int = 700, width: int = 500) -> np.ndarray:
@@ -45,6 +46,28 @@ class TemplateAlignmentTests(unittest.TestCase):
         aligned = _align_template_mask_by_coverage(template, target_mask)
 
         self.assertGreater(_overlap(aligned, target_mask), _overlap(template, target_mask))
+
+    def test_image_aligner_uses_one_coordinate_system_for_resized_pages(self):
+        reference = _make_form()
+        target = cv2.resize(reference, (750, 1050), interpolation=cv2.INTER_LINEAR)
+        expected = cv2.resize(target, (500, 700), interpolation=cv2.INTER_AREA)
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], np.float32)
+
+        with (
+            patch(
+                "src.vision.cv2.estimateAffine2D",
+                return_value=(identity.copy(), None),
+            ) as estimate_affine,
+            patch(
+                "src.vision.cv2.findTransformECC",
+                return_value=(0.999, identity.copy()),
+            ) as find_ecc,
+        ):
+            aligned = ImageAligner(reference).align(target)
+
+        estimate_affine.assert_called_once()
+        find_ecc.assert_called_once()
+        self.assertTrue(np.array_equal(aligned, expected))
 
     def test_ink_is_preserved_and_checkbox_detection_still_works(self):
         form = _make_form()

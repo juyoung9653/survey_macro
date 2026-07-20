@@ -10,7 +10,7 @@ import numpy as np
 
 
 _PDF_CACHE_VERSION = 2
-_CHECKBOX_CACHE_VERSION = 2
+_CHECKBOX_CACHE_VERSION = 3
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):
@@ -147,20 +147,27 @@ class ImageAligner:
         return cv2.resize(img, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA)
 
     def align(self, img: np.ndarray) -> np.ndarray:
+        # 특징점, ECC, 최종 warp가 모두 같은 좌표계를 사용하도록 먼저 크기를
+        # 통일합니다. 서로 다른 용지 크기의 PDF를 묶을 때 행렬이 어긋나는 것을 막습니다.
+        working_img = self._resize_to_ref(img)
         if self.des1 is None:
-            return self._resize_to_ref(img)
+            return working_img
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        gray = (
+            cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
+            if working_img.ndim == 3
+            else working_img
+        )
         kp2, des2 = self.orb.detectAndCompute(gray, None)
         if des2 is None:
-            return self._resize_to_ref(img)
+            return working_img
 
         matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         matches = sorted(matcher.match(self.des1, des2), key=lambda m: m.distance)
         top_matches = matches[: max(4, int(len(matches) * 0.15))]
 
         if len(top_matches) < 3:
-            return self._resize_to_ref(img)
+            return working_img
 
         pts1 = np.float32([self.kp1[m.queryIdx].pt for m in top_matches]).reshape(
             -1, 1, 2
@@ -170,7 +177,7 @@ class ImageAligner:
         # affine transform: rotation + translation + scale, no perspective (no twisting)
         M, _ = cv2.estimateAffine2D(pts2, pts1, ransacReprojThreshold=3.0)
         if M is None:
-            return self._resize_to_ref(img)
+            return working_img
 
         # --- ECC 정밀 정합 (sub-pixel refinement) ---
         # ORB 특징점 기반 affine을 초기값으로, ECC로 픽셀 단위 미세 조정
@@ -180,12 +187,7 @@ class ImageAligner:
                 50,
                 1e-6,
             )
-            # 입력 크기를 ref에 맞춰 resize (ECC는 같은 크기 요구)
-            if gray.shape[:2] != (self.ref_h, self.ref_w):
-                gray = cv2.resize(
-                    gray, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA
-                )
-            M_refined, _ = cv2.findTransformECC(
+            _, M_refined = cv2.findTransformECC(
                 self.ref_gray,
                 gray,
                 M.copy(),
@@ -198,7 +200,7 @@ class ImageAligner:
         except Exception:
             pass  # ECC 실패 시 ORB 결과 그대로 사용
 
-        return cv2.warpAffine(img, M, (self.ref_w, self.ref_h))
+        return cv2.warpAffine(working_img, M, (self.ref_w, self.ref_h))
 
 
 def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndarray:

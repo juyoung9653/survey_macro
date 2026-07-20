@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -5,8 +6,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QActionGroup, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QObject, QRectF, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QActionGroup, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -450,6 +451,35 @@ class ValueMappingDialog(QDialog):
         super().accept()
 
 
+class _AnalysisWorker(QObject):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(
+        self,
+        file_paths: list[str],
+        template_pages: list[np.ndarray],
+        preset: TemplatePreset,
+    ):
+        super().__init__()
+        self.file_paths = file_paths
+        self.template_pages = template_pages
+        self.preset = preset
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            success = run_analysis(
+                self.file_paths,
+                self.template_pages,
+                self.preset,
+                progress_cb=self.progress.emit,
+            )
+            self.finished.emit(bool(success), "")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
+
+
 class MainWindow(QMainWindow):
     ROT_CYCLE = ROTATION_CODES
 
@@ -473,6 +503,11 @@ class MainWindow(QMainWindow):
 
         self.pending_boxes = []
         self.selected_boxes = []
+
+        self._analysis_thread: QThread | None = None
+        self._analysis_worker: _AnalysisWorker | None = None
+        self._analysis_progress: QProgressDialog | None = None
+        self._analysis_result: tuple[bool, str] | None = None
 
         self._init_ui()
 
@@ -553,11 +588,11 @@ class MainWindow(QMainWindow):
         del_btn.setStyleSheet("background-color: #f44336; color: white;")
         del_btn.clicked.connect(self.delete_selected_boxes)
 
-        exec_btn = QPushButton("▶ 분석 실행")
-        exec_btn.setStyleSheet(
+        self.exec_btn = QPushButton("▶ 분석 실행")
+        self.exec_btn.setStyleSheet(
             "background-color: #4CAF50; color: white; font-weight: bold;"
         )
-        exec_btn.clicked.connect(self.execute_analysis)
+        self.exec_btn.clicked.connect(self.execute_analysis)
 
         if hasattr(self, "file_menu_btn"):
             self.file_menu_btn.setFixedHeight(group_btn.sizeHint().height())
@@ -580,7 +615,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.comment_field_btn)
         btn_layout.addWidget(del_btn)
         btn_layout.addStretch(1)
-        btn_layout.addWidget(exec_btn)
+        btn_layout.addWidget(self.exec_btn)
 
         main_layout.addLayout(btn_layout)
 
@@ -1058,17 +1093,8 @@ class MainWindow(QMainWindow):
                     40, 30, "템플릿 병합 중...", progress_cb
                 ),
             )
-            if multi_templates:
-                # 병합된 템플릿으로 self.pages 교체
-                new_pages = []
-                for i in range(page_count):
-                    if i in multi_templates:
-                        new_pages.append(multi_templates[i])
-                    elif i < len(self.pages):
-                        new_pages.append(self.pages[i])
-                if new_pages:
-                    self.pages = new_pages
-                    self._update_page_size()
+            # 병합 템플릿은 이미 회전·정합된 이미지입니다. self.pages까지 교체하면
+            # 표시와 분석에서 회전이 다시 적용되므로 자동 탐지 입력으로만 사용합니다.
 
         self.auto_detect(
             progress_cb=self._wrap_progress(70, 30, "체크박스 탐지 중...", progress_cb),
@@ -1420,17 +1446,82 @@ class MainWindow(QMainWindow):
         if not self.file_paths or not self.preset.fields:
             QMessageBox.warning(self, "경고", "파일이나 생성된 템플릿 항목이 없습니다.")
             return
+        if self._analysis_thread is not None and self._analysis_thread.isRunning():
+            QMessageBox.information(self, "알림", "이미 분석이 진행 중입니다.")
+            return
 
-        progress = self._show_progress_dialog("분석", "분석 준비 중...")
-        progress_cb = self._make_progress_cb(progress)
-
-        success = run_analysis(
-            self.file_paths, self.pages, self.preset, progress_cb=progress_cb
+        self._analysis_progress = self._show_progress_dialog(
+            "분석", "분석 준비 중..."
         )
-        progress_cb(100, "분석 완료")
-        progress.close()
+        self._analysis_result = None
+        self.exec_btn.setEnabled(False)
+
+        thread = QThread(self)
+        worker = _AnalysisWorker(
+            list(self.file_paths),
+            list(self.pages),
+            copy.deepcopy(self.preset),
+        )
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._update_analysis_progress)
+        worker.finished.connect(self._store_analysis_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._finish_analysis)
+        thread.finished.connect(thread.deleteLater)
+
+        self._analysis_thread = thread
+        self._analysis_worker = worker
+        thread.start()
+
+    @pyqtSlot(int, str)
+    def _update_analysis_progress(self, value: int, message: str):
+        if self._analysis_progress is None:
+            return
+        self._analysis_progress.setValue(max(0, min(100, value)))
+        if message:
+            self._analysis_progress.setLabelText(message)
+
+    @pyqtSlot(bool, str)
+    def _store_analysis_result(self, success: bool, error_message: str):
+        self._analysis_result = (success, error_message)
+        if self._analysis_progress is not None:
+            self._analysis_progress.setValue(100)
+            self._analysis_progress.close()
+
+    @pyqtSlot()
+    def _finish_analysis(self):
+        success, error_message = self._analysis_result or (
+            False,
+            "분석 작업이 예기치 않게 종료되었습니다.",
+        )
+
+        if self._analysis_progress is not None:
+            self._analysis_progress.close()
+        self._analysis_progress = None
+        self._analysis_worker = None
+        self._analysis_thread = None
+        self._analysis_result = None
+        self.exec_btn.setEnabled(True)
 
         if success:
             QMessageBox.information(self, "완료", "분석이 완료되었습니다.")
+        elif error_message:
+            QMessageBox.critical(
+                self, "오류", f"분석 중 문제가 발생했습니다.\n\n{error_message}"
+            )
         else:
             QMessageBox.critical(self, "오류", "분석 중 문제가 발생했습니다.")
+
+    def closeEvent(self, a0: QCloseEvent):
+        if self._analysis_thread is not None and self._analysis_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "분석 진행 중",
+                "분석이 끝난 뒤 프로그램을 종료해주세요.",
+            )
+            a0.ignore()
+            return
+        super().closeEvent(a0)

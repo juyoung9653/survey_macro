@@ -15,7 +15,7 @@ from .vision import ImageAligner, apply_rotation, load_pdf_pages
 
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
-_UI_TEMPLATE_CACHE_VERSION = 2
+_UI_TEMPLATE_CACHE_VERSION = 3
 
 
 def _ui_template_cache_path(
@@ -1063,7 +1063,7 @@ def _render_survey_pages(
 def _collect_template_samples(
     fpath: str,
     config: TemplatePreset,
-    aligners: list,
+    alignment_references: list[np.ndarray],
     dpi: int = 300,
     sample_limit: int = 31,
 ) -> tuple[str, dict[int, list[bytes]]]:
@@ -1075,6 +1075,11 @@ def _collect_template_samples(
         return _file_key(fpath), {}
 
     page_count = config.page_count
+    aligners = [ImageAligner(reference) for reference in alignment_references]
+    if not aligners:
+        doc.close()
+        raise RuntimeError("페이지 정합 기준 이미지가 없습니다.")
+
     f_pages: dict[int, list[bytes]] = {i: [] for i in range(page_count)}
     survey_count = _survey_count(len(doc), page_count)
     limit = min(survey_count, sample_limit)
@@ -1127,6 +1132,33 @@ def _decode_sampled_survey(
     return decoded
 
 
+def _build_file_templates(
+    file_paths: list[str],
+    sample_results: dict[str, dict[int, list[bytes]]],
+) -> tuple[
+    dict[int, np.ndarray] | None,
+    dict[str, dict[int, np.ndarray]],
+]:
+    """공통 기준에 정합된 표본으로 파일별 템플릿을 만듭니다.
+
+    표본 페이지는 수집 단계에서 이미 같은 기준 이미지에 정합되어 있습니다. 파일별
+    중앙값 템플릿만 다시 첫 파일에 맞추면 템플릿에만 추가 변환이 생겨 실제 분석
+    페이지와 좌표계가 달라지므로, 생성된 템플릿을 그대로 유지합니다.
+    """
+    reference_templates: dict[int, np.ndarray] | None = None
+    file_templates: dict[str, dict[int, np.ndarray]] = {}
+
+    for fpath in file_paths:
+        file_key = _file_key(fpath)
+        f_pages = sample_results.get(file_key, {})
+        file_template = generate_dynamic_templates(f_pages) if f_pages else {}
+        file_templates[file_key] = file_template
+        if reference_templates is None and file_template:
+            reference_templates = file_template
+
+    return reference_templates, file_templates
+
+
 # ── Phase 2 Worker: 파일 1개 전체 분석 (스레드 안전) ──
 def _analyze_single_file(
     fpath: str,
@@ -1134,7 +1166,7 @@ def _analyze_single_file(
     config: TemplatePreset,
     file_template: dict[int, np.ndarray],
     reference_templates: dict[int, np.ndarray],
-    aligners: list,
+    alignment_references: list[np.ndarray],
     review_folder: Path,
     dpi: int = 300,
     sample_pages: dict[int, list[bytes]] | None = None,
@@ -1150,6 +1182,9 @@ def _analyze_single_file(
         out_orig = fitz.open()
         out_ink = fitz.open()
         survey_count = _survey_count(len(doc), config.page_count)
+        aligners = [ImageAligner(reference) for reference in alignment_references]
+        if not aligners:
+            raise RuntimeError("페이지 정합 기준 이미지가 없습니다.")
         f_template = file_template or reference_templates
         template_masks = {}
         for local_p, template in f_template.items():
@@ -1256,11 +1291,15 @@ def run_analysis(
         return False
     file_labels = _build_file_labels(file_paths)
 
-    # ── 페이지 정합기 (모든 스레드에서 읽기 전용으로 공유) ──
-    aligners = [
-        ImageAligner(apply_rotation(p, config.rot_code, config.fine_angle))
+    # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일 작업자마다 만듭니다.
+    # 배치 처리에서 여러 스레드가 같은 OpenCV ORB 인스턴스를 동시에 쓰지 않게 합니다.
+    alignment_references = [
+        apply_rotation(p, config.rot_code, config.fine_angle)
         for p in template_pages[: config.page_count]
     ]
+    if not alignment_references:
+        print("페이지 정합 기준 이미지가 없습니다.")
+        return False
 
     # ══════════════════════════════════════
     # Phase 1: 템플릿 샘플 병렬 수집
@@ -1273,7 +1312,7 @@ def run_analysis(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                _collect_template_samples, fpath, config, aligners
+                _collect_template_samples, fpath, config, alignment_references
             ): index
             for index, fpath in enumerate(file_paths)
         }
@@ -1292,35 +1331,11 @@ def run_analysis(
                 f"템플릿 샘플 수집 중... ({completed}/{num_files})",
             )
 
-    # ── 템플릿 빌드 + 정렬 (원본 순서 유지) ──
+    # ── 템플릿 빌드 (원본 순서 및 공통 정합 좌표 유지) ──
     report_progress(8, "템플릿 생성 중...")
-    reference_templates: dict[int, np.ndarray] | None = None
-    file_templates: dict[str, dict[int, np.ndarray]] = {}
-
-    for fpath in file_paths:
-        file_key = _file_key(fpath)
-        f_pages = sample_results.get(file_key, {})
-        if not f_pages:
-            file_templates[file_key] = {}
-            continue
-
-        file_template = generate_dynamic_templates(f_pages)
-        if not file_template:
-            file_templates[file_key] = {}
-            continue
-
-        if reference_templates is None:
-            reference_templates = file_template
-            file_templates[file_key] = file_template
-        else:
-            aligned_tpl: dict[int, np.ndarray] = {}
-            for local_p, tpl in file_template.items():
-                if local_p in reference_templates:
-                    a = ImageAligner(reference_templates[local_p])
-                    aligned_tpl[local_p] = a.align(tpl)
-                else:
-                    aligned_tpl[local_p] = tpl
-            file_templates[file_key] = aligned_tpl
+    reference_templates, file_templates = _build_file_templates(
+        file_paths, sample_results
+    )
 
     if reference_templates is None:
         print("템플릿 생성에 실패했습니다.")
@@ -1360,7 +1375,7 @@ def run_analysis(
                 config,
                 file_templates.get(file_key, reference_templates),
                 reference_templates,
-                aligners,
+                alignment_references,
                 review_folder,
                 sample_pages=sample_results.get(file_key),
             )
