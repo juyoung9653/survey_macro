@@ -728,7 +728,7 @@ def _analyze_single_file(
     out_orig = fitz.open()
     out_ink = fitz.open()
     file_results: list[dict] = []
-    comment_pages: dict[int, np.ndarray] = {}
+    comment_pages: list[np.ndarray] = []
 
     # 설문 내 페이지 병렬 처리를 위한 inner pool
     inner_workers = min(4, page_count)
@@ -766,7 +766,7 @@ def _analyze_single_file(
                     out_ink, ink_base[local_p], ink_ann.get(local_p, [])
                 )
             for local_p in sorted(cp.keys()):
-                comment_pages[local_p] = cp[local_p]
+                comment_pages.append(cp[local_p])
 
             del row_data, debug_base, ink_base, debug_ann, ink_ann, cp
             del survey_gray_pages, survey_data
@@ -903,7 +903,7 @@ def run_analysis(
     # ══════════════════════════════════════
     report_progress(10, "분석 시작 중...")
     all_results: list[dict] = []
-    all_comment_pages: list[dict[int, np.ndarray]] = []
+    all_comment_pages: list[np.ndarray] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -921,10 +921,10 @@ def run_analysis(
         completed = 0
         for future in as_completed(futures):
             try:
-                fname, file_results, cp = future.result()
+                fname, file_results, cp_list = future.result()
                 all_results.extend(file_results)
-                if cp:
-                    all_comment_pages.append(cp)
+                if cp_list:
+                    all_comment_pages.extend(cp_list)
             except Exception as e:
                 print(f"분석 실패: {e}")
             completed += 1
@@ -935,9 +935,8 @@ def run_analysis(
 
     # ── 의견 PDF 병합 저장 ──
     comment_doc = fitz.open()
-    for cp in all_comment_pages:
-        for local_p in sorted(cp.keys()):
-            _insert_img_into_pdf(comment_doc, cp[local_p])
+    for img in all_comment_pages:
+        _insert_img_into_pdf(comment_doc, img)
     if len(comment_doc) > 0:
         comment_doc.save("의견.pdf")
     comment_doc.close()
