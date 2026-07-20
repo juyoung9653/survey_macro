@@ -15,7 +15,7 @@ from .vision import ImageAligner, apply_rotation, load_pdf_pages
 
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
-_UI_TEMPLATE_CACHE_VERSION = 3
+_UI_TEMPLATE_CACHE_VERSION = 5
 
 
 def _ui_template_cache_path(
@@ -368,8 +368,13 @@ def generate_ui_templates(
     if not pages:
         return {}
 
+    # 체크박스 테두리는 얇아서 표본마다 ECC의 미세 affine 변형이 달라지면
+    # 중앙값 템플릿에서 끊어질 수 있습니다. 템플릿 합성은 ORB 정합만 사용합니다.
     aligners = [
-        ImageAligner(apply_rotation(p, rot_code, fine_angle))
+        ImageAligner(
+            apply_rotation(p, rot_code, fine_angle),
+            refine_ecc=False,
+        )
         for p in pages[:page_count]
     ]
 
@@ -498,7 +503,7 @@ def generate_ui_templates_multi(
                 orig = apply_rotation(pages[global_p], rot_code, fine_angle)
                 aligner = ref_aligners.get(local_p)
                 if aligner is None:
-                    aligner = ImageAligner(orig)
+                    aligner = ImageAligner(orig, refine_ecc=False)
                     ref_aligners[local_p] = aligner
                 aligned = aligner.align(orig)
                 success, encoded = cv2.imencode(".png", aligned)

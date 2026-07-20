@@ -69,6 +69,61 @@ class TemplateAlignmentTests(unittest.TestCase):
         find_ecc.assert_called_once()
         self.assertTrue(np.array_equal(aligned, expected))
 
+    def test_image_aligner_inverts_ecc_warp_and_fills_white_border(self):
+        reference = _make_form()
+        ref_to_target = np.array(
+            [[1.0, 0.0, 5.0], [0.0, 1.0, -4.0]], dtype=np.float32
+        )
+        target_to_ref = cv2.invertAffineTransform(ref_to_target)
+        target = cv2.warpAffine(
+            reference,
+            ref_to_target,
+            (reference.shape[1], reference.shape[0]),
+            borderValue=255,
+        )
+        expected = cv2.warpAffine(
+            target,
+            target_to_ref,
+            (reference.shape[1], reference.shape[0]),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+
+        with (
+            patch(
+                "src.vision.cv2.estimateAffine2D",
+                return_value=(target_to_ref.copy(), None),
+            ),
+            patch(
+                "src.vision.cv2.findTransformECC",
+                return_value=(0.999, ref_to_target.copy()),
+            ) as find_ecc,
+        ):
+            aligned = ImageAligner(reference).align(target)
+
+        ecc_initial = find_ecc.call_args.args[2]
+        self.assertTrue(np.allclose(ecc_initial, ref_to_target))
+        self.assertTrue(np.array_equal(aligned, expected))
+        self.assertEqual(int(aligned[0, 0]), 255)
+
+    def test_image_aligner_can_skip_ecc_for_checkbox_template(self):
+        reference = _make_form()
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+
+        with (
+            patch(
+                "src.vision.cv2.estimateAffine2D",
+                return_value=(identity.copy(), None),
+            ),
+            patch("src.vision.cv2.findTransformECC") as find_ecc,
+        ):
+            aligned = ImageAligner(reference, refine_ecc=False).align(reference)
+
+        find_ecc.assert_not_called()
+        self.assertTrue(np.array_equal(aligned, reference))
+
     def test_ink_is_preserved_and_checkbox_detection_still_works(self):
         form = _make_form()
         ink = np.zeros_like(form)

@@ -10,7 +10,7 @@ import numpy as np
 
 
 _PDF_CACHE_VERSION = 2
-_CHECKBOX_CACHE_VERSION = 3
+_CHECKBOX_CACHE_VERSION = 5
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):
@@ -133,11 +133,12 @@ def load_pdf_pages(
 
 
 class ImageAligner:
-    def __init__(self, ref_img: np.ndarray):
+    def __init__(self, ref_img: np.ndarray, refine_ecc: bool = True):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
         )
         self.ref_h, self.ref_w = self.ref_gray.shape[:2]
+        self.refine_ecc = refine_ecc
         self.orb = cv2.ORB_create(2000)
         self.kp1, self.des1 = self.orb.detectAndCompute(self.ref_gray, None)
 
@@ -180,27 +181,38 @@ class ImageAligner:
             return working_img
 
         # --- ECC 정밀 정합 (sub-pixel refinement) ---
-        # ORB 특징점 기반 affine을 초기값으로, ECC로 픽셀 단위 미세 조정
-        try:
-            criteria = (
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                50,
-                1e-6,
-            )
-            _, M_refined = cv2.findTransformECC(
-                self.ref_gray,
-                gray,
-                M.copy(),
-                cv2.MOTION_AFFINE,
-                criteria,
-                None,
-                5,
-            )
-            M = M_refined
-        except Exception:
-            pass  # ECC 실패 시 ORB 결과 그대로 사용
+        # estimateAffine2D의 M은 입력→기준이지만 findTransformECC의 행렬은
+        # 기준→입력 방향입니다. ECC 전후에 역행렬로 방향을 맞춥니다.
+        if self.refine_ecc:
+            try:
+                criteria = (
+                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                    50,
+                    1e-6,
+                )
+                ecc_initial = cv2.invertAffineTransform(M).astype(np.float32)
+                _, M_refined = cv2.findTransformECC(
+                    self.ref_gray,
+                    gray,
+                    ecc_initial,
+                    cv2.MOTION_AFFINE,
+                    criteria,
+                    None,
+                    5,
+                )
+                if np.isfinite(M_refined).all():
+                    M = cv2.invertAffineTransform(M_refined)
+            except Exception:
+                pass  # ECC 실패 시 ORB 결과 그대로 사용
 
-        return cv2.warpAffine(working_img, M, (self.ref_w, self.ref_h))
+        border_value = 255 if working_img.ndim == 2 else (255, 255, 255)
+        return cv2.warpAffine(
+            working_img,
+            M,
+            (self.ref_w, self.ref_h),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=border_value,
+        )
 
 
 def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndarray:
