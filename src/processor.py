@@ -309,22 +309,207 @@ def generate_ui_templates_multi(
     return bgr_templates
 
 
+def _best_shift_by_correlation(
+    template_mask: np.ndarray,
+    padded_target: np.ndarray,
+    max_shift: int,
+    reference_pixels: int,
+) -> tuple[float, int, int, int]:
+    """제한된 이동 범위의 모든 겹침을 OpenCV 상관맵 한 번으로 계산합니다."""
+    point_data = cv2.findNonZero(template_mask)
+    if point_data is None:
+        return float("-inf"), 0, 0, 0
+
+    candidate_pixels = len(point_data)
+    x, y, width, height = cv2.boundingRect(point_data)
+    template_roi = np.ascontiguousarray(
+        template_mask[y : y + height, x : x + width]
+    )
+    target_roi = np.ascontiguousarray(
+        padded_target[
+            y : y + height + max_shift * 2,
+            x : x + width + max_shift * 2,
+        ]
+    )
+    correlation = cv2.matchTemplate(target_roi, template_roi, cv2.TM_CCORR)
+    _, max_value, _, max_location = cv2.minMaxLoc(correlation)
+
+    # 두 마스크 값이 0 또는 255이므로 상관값을 겹친 픽셀 수로 환산할 수 있습니다.
+    overlap = int(round(max_value / (255.0 * 255.0)))
+    dx = max_location[0] - max_shift
+    dy = max_location[1] - max_shift
+    # 회전 보간으로 마스크 면적이 변하는 후보만 약하게 감점합니다.
+    score = float(overlap) - abs(candidate_pixels - reference_pixels) * 0.2
+    return score, overlap, dx, dy
+
+
+def _align_template_mask_by_coverage(
+    template_mask: np.ndarray,
+    target_mask: np.ndarray,
+    max_angle: float = 0.6,
+    max_shift: int = 8,
+) -> np.ndarray:
+    """템플릿 선이 대상의 어두운 픽셀을 가장 많이 덮도록 미세 정합합니다.
+
+    체크박스 생성용 페이지 정합과는 완전히 분리된 후처리입니다. 이미 ORB/ECC로
+    정합된 페이지의 잔여 오차만 보정하므로 탐색 범위를 작게 제한합니다.
+    """
+    h, w = target_mask.shape[:2]
+    if template_mask.shape[:2] != (h, w):
+        template_mask = cv2.resize(
+            template_mask, (w, h), interpolation=cv2.INTER_NEAREST
+        )
+
+    template_pixels = cv2.countNonZero(template_mask)
+    target_pixels = cv2.countNonZero(target_mask)
+    if template_pixels < 32 or target_pixels < 32:
+        return template_mask
+
+    identity_overlap = cv2.countNonZero(
+        cv2.bitwise_and(template_mask, target_mask)
+    )
+    identity_score = float(identity_overlap)
+    # 1~2px 확장은 뒤에서 적용되므로 97% 이상 맞으면 추가 탐색의 이득이 없습니다.
+    if identity_overlap >= template_pixels * 0.97:
+        return template_mask
+
+    # 긴 변을 최대 900px로 줄여 각도와 대략적인 이동량을 빠르게 찾습니다.
+    search_scale = min(0.5, 900.0 / max(h, w))
+    search_w = max(1, round(w * search_scale))
+    search_h = max(1, round(h * search_scale))
+    # INTER_AREA로 축소한 뒤 낮은 임계값으로 다시 이진화해 가는 선의 소실을 줄입니다.
+    small_template = cv2.resize(
+        template_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
+    )
+    small_target = cv2.resize(
+        target_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
+    )
+    _, small_template = cv2.threshold(
+        small_template, 32, 255, cv2.THRESH_BINARY
+    )
+    _, small_target = cv2.threshold(small_target, 32, 255, cv2.THRESH_BINARY)
+    small_template_pixels = cv2.countNonZero(small_template)
+    if small_template_pixels == 0:
+        return template_mask
+
+    angle_step = 0.1
+    angle_count = max(0, round(max_angle / angle_step))
+    angles = [step * angle_step for step in range(-angle_count, angle_count + 1)]
+    small_shift = max(0, int(np.ceil(max_shift * search_scale)))
+    small_padded_target = cv2.copyMakeBorder(
+        small_target,
+        small_shift,
+        small_shift,
+        small_shift,
+        small_shift,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    center = (search_w / 2.0, search_h / 2.0)
+
+    best_coarse_key = (float("-inf"), 0, float("-inf"))
+    best_coarse = (0.0, 0, 0)
+
+    for angle in angles:
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            small_template,
+            matrix,
+            (search_w, search_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        score, overlap, dx, dy = _best_shift_by_correlation(
+            rotated, small_padded_target, small_shift, small_template_pixels
+        )
+        motion = abs(angle) + abs(dx) + abs(dy)
+        key = (score, overlap, -motion)
+        if key > best_coarse_key:
+            best_coarse_key = key
+            best_coarse = (angle, dx, dy)
+
+    coarse_angle, _, _ = best_coarse
+    fine_angles = {
+        round(max(-max_angle, coarse_angle - 0.05), 2),
+        round(coarse_angle, 2),
+        round(min(max_angle, coarse_angle + 0.05), 2),
+    }
+
+    # 원본 크기의 무변환 점수를 기준으로 두어 정합 결과가 더 나빠지는 것을 방지합니다.
+    best_key = (identity_score, identity_overlap, 0.0)
+    best_transform = (0.0, 0, 0)
+    full_center = (w / 2.0, h / 2.0)
+    full_padded_target = cv2.copyMakeBorder(
+        target_mask,
+        max_shift,
+        max_shift,
+        max_shift,
+        max_shift,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+    for angle in sorted(fine_angles):
+        matrix = cv2.getRotationMatrix2D(full_center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            template_mask,
+            matrix,
+            (w, h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        score, overlap, dx, dy = _best_shift_by_correlation(
+            rotated, full_padded_target, max_shift, template_pixels
+        )
+        motion = abs(angle) + abs(dx) + abs(dy)
+        key = (score, overlap, -motion)
+        if key > best_key:
+            best_key = key
+            best_transform = (angle, dx, dy)
+
+    best_angle, best_dx, best_dy = best_transform
+    min_overlap_gain = max(32, round(template_pixels * 0.001))
+    is_identity = best_angle == 0.0 and best_dx == 0 and best_dy == 0
+    has_meaningful_gain = best_key[1] >= identity_overlap + min_overlap_gain
+    if is_identity or not has_meaningful_gain:
+        return template_mask
+
+    matrix = cv2.getRotationMatrix2D(full_center, best_angle, 1.0)
+    matrix[0, 2] += best_dx
+    matrix[1, 2] += best_dy
+    return cv2.warpAffine(
+        template_mask,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
 def extract_pure_ink_mask(
     target_gray: np.ndarray,
     template_gray: np.ndarray,
     template_dilate_pct: float = 0.3,
 ) -> np.ndarray:
-    """템플릿 영역을 마스킹 방식으로 제거하고 순수 사용자 잉크만 추출.
+    """템플릿을 대상에 미세 정합해 제거하고 순수 사용자 잉크만 추출합니다."""
+    if target_gray.ndim == 3:
+        target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+    if template_gray.ndim == 3:
+        template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
 
-    absdiff 비교 대신, 템플릿 선 영역을 dilate로 확장한 뒤
-    대상 이미지에서 해당 영역을 통째로 지워(흰색) 잔여물을 방지합니다.
-    """
-    # 1. 템플릿에서 선(어두운 부분) 영역 마스크 생성
+    # 1. 대상과 템플릿의 어두운 픽셀 마스크 생성
+    _, target_mask = cv2.threshold(target_gray, 200, 255, cv2.THRESH_BINARY_INV)
     _, template_mask = cv2.threshold(
         template_gray, 200, 255, cv2.THRESH_BINARY_INV
     )
 
-    # 2. 정합 오차만큼 템플릿 마스크를 확장 (선을 n% 두껍게)
+    # 2. 템플릿 마스크만 미세 회전·이동하여 대상의 인쇄선을 최대한 덮음
+    template_mask = _align_template_mask_by_coverage(template_mask, target_mask)
+
+    # 3. 남은 미세 정합 오차만큼 템플릿 마스크 확장
     dilate_px = max(0, round(template_dilate_pct * 5))
     if dilate_px > 0:
         template_mask = cv2.dilate(
@@ -333,15 +518,15 @@ def extract_pure_ink_mask(
             iterations=dilate_px,
         )
 
-    # 3. 대상 이미지에서 템플릿 영역을 지움 (흰색=255로)
+    # 4. 대상 이미지에서 템플릿 영역을 지움
     cleaned = target_gray.copy()
     cleaned[template_mask > 0] = 255
 
-    # 4. 남은 어두운 픽셀이 순수 잉크
+    # 5. 남은 어두운 픽셀이 순수 잉크
     blur = cv2.GaussianBlur(cleaned, (3, 3), 0)
     _, pure_ink_mask = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
 
-    # 5. 모폴로지 노이즈 제거
+    # 6. 모폴로지 노이즈 제거
     pure_ink_mask = cv2.erode(pure_ink_mask, np.ones((2, 2), np.uint8), iterations=1)
     pure_ink_mask = cv2.dilate(pure_ink_mask, np.ones((3, 3), np.uint8), iterations=1)
 
