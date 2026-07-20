@@ -9,6 +9,10 @@ import fitz
 import numpy as np
 
 
+_PDF_CACHE_VERSION = 2
+_CHECKBOX_CACHE_VERSION = 2
+
+
 def _report_progress(progress_cb, value: int, message: str = ""):
     if progress_cb:
         progress_cb(value, message)
@@ -19,20 +23,19 @@ def _render_single_page(
 ) -> np.ndarray:
     """멀티스레딩을 위해 개별 스레드에서 문서를 열고 렌더링하는 내부 헬퍼 함수
     gray=True 시 직접 흑백(2D)으로 렌더링 (BGR 대비 1/3 메모리)"""
-    doc = fitz.open(pdf_path)
-    page = doc[page_num]
-    if gray:
-        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
-    else:
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_num]
+        if gray:
+            pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+            return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+
         pix = page.get_pixmap(dpi=dpi)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
         if pix.n == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        elif pix.n == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    doc.close()
-    return img
+            return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        if pix.n == 3:
+            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        return img
 
 
 def load_pdf_pages(
@@ -41,15 +44,21 @@ def load_pdf_pages(
     max_workers: int = 4,
     progress_cb=None,
     gray: bool = False,
+    page_indices: list[int] | None = None,
 ) -> list[np.ndarray]:
     """PDF를 읽어 OpenCV 이미지 리스트로 반환 (Temp 캐시 및 멀티스레딩 최적화)"""
+    requested_indices = None if page_indices is None else list(page_indices)
 
     # 1. 고유 캐시 키 생성 (파일 경로 + 파일 크기 + 마지막 수정 시간 + DPI)
     # 원본 PDF 파일이 수정되거나 해상도(DPI) 설정이 바뀌면 자동으로 새로운 캐시를 생성합니다.
     stat = os.stat(pdf_path)
     unique_str = (
-        f"{os.path.abspath(pdf_path)}_{stat.st_size}_{stat.st_mtime}_{dpi}_{gray}"
+        f"v{_PDF_CACHE_VERSION}_{os.path.abspath(pdf_path)}_"
+        f"{stat.st_size}_{stat.st_mtime_ns}_{dpi}_{gray}"
     )
+    if requested_indices is not None:
+        selection_key = json.dumps(requested_indices, separators=(",", ":"))
+        unique_str = f"{unique_str}_{selection_key}"
     cache_key = hashlib.md5(unique_str.encode("utf-8")).hexdigest()
 
     # OS의 기본 Temp 폴더 (Windows의 경우 %TEMP%) 내에 전용 캐시 폴더 생성
@@ -58,6 +67,9 @@ def load_pdf_pages(
     cache_file = os.path.join(cache_dir, f"{cache_key}.npz")
 
     _report_progress(progress_cb, 0, "PDF 로딩 시작")
+    if requested_indices == []:
+        _report_progress(progress_cb, 100, "체크박스 자동 생성 중...")
+        return []
 
     # 2. 캐시가 존재하면 PDF를 다시 읽지 않고 디스크에서 바로 로드 (초고속)
     if os.path.exists(cache_file):
@@ -76,25 +88,39 @@ def load_pdf_pages(
     num_pages = len(doc)
     doc.close()
 
+    if requested_indices is None:
+        render_indices = list(range(num_pages))
+    else:
+        render_indices = [
+            page_num for page_num in requested_indices if 0 <= page_num < num_pages
+        ]
+
+    if not render_indices:
+        _report_progress(progress_cb, 100, "체크박스 자동 생성 중...")
+        return []
+
     # ThreadPoolExecutor를 사용해 여러 페이지를 동시에 렌더링합니다.
     # max_workers는 보통 CPU 코어 수에 맞추는 것이 좋으며, 기본값 4 정도가 안정적입니다.
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    worker_count = min(max_workers, len(render_indices))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(_render_single_page, pdf_path, p_num, dpi, gray): p_num
-            for p_num in range(num_pages)
+            executor.submit(_render_single_page, pdf_path, p_num, dpi, gray): output_idx
+            for output_idx, p_num in enumerate(render_indices)
         }
-        pages = [None] * num_pages
+        pages_by_output: dict[int, np.ndarray] = {}
         completed = 0
 
         for future in as_completed(futures):
-            p_num = futures[future]
-            pages[p_num] = future.result()
+            output_idx = futures[future]
+            pages_by_output[output_idx] = future.result()
             completed += 1
             _report_progress(
                 progress_cb,
-                int(completed / num_pages * 100),
-                f"PDF 로딩... ({completed}/{num_pages})",
+                int(completed / len(render_indices) * 100),
+                f"PDF 로딩... ({completed}/{len(render_indices)})",
             )
+
+    pages = [pages_by_output[i] for i in range(len(render_indices))]
 
     # 4. 다음 실행을 위해 결과를 Temp 폴더에 저장 (.npz 확장자)
     try:
@@ -314,10 +340,13 @@ def _checkbox_cache_key(
     for p in pdf_paths:
         try:
             stat = os.stat(p)
-            parts.append(f"{os.path.abspath(p)}_{stat.st_size}_{stat.st_mtime}")
+            parts.append(f"{os.path.abspath(p)}_{stat.st_size}_{stat.st_mtime_ns}")
         except Exception:
             parts.append(p)
-    unique_str = f"{'|'.join(parts)}_{page_count}_{rot_code}_{fine_angle}_{dpi}"
+    unique_str = (
+        f"v{_CHECKBOX_CACHE_VERSION}_{'|'.join(parts)}_"
+        f"{page_count}_{rot_code}_{fine_angle}_{dpi}"
+    )
     return hashlib.md5(unique_str.encode("utf-8")).hexdigest()
 
 
@@ -341,10 +370,14 @@ def load_checkbox_cache(
 
 
 def clear_all_cache():
-    """체크박스 캐시와 PDF 페이지 캐시를 모두 삭제합니다."""
+    """체크박스, PDF 페이지, UI 템플릿 캐시를 모두 삭제합니다."""
     import shutil
 
-    for cache_dir_name in ("pdf_vision_cache", "pdf_checkbox_cache"):
+    for cache_dir_name in (
+        "pdf_vision_cache",
+        "pdf_checkbox_cache",
+        "pdf_ui_template_cache",
+    ):
         cache_dir = os.path.join(tempfile.gettempdir(), cache_dir_name)
         if os.path.isdir(cache_dir):
             try:
@@ -378,7 +411,11 @@ def cleanup_old_cache(max_days: int = 30):
 
     now = time.time()
     cutoff = now - max_days * 86400
-    for cache_dir_name in ("pdf_vision_cache", "pdf_checkbox_cache"):
+    for cache_dir_name in (
+        "pdf_vision_cache",
+        "pdf_checkbox_cache",
+        "pdf_ui_template_cache",
+    ):
         cache_dir = os.path.join(tempfile.gettempdir(), cache_dir_name)
         if not os.path.isdir(cache_dir):
             continue

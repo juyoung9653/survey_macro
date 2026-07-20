@@ -859,7 +859,10 @@ class MainWindow(QMainWindow):
         saved_templates = self._load_template_images(preset_name) if preset_name else []
 
         if self.file_paths:
-            raw_pages = load_pdf_pages(self.file_paths[0])[: self.preset.page_count]
+            raw_pages = load_pdf_pages(
+                self.file_paths[0],
+                page_indices=list(range(self.preset.page_count)),
+            )
             if len(raw_pages) < self.preset.page_count:
                 self.preset.page_count = len(raw_pages)
 
@@ -1035,7 +1038,8 @@ class MainWindow(QMainWindow):
         self.pages = load_pdf_pages(
             self.file_paths[0],
             progress_cb=self._wrap_progress(0, 40, "PDF 로딩 중...", progress_cb),
-        )[:page_count]
+            page_indices=list(range(page_count)),
+        )
 
         self._reset_state_for_new_pdf()
         self._update_page_size()

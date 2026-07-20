@@ -1,5 +1,7 @@
 import copy
-import gc
+import hashlib
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -8,27 +10,127 @@ import fitz
 import numpy as np
 
 from .export import export_to_excel
-from .models import Box, TemplatePreset
+from .models import Box, Field, TemplatePreset
 from .vision import ImageAligner, apply_rotation, load_pdf_pages
 
 
-def _gray_to_bgr_for_encode(img: np.ndarray) -> np.ndarray:
-    """gray(2D)면 BGR로 변환, 이미 BGR이면 그대로 반환"""
-    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img
+_UI_TEMPLATE_SAMPLE_LIMIT = 31
+_UI_TEMPLATE_CACHE_VERSION = 2
+
+
+def _ui_template_cache_path(
+    pdf_paths: list[str],
+    page_count: int,
+    rot_code: int,
+    fine_angle: float,
+    mode: str,
+) -> Path | None:
+    parts = [
+        f"v{_UI_TEMPLATE_CACHE_VERSION}",
+        mode,
+        str(page_count),
+        str(rot_code),
+        str(fine_angle),
+        str(_UI_TEMPLATE_SAMPLE_LIMIT),
+    ]
+    try:
+        for path in pdf_paths:
+            stat = os.stat(path)
+            parts.append(
+                f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}"
+            )
+    except OSError:
+        return None
+
+    key = hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
+    return Path(tempfile.gettempdir()) / "pdf_ui_template_cache" / f"{key}.npz"
+
+
+def _load_ui_template_cache(cache_path: Path | None) -> dict[int, np.ndarray] | None:
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        with np.load(cache_path) as data:
+            indices = data["arr_0"].astype(int).tolist()
+            templates = {
+                int(page_index): data[f"arr_{array_index + 1}"]
+                for array_index, page_index in enumerate(indices)
+            }
+        os.utime(cache_path, None)
+        return templates or None
+    except Exception:
+        return None
+
+
+def _save_ui_template_cache(
+    cache_path: Path | None, templates: dict[int, np.ndarray]
+) -> None:
+    if cache_path is None or not templates:
+        return
+    temp_path = cache_path.with_name(f"{cache_path.name}.tmp.npz")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        ordered_items = sorted(templates.items())
+        indices = np.array([key for key, _ in ordered_items], dtype=np.int32)
+        arrays = [value for _, value in ordered_items]
+        np.savez_compressed(str(temp_path), indices, *arrays)
+        os.replace(temp_path, cache_path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _file_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _build_file_labels(file_paths: list[str]) -> list[str]:
+    """Windows 대소문자 규칙까지 고려해 Excel/PDF 출력명을 유일하게 만듭니다."""
+    stems = [Path(path).stem for path in file_paths]
+    normalized = [os.path.normcase(stem) for stem in stems]
+    totals = {name: normalized.count(name) for name in set(normalized)}
+    reserved = set(normalized)
+    used: set[str] = set()
+    labels = []
+
+    for stem, normalized_stem in zip(stems, normalized):
+        if totals[normalized_stem] == 1 and normalized_stem not in used:
+            label = stem
+        else:
+            suffix = 1
+            while True:
+                candidate = f"{stem}_{suffix}"
+                normalized_candidate = os.path.normcase(candidate)
+                if normalized_candidate not in reserved and normalized_candidate not in used:
+                    label = candidate
+                    break
+                suffix += 1
+        used.add(os.path.normcase(label))
+        labels.append(label)
+
+    return labels
+
+
+def _encode_jpeg(img: np.ndarray, quality: int = 85) -> bytes | None:
+    """그레이/BGR 이미지를 불필요한 색공간 복사 없이 JPEG로 인코딩합니다."""
+    success, buf = cv2.imencode(
+        ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality]
+    )
+    return buf.tobytes() if success else None
+
 
 
 def _build_vector_page(
     target_doc, base_img: np.ndarray, annotations: list, img_quality: int = 85
 ) -> None:
-    """벡터 PDF 페이지 생성: 배경 이미지(JPEG) + 벡터 사각형/텍스트 오버레이
-    base_img는 gray(2D) 또는 BGR(3D) 모두 허용. gray면 내부에서 BGR로 변환 후 인코딩."""
+    """벡터 PDF 페이지 생성: 배경 이미지(JPEG) + 벡터 사각형/텍스트 오버레이."""
     h, w = base_img.shape[:2]
     page = target_doc.new_page(width=w, height=h)
-    bgr = _gray_to_bgr_for_encode(base_img)
-    success, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, img_quality])
-    del bgr
-    if success:
-        page.insert_image(page.rect, stream=buf.tobytes())
+    image_bytes = _encode_jpeg(base_img, img_quality)
+    if image_bytes:
+        page.insert_image(page.rect, stream=image_bytes)
     for bx, by, bw, bh, label, is_ticked in annotations:
         color = (0, 1, 0) if is_ticked else (1, 0, 0)
         rect = fitz.Rect(bx, by, bx + bw, by + bh)
@@ -36,20 +138,25 @@ def _build_vector_page(
         page.insert_text(fitz.Point(bx, max(0, by - 5)), label, fontsize=8, color=color)
 
 
+def _insert_encoded_img_into_pdf(target_doc, image_bytes: bytes) -> None:
+    """인코딩된 JPEG 한 장을 target_doc에 추가합니다."""
+    img_doc = fitz.open("jpg", image_bytes)
+    page_doc = None
+    try:
+        pdf_bytes = img_doc.convert_to_pdf()
+        page_doc = fitz.open("pdf", pdf_bytes)
+        target_doc.insert_pdf(page_doc)
+    finally:
+        if page_doc is not None:
+            page_doc.close()
+        img_doc.close()
+
+
 def _insert_img_into_pdf(target_doc, img: np.ndarray, quality: int = 85) -> None:
-    """numpy 이미지를 JPEG로 인코딩해 target_doc(fitz.Document)에 페이지로 추가
-    img는 gray(2D) 또는 BGR(3D) 모두 허용."""
-    bgr = _gray_to_bgr_for_encode(img)
-    success, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    del bgr
-    if not success:
-        return
-    img_doc = fitz.open("jpg", buf.tobytes())
-    pdf_bytes = img_doc.convert_to_pdf()
-    page_doc = fitz.open("pdf", pdf_bytes)
-    target_doc.insert_pdf(page_doc)
-    page_doc.close()
-    img_doc.close()
+    """numpy 이미지를 JPEG로 인코딩해 target_doc에 페이지로 추가합니다."""
+    image_bytes = _encode_jpeg(img, quality)
+    if image_bytes:
+        _insert_encoded_img_into_pdf(target_doc, image_bytes)
 
 
 def sort_boxes_z_pattern(boxes: list[Box]) -> list[Box]:
@@ -154,6 +261,24 @@ def expand_isolated_boxes(
 # ==========================================
 
 
+def _median_uint8_inplace(stack: np.ndarray) -> np.ndarray:
+    """uint8 스택을 제자리 partition해 np.median(...).astype(uint8)과 동일하게 계산."""
+    count = stack.shape[0]
+    if count == 1:
+        return stack[0].copy()
+
+    upper = count // 2
+    if count % 2:
+        stack.partition(upper, axis=0)
+        return stack[upper].copy()
+
+    lower = upper - 1
+    stack.partition((lower, upper), axis=0)
+    total = stack[lower].astype(np.uint16)
+    total += stack[upper]
+    return (total // 2).astype(np.uint8)
+
+
 def generate_dynamic_templates(
     pages_by_local_idx: dict[int, list],
 ) -> dict[int, np.ndarray]:
@@ -161,24 +286,29 @@ def generate_dynamic_templates(
     for local_p, pages in pages_by_local_idx.items():
         if not pages:
             continue
-        sample_data = pages  # 상위에서 이미 50장으로 제한됨
-        # PNG 압축된 bytes면 디코딩, raw array면 그대로 사용
-        if isinstance(sample_data[0], bytes):
-            decoded = [
-                cv2.imdecode(np.frombuffer(d, np.uint8), cv2.IMREAD_GRAYSCALE)
-                for d in sample_data
-            ]
-            # 밝기 outlier 필터: 지나치게 어두운 페이지(체크多) 제외
-            decoded = _filter_blank_pages(decoded)
-            if not decoded:
-                continue
-            stack = np.stack(decoded, axis=0)
+
+        if isinstance(pages[0], bytes):
+            images = []
+            for data in pages:
+                if not data:
+                    continue
+                image = cv2.imdecode(
+                    np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE
+                )
+                if image is not None:
+                    images.append(image)
         else:
-            filtered = _filter_blank_pages(sample_data)
-            if not filtered:
-                continue
-            stack = np.stack(filtered, axis=0)
-        templates[local_p] = np.median(stack, axis=0).astype(np.uint8)
+            images = list(pages)
+
+        filtered = _filter_blank_pages(images)
+        if not filtered:
+            continue
+
+        stack = np.stack(filtered, axis=0)
+        del images, filtered
+        templates[local_p] = _median_uint8_inplace(stack)
+        del stack
+
     return templates
 
 
@@ -206,12 +336,36 @@ def generate_ui_templates(
     progress_cb=None,
 ) -> dict[int, np.ndarray]:
     """UI에서 자동 탐지를 수행하기 전, PDF 전체를 읽어 깔끔한 빈 템플릿을 생성해 반환합니다."""
+    if page_count <= 0:
+        return {}
+
+    cache_path = _ui_template_cache_path(
+        [pdf_path], page_count, rot_code, fine_angle, "single"
+    )
+    cached_templates = _load_ui_template_cache(cache_path)
+    if cached_templates is not None:
+        if progress_cb:
+            progress_cb(100, "캐시된 템플릿 불러오기 완료")
+        return {
+            key: cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
+            for key, value in cached_templates.items()
+        }
+
     try:
-        pages = load_pdf_pages(pdf_path, progress_cb=progress_cb, gray=True)
+        with fitz.open(pdf_path) as doc:
+            sample_page_count = min(
+                len(doc), page_count * _UI_TEMPLATE_SAMPLE_LIMIT
+            )
+        pages = load_pdf_pages(
+            pdf_path,
+            progress_cb=progress_cb,
+            gray=True,
+            page_indices=list(range(sample_page_count)),
+        )
     except Exception:
         return {}
 
-    if not pages or page_count <= 0:
+    if not pages:
         return {}
 
     aligners = [
@@ -233,12 +387,13 @@ def generate_ui_templates(
             aligner = aligners[local_p] if local_p < len(aligners) else aligners[-1]
 
             aligned = aligner.align(orig)
-            if len(pages_by_local_idx[local_p]) < 50:
-                pages_by_local_idx[local_p].append(
-                    cv2.imencode(".png", aligned)[1].tobytes()
-                )
+            if len(pages_by_local_idx[local_p]) < _UI_TEMPLATE_SAMPLE_LIMIT:
+                success, encoded = cv2.imencode(".png", aligned)
+                if success:
+                    pages_by_local_idx[local_p].append(encoded.tobytes())
 
     dynamic_templates = generate_dynamic_templates(pages_by_local_idx)
+    _save_ui_template_cache(cache_path, dynamic_templates)
 
     # auto_detect_checkboxes 함수는 BGR 형태를 요구하므로 변환해서 반환합니다.
     bgr_templates = {}
@@ -256,29 +411,84 @@ def generate_ui_templates_multi(
     progress_cb=None,
 ) -> dict[int, np.ndarray]:
     """여러 PDF에서 템플릿을 생성하고 병합하여 더 정확한 템플릿을 만듭니다."""
-    if not pdf_paths:
+    if not pdf_paths or page_count <= 0:
         return {}
 
-    all_by_local_idx = {i: [] for i in range(page_count)}
-    ref_aligners = None
+    cache_path = _ui_template_cache_path(
+        pdf_paths, page_count, rot_code, fine_angle, "multi"
+    )
+    cached_templates = _load_ui_template_cache(cache_path)
+    if cached_templates is not None:
+        if progress_cb:
+            progress_cb(100, "캐시된 병합 템플릿 불러오기 완료")
+        return {
+            key: cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
+            for key, value in cached_templates.items()
+        }
 
-    for f_i, fpath in enumerate(pdf_paths):
+    page_totals = []
+    full_capacities = []
+    partial_page_counts = []
+    for fpath in pdf_paths:
         try:
-            pages = load_pdf_pages(fpath, gray=True)
+            with fitz.open(fpath) as doc:
+                total_pages = len(doc)
+        except Exception:
+            total_pages = 0
+        page_totals.append(total_pages)
+        full_capacities.append(total_pages // page_count)
+        partial_page_counts.append(total_pages % page_count)
+
+    # 완전한 설문을 먼저 균등 배분하고, 남는 한도에만 partial survey를 사용합니다.
+    full_quotas = [0] * len(pdf_paths)
+    remaining = _UI_TEMPLATE_SAMPLE_LIMIT
+    while remaining > 0:
+        progressed = False
+        for index, capacity in enumerate(full_capacities):
+            if full_quotas[index] >= capacity:
+                continue
+            full_quotas[index] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+
+    selected_page_counts = [quota * page_count for quota in full_quotas]
+    if remaining > 0:
+        for index, partial_pages in enumerate(partial_page_counts):
+            if partial_pages <= 0:
+                continue
+            selected_page_counts[index] += partial_pages
+            remaining -= 1
+            if remaining == 0:
+                break
+
+    all_by_local_idx = {i: [] for i in range(page_count)}
+    ref_aligners: dict[int, ImageAligner] = {}
+
+    for f_i, (fpath, sample_page_count) in enumerate(
+        zip(pdf_paths, selected_page_counts)
+    ):
+        if sample_page_count <= 0:
+            if progress_cb:
+                progress_cb(
+                    int((f_i + 1) / len(pdf_paths) * 100), "템플릿 병합 중..."
+                )
+            continue
+
+        sample_page_count = min(page_totals[f_i], sample_page_count)
+        try:
+            pages = load_pdf_pages(
+                fpath,
+                gray=True,
+                page_indices=list(range(sample_page_count)),
+            )
         except Exception:
             continue
 
-        if not pages or page_count <= 0:
-            continue
-
-        if ref_aligners is None:
-            ref_aligners = [
-                ImageAligner(apply_rotation(p, rot_code, fine_angle))
-                for p in pages[:page_count]
-            ]
-
         survey_count = _survey_count(len(pages), page_count)
-
         for survey_idx in range(survey_count):
             for local_p in range(page_count):
                 global_p = survey_idx * page_count + local_p
@@ -286,21 +496,23 @@ def generate_ui_templates_multi(
                     break
 
                 orig = apply_rotation(pages[global_p], rot_code, fine_angle)
-                aligner = (
-                    ref_aligners[local_p]
-                    if local_p < len(ref_aligners)
-                    else ref_aligners[-1]
-                )
+                aligner = ref_aligners.get(local_p)
+                if aligner is None:
+                    aligner = ImageAligner(orig)
+                    ref_aligners[local_p] = aligner
                 aligned = aligner.align(orig)
-                if len(all_by_local_idx[local_p]) < 50:
-                    all_by_local_idx[local_p].append(
-                        cv2.imencode(".png", aligned)[1].tobytes()
-                    )
+                success, encoded = cv2.imencode(".png", aligned)
+                if success:
+                    all_by_local_idx[local_p].append(encoded.tobytes())
 
         if progress_cb:
             progress_cb(int((f_i + 1) / len(pdf_paths) * 100), "템플릿 병합 중...")
 
+    if progress_cb:
+        progress_cb(100, "템플릿 병합 완료")
+
     dynamic_templates = generate_dynamic_templates(all_by_local_idx)
+    _save_ui_template_cache(cache_path, dynamic_templates)
 
     bgr_templates = {}
     for k, v in dynamic_templates.items():
@@ -493,18 +705,22 @@ def extract_pure_ink_mask(
     target_gray: np.ndarray,
     template_gray: np.ndarray,
     template_dilate_pct: float = 0.3,
+    prepared_template_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """템플릿을 대상에 미세 정합해 제거하고 순수 사용자 잉크만 추출합니다."""
     if target_gray.ndim == 3:
         target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
-    if template_gray.ndim == 3:
-        template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
 
     # 1. 대상과 템플릿의 어두운 픽셀 마스크 생성
     _, target_mask = cv2.threshold(target_gray, 200, 255, cv2.THRESH_BINARY_INV)
-    _, template_mask = cv2.threshold(
-        template_gray, 200, 255, cv2.THRESH_BINARY_INV
-    )
+    if prepared_template_mask is None:
+        if template_gray.ndim == 3:
+            template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
+        _, template_mask = cv2.threshold(
+            template_gray, 200, 255, cv2.THRESH_BINARY_INV
+        )
+    else:
+        template_mask = prepared_template_mask
 
     # 2. 템플릿 마스크만 미세 회전·이동하여 대상의 인쇄선을 최대한 덮음
     template_mask = _align_template_mask_by_coverage(template_mask, target_mask)
@@ -627,6 +843,19 @@ def _select_working_boxes(
     return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=2.0)
 
 
+def _prepare_field_plans(
+    config: TemplatePreset,
+) -> list[tuple[Field, list[Box], bool]]:
+    """설문마다 동일한 박스 정렬·확장 결과를 분석 시작 전에 한 번만 계산합니다."""
+    all_boxes = [box for field in config.fields for box in field.boxes]
+    plans = []
+    for field in config.fields:
+        sorted_boxes = sort_boxes_z_pattern(field.boxes)
+        working_boxes = _select_working_boxes(field, sorted_boxes, all_boxes)
+        plans.append((field, working_boxes, is_contiguous_group(sorted_boxes)))
+    return plans
+
+
 def _collect_ink_data(
     working_boxes: list[Box],
     pure_ink_masks: dict[int, np.ndarray],
@@ -656,7 +885,11 @@ def _collect_ink_data(
 
 
 def process_survey_data(
-    survey_data: dict, config: TemplatePreset, dynamic_templates: dict[int, np.ndarray]
+    survey_data: dict,
+    config: TemplatePreset,
+    dynamic_templates: dict[int, np.ndarray],
+    template_masks: dict[int, np.ndarray] | None = None,
+    field_plans: list[tuple[Field, list[Box], bool]] | None = None,
 ) -> tuple[dict, dict, dict, dict, dict, dict]:
     fname = survey_data.get("fname", "")
     survey_label = survey_data["row_title"]
@@ -666,10 +899,14 @@ def process_survey_data(
     if survey_gray_pages:
         first = next(iter(survey_gray_pages.values()))
         if isinstance(first, bytes):
-            survey_gray_pages = {
-                k: cv2.imdecode(np.frombuffer(v, np.uint8), cv2.IMREAD_GRAYSCALE)
-                for k, v in survey_gray_pages.items()
-            }
+            decoded_pages = {}
+            for local_p, data in survey_gray_pages.items():
+                image = cv2.imdecode(
+                    np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE
+                )
+                if image is not None:
+                    decoded_pages[local_p] = image
+            survey_gray_pages = decoded_pages
     survey_ink_only_images = {}
     comment_hits = set()
 
@@ -681,7 +918,10 @@ def process_survey_data(
     for local_p, gray_img in survey_gray_pages.items():
         if local_p in dynamic_templates:
             mask = extract_pure_ink_mask(
-                gray_img, dynamic_templates[local_p], config.template_dilate_pct
+                gray_img,
+                dynamic_templates[local_p],
+                config.template_dilate_pct,
+                template_masks.get(local_p) if template_masks else None,
             )
             pure_ink_masks[local_p] = mask
 
@@ -689,16 +929,9 @@ def process_survey_data(
             survey_ink_only_images[local_p] = ink_display
             ink_annotations[local_p] = []
 
-    all_boxes_in_config = [b for f in config.fields for b in f.boxes]
+    plans = field_plans if field_plans is not None else _prepare_field_plans(config)
 
-    for field in config.fields:
-        z_sorted_boxes = sort_boxes_z_pattern(field.boxes)
-        is_contiguous = is_contiguous_group(z_sorted_boxes)
-
-        working_boxes = _select_working_boxes(
-            field, z_sorted_boxes, all_boxes_in_config
-        )
-
+    for field, working_boxes, is_contiguous in plans:
         inks, areas, valid_boxes = _collect_ink_data(working_boxes, pure_ink_masks)
 
         if field.is_comment:
@@ -812,29 +1045,9 @@ def _render_survey_pages(
     rot_code: int,
     fine_angle: float,
     dpi: int,
-    inner_pool: ThreadPoolExecutor | None,
 ) -> dict[int, np.ndarray]:
-    """한 설문의 모든 페이지를 렌더링+정합. inner_pool이 있으면 병렬 처리."""
-    if inner_pool and page_count > 1:
-        futures = {}
-        for local_p in range(page_count):
-            global_p = survey_idx * page_count + local_p
-            if global_p >= len(doc):
-                break
-            future = inner_pool.submit(
-                _render_aligned_page,
-                doc, global_p, local_p, aligners, rot_code, fine_angle, dpi,
-            )
-            futures[future] = local_p
-
-        result: dict[int, np.ndarray] = {}
-        for future in as_completed(futures):
-            local_p, aligned = future.result()
-            result[local_p] = aligned
-        return result
-
-    # 순차 처리 (page_count == 1 또는 pool 미제공)
-    result: dict[int, np.ndarray] = {}
+    """한 설문의 페이지를 순차 렌더링·정합합니다."""
+    sequential_result: dict[int, np.ndarray] = {}
     for local_p in range(page_count):
         global_p = survey_idx * page_count + local_p
         if global_p >= len(doc):
@@ -842,8 +1055,8 @@ def _render_survey_pages(
         _, aligned = _render_aligned_page(
             doc, global_p, local_p, aligners, rot_code, fine_angle, dpi
         )
-        result[local_p] = aligned
-    return result
+        sequential_result[local_p] = aligned
+    return sequential_result
 
 
 # ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
@@ -859,81 +1072,135 @@ def _collect_template_samples(
         doc = fitz.open(fpath)
     except Exception as e:
         print(f"파일 로드 실패 ({fname}): {e}")
-        return fname, {}
+        return _file_key(fpath), {}
 
     page_count = config.page_count
     f_pages: dict[int, list[bytes]] = {i: [] for i in range(page_count)}
     survey_count = _survey_count(len(doc), page_count)
     limit = min(survey_count, sample_limit)
 
-    # 설문 내 페이지 병렬 처리를 위한 inner pool
-    inner_workers = min(4, page_count)
-    inner_pool = ThreadPoolExecutor(max_workers=inner_workers) if inner_workers > 1 else None
-
     try:
         for survey_idx in range(limit):
             pages = _render_survey_pages(
-                doc, survey_idx, page_count, aligners,
-                config.rot_code, config.fine_angle, dpi, inner_pool,
+                doc,
+                survey_idx,
+                page_count,
+                aligners,
+                config.rot_code,
+                config.fine_angle,
+                dpi,
             )
             for local_p, aligned in pages.items():
-                if len(f_pages[local_p]) < sample_limit:
-                    f_pages[local_p].append(cv2.imencode(".png", aligned)[1].tobytes())
+                if len(f_pages[local_p]) >= sample_limit:
+                    continue
+                success, encoded = cv2.imencode(".png", aligned)
+                f_pages[local_p].append(encoded.tobytes() if success else b"")
     finally:
-        if inner_pool:
-            inner_pool.shutdown(wait=False)
         doc.close()
 
-    return fname, f_pages
+    return _file_key(fpath), f_pages
+
+
+def _decode_sampled_survey(
+    sample_pages: dict[int, list[bytes]] | None,
+    survey_idx: int,
+    expected_pages: int,
+) -> dict[int, np.ndarray] | None:
+    """Phase 1에서 만든 lossless PNG를 재사용해 중복 렌더링·정합을 피합니다."""
+    if not sample_pages:
+        return None
+
+    decoded: dict[int, np.ndarray] = {}
+    for local_p in range(expected_pages):
+        samples = sample_pages.get(local_p, [])
+        if survey_idx >= len(samples):
+            return None
+        data = samples[survey_idx]
+        if not data:
+            return None
+        image = cv2.imdecode(
+            np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE
+        )
+        if image is None:
+            return None
+        decoded[local_p] = image
+    return decoded
 
 
 # ── Phase 2 Worker: 파일 1개 전체 분석 (스레드 안전) ──
 def _analyze_single_file(
     fpath: str,
+    file_label: str,
     config: TemplatePreset,
-    file_templates: dict[str, dict[int, np.ndarray]],
+    file_template: dict[int, np.ndarray],
     reference_templates: dict[int, np.ndarray],
     aligners: list,
     review_folder: Path,
     dpi: int = 300,
-) -> tuple[str, list[dict], dict[int, np.ndarray]]:
-    fname = Path(fpath).stem
+    sample_pages: dict[int, list[bytes]] | None = None,
+) -> tuple[str, list[dict], list[bytes]]:
     try:
         doc = fitz.open(fpath)
     except Exception as e:
-        print(f"파일 로드 실패 ({fname}): {e}")
-        return fname, [], {}
+        raise RuntimeError(f"파일 로드 실패: {e}") from e
 
-    survey_count = _survey_count(len(doc), config.page_count)
-    f_template = file_templates.get(fname, reference_templates)
-    page_count = config.page_count
-    rot_code = config.rot_code
-    fine_angle = config.fine_angle
-
-    out_orig = fitz.open()
-    out_ink = fitz.open()
-    file_results: list[dict] = []
-    comment_pages: list[np.ndarray] = []
-
-    # 설문 내 페이지 병렬 처리를 위한 inner pool
-    inner_workers = min(4, page_count)
-    inner_pool = ThreadPoolExecutor(max_workers=inner_workers) if inner_workers > 1 else None
-
+    out_orig = None
+    out_ink = None
     try:
-        for survey_idx in range(survey_count):
-            survey_gray_pages = _render_survey_pages(
-                doc, survey_idx, page_count, aligners,
-                rot_code, fine_angle, dpi, inner_pool,
+        out_orig = fitz.open()
+        out_ink = fitz.open()
+        survey_count = _survey_count(len(doc), config.page_count)
+        f_template = file_template or reference_templates
+        template_masks = {}
+        for local_p, template in f_template.items():
+            gray_template = (
+                cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                if template.ndim == 3
+                else template
             )
+            template_masks[local_p] = cv2.threshold(
+                gray_template, 200, 255, cv2.THRESH_BINARY_INV
+            )[1]
+        field_plans = _prepare_field_plans(config)
+
+        page_count = config.page_count
+        rot_code = config.rot_code
+        fine_angle = config.fine_angle
+        file_results: list[dict] = []
+        comment_pages: list[bytes] = []
+
+        for survey_idx in range(survey_count):
+            expected_pages = min(
+                page_count, max(0, len(doc) - survey_idx * page_count)
+            )
+            survey_gray_pages = _decode_sampled_survey(
+                sample_pages, survey_idx, expected_pages
+            )
+            if survey_gray_pages is None:
+                survey_gray_pages = _render_survey_pages(
+                    doc,
+                    survey_idx,
+                    page_count,
+                    aligners,
+                    rot_code,
+                    fine_angle,
+                    dpi,
+                )
 
             survey_data = {
-                "fname": fname,
-                "row_title": f"{fname}_{survey_idx + 1}p",
+                "fname": file_label,
+                "row_title": f"{file_label}_{survey_idx + 1}p",
                 "gray_pages": survey_gray_pages,
             }
 
             row_data, debug_base, ink_base, debug_ann, ink_ann, cp = (
-                process_survey_data(survey_data, config, f_template)
+                process_survey_data(
+                    survey_data,
+                    config,
+                    f_template,
+                    template_masks,
+                    field_plans,
+                )
             )
 
             field_values = [
@@ -942,34 +1209,31 @@ def _analyze_single_file(
             if any(v.strip() for v in field_values):
                 file_results.append(row_data)
 
-            for local_p in sorted(debug_base.keys()):
+            for local_p in sorted(debug_base):
                 _build_vector_page(
                     out_orig, debug_base[local_p], debug_ann.get(local_p, [])
                 )
-            for local_p in sorted(ink_base.keys()):
+            for local_p in sorted(ink_base):
                 _build_vector_page(
                     out_ink, ink_base[local_p], ink_ann.get(local_p, [])
                 )
-            for local_p in sorted(cp.keys()):
-                comment_pages.append(cp[local_p])
+            for local_p in sorted(cp):
+                image_bytes = _encode_jpeg(cp[local_p])
+                if image_bytes:
+                    comment_pages.append(image_bytes)
 
-            del row_data, debug_base, ink_base, debug_ann, ink_ann, cp
-            del survey_gray_pages, survey_data
-            gc.collect()
+        if len(out_orig) > 0:
+            out_orig.save(review_folder / f"{file_label}_원본포함.pdf")
+        if len(out_ink) > 0:
+            out_ink.save(review_folder / f"{file_label}_잉크추출.pdf")
+
+        return file_label, file_results, comment_pages
     finally:
-        if inner_pool:
-            inner_pool.shutdown(wait=False)
         doc.close()
-
-    # 파일별 출력 PDF 저장 + 해제
-    if len(out_orig) > 0:
-        out_orig.save(review_folder / f"{fname}_원본포함.pdf")
-    out_orig.close()
-    if len(out_ink) > 0:
-        out_ink.save(review_folder / f"{fname}_잉크추출.pdf")
-    out_ink.close()
-
-    return fname, file_results, comment_pages
+        if out_orig is not None:
+            out_orig.close()
+        if out_ink is not None:
+            out_ink.close()
 
 
 def run_analysis(
@@ -987,21 +1251,10 @@ def run_analysis(
 
     report_progress(0, "분석 준비 중...")
 
-    # ── 전체 설문 개수 파악 (진행률 표시용) ──
-    total_surveys = 0
-    for fpath in file_paths:
-        try:
-            doc = fitz.open(fpath)
-            total_surveys += _survey_count(len(doc), config.page_count)
-            doc.close()
-        except Exception:
-            continue
-    if total_surveys <= 0:
-        total_surveys = 1
-
     num_files = len(file_paths)
     if num_files == 0:
         return False
+    file_labels = _build_file_labels(file_paths)
 
     # ── 페이지 정합기 (모든 스레드에서 읽기 전용으로 공유) ──
     aligners = [
@@ -1014,20 +1267,25 @@ def run_analysis(
     # ══════════════════════════════════════
     report_progress(0, "템플릿 샘플 수집 중...")
     sample_results: dict[str, dict[int, list[bytes]]] = {}
-    max_workers = min(8, num_files)
+    # OpenCV도 내부 스레드를 사용하므로 파일 단위 작업은 2개까지만 병렬화합니다.
+    max_workers = min(2, num_files)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 _collect_template_samples, fpath, config, aligners
-            ): fpath
-            for fpath in file_paths
+            ): index
+            for index, fpath in enumerate(file_paths)
         }
         completed = 0
         for future in as_completed(futures):
-            fname, f_pages = future.result()
-            if f_pages:
-                sample_results[fname] = f_pages
+            index = futures[future]
+            try:
+                file_key, f_pages = future.result()
+                if f_pages:
+                    sample_results[file_key] = f_pages
+            except Exception as e:
+                print(f"템플릿 샘플 수집 실패 ({file_labels[index]}): {e}")
             completed += 1
             report_progress(
                 int(completed / num_files * 8),
@@ -1040,20 +1298,20 @@ def run_analysis(
     file_templates: dict[str, dict[int, np.ndarray]] = {}
 
     for fpath in file_paths:
-        fname = Path(fpath).stem
-        f_pages = sample_results.get(fname, {})
+        file_key = _file_key(fpath)
+        f_pages = sample_results.get(file_key, {})
         if not f_pages:
-            file_templates[fname] = {}
+            file_templates[file_key] = {}
             continue
 
         file_template = generate_dynamic_templates(f_pages)
         if not file_template:
-            file_templates[fname] = {}
+            file_templates[file_key] = {}
             continue
 
         if reference_templates is None:
             reference_templates = file_template
-            file_templates[fname] = file_template
+            file_templates[file_key] = file_template
         else:
             aligned_tpl: dict[int, np.ndarray] = {}
             for local_p, tpl in file_template.items():
@@ -1062,73 +1320,96 @@ def run_analysis(
                     aligned_tpl[local_p] = a.align(tpl)
                 else:
                     aligned_tpl[local_p] = tpl
-            file_templates[fname] = aligned_tpl
-
-    del sample_results
-    gc.collect()
+            file_templates[file_key] = aligned_tpl
 
     if reference_templates is None:
         print("템플릿 생성에 실패했습니다.")
         return False
 
-    for fname in file_templates:
-        if not file_templates[fname]:
-            file_templates[fname] = reference_templates
+    for file_key in file_templates:
+        if not file_templates[file_key]:
+            file_templates[file_key] = reference_templates
 
     # ── 검토용 템플릿 PDF 저장 ──
     template_pdf = fitz.open()
-    for local_p in sorted(reference_templates.keys()):
-        _insert_img_into_pdf(template_pdf, reference_templates[local_p], quality=90)
-    if len(template_pdf) > 0:
-        template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
-    template_pdf.close()
+    try:
+        for local_p in sorted(reference_templates):
+            _insert_img_into_pdf(
+                template_pdf, reference_templates[local_p], quality=90
+            )
+        if len(template_pdf) > 0:
+            template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
+    finally:
+        template_pdf.close()
 
     # ══════════════════════════════════════
     # Phase 2: 파일별 분석 병렬 처리
     # ══════════════════════════════════════
     report_progress(10, "분석 시작 중...")
-    all_results: list[dict] = []
-    all_comment_pages: list[np.ndarray] = []
+    ordered_outputs: list[tuple[list[dict], list[bytes]] | None] = [None] * num_files
+    analysis_failures: list[str] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
+        futures = {}
+        for index, (fpath, file_label) in enumerate(zip(file_paths, file_labels)):
+            file_key = _file_key(fpath)
+            future = executor.submit(
                 _analyze_single_file,
                 fpath,
+                file_label,
                 config,
-                file_templates,
+                file_templates.get(file_key, reference_templates),
                 reference_templates,
                 aligners,
                 review_folder,
-            ): fpath
-            for fpath in file_paths
-        }
+                sample_pages=sample_results.get(file_key),
+            )
+            futures[future] = index
+
         completed = 0
         for future in as_completed(futures):
+            index = futures[future]
+            file_key = _file_key(file_paths[index])
             try:
-                fname, file_results, cp_list = future.result()
-                all_results.extend(file_results)
-                if cp_list:
-                    all_comment_pages.extend(cp_list)
+                _, file_results, comment_pages = future.result()
+                ordered_outputs[index] = (file_results, comment_pages)
             except Exception as e:
-                print(f"분석 실패: {e}")
+                analysis_failures.append(file_labels[index])
+                print(f"분석 실패 ({file_labels[index]}): {e}")
+            finally:
+                sample_results.pop(file_key, None)
             completed += 1
             report_progress(
                 10 + int(completed / num_files * 88),
                 f"분석 중... ({completed}/{num_files})",
             )
 
+    sample_results.clear()
+    all_results: list[dict] = []
+    all_comment_pages: list[bytes] = []
+    for output in ordered_outputs:
+        if output is None:
+            continue
+        file_results, comment_pages = output
+        all_results.extend(file_results)
+        all_comment_pages.extend(comment_pages)
+
     # ── 의견 PDF 병합 저장 ──
+    comment_path = Path("의견.pdf")
     comment_doc = fitz.open()
-    for img in all_comment_pages:
-        _insert_img_into_pdf(comment_doc, img)
-    if len(comment_doc) > 0:
-        comment_doc.save("의견.pdf")
-    comment_doc.close()
+    try:
+        for image_bytes in all_comment_pages:
+            _insert_encoded_img_into_pdf(comment_doc, image_bytes)
+        if len(comment_doc) > 0:
+            comment_doc.save(comment_path)
+        elif comment_path.exists():
+            comment_path.unlink()
+    finally:
+        comment_doc.close()
     del all_comment_pages
 
     # ── 엑셀 저장 ──
     report_progress(98, "엑셀 저장 중...")
     success = export_to_excel(all_results, config)
     report_progress(100, "완료")
-    return success
+    return success and not analysis_failures
