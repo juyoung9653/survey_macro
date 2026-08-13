@@ -4,7 +4,18 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from src.processor import _align_template_mask_by_coverage, extract_pure_ink_mask
+from src.models import Box, Field, TemplatePreset
+from src.processor import (
+    _align_template_mask_by_coverage,
+    _checkbox_layout_is_trustworthy,
+    _remap_checkbox_layout,
+    evaluate_checkbox_marks,
+    evaluate_marks,
+    extract_checkbox_halo_ink_info,
+    extract_checkbox_ink_info,
+    extract_pure_ink_mask,
+    process_survey_data,
+)
 from src.vision import ImageAligner, auto_detect_checkboxes
 
 
@@ -137,6 +148,589 @@ class TemplateAlignmentTests(unittest.TestCase):
 
         self.assertGreater(_overlap(extracted, ink), 50)
         self.assertGreater(len(boxes), 0)
+
+    def test_checkbox_inner_ink_refines_shift_and_ignores_empty_border(self):
+        expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        actual_x, actual_y = 75, 57
+        empty = np.full((170, 250), 255, np.uint8)
+        cv2.rectangle(
+            empty,
+            (actual_x, actual_y),
+            (actual_x + 23, actual_y + 23),
+            80,
+            2,
+        )
+        marked = empty.copy()
+        cv2.line(
+            marked,
+            (actual_x + 5, actual_y + 12),
+            (actual_x + 10, actual_y + 17),
+            35,
+            2,
+        )
+        cv2.line(
+            marked,
+            (actual_x + 10, actual_y + 17),
+            (actual_x + 19, actual_y + 5),
+            35,
+            2,
+        )
+
+        empty_info = extract_checkbox_ink_info(empty, expected)
+        marked_info = extract_checkbox_ink_info(marked, expected)
+
+        self.assertAlmostEqual(marked_info.box.x, actual_x, delta=1)
+        self.assertAlmostEqual(marked_info.box.y, actual_y, delta=1)
+        self.assertEqual(empty_info.ink_pixels, 0)
+        self.assertGreater(marked_info.ink_pixels, 5)
+        self.assertEqual(
+            evaluate_checkbox_marks(
+                [empty_info.ink_pixels, marked_info.ink_pixels],
+                [empty_info.area, marked_info.area],
+            ),
+            [False, True],
+        )
+
+        border_residue = np.zeros_like(empty)
+        cv2.rectangle(
+            border_residue,
+            (actual_x, actual_y),
+            (actual_x + 23, actual_y + 23),
+            255,
+            2,
+        )
+        external_mark = border_residue.copy()
+        cv2.line(
+            external_mark,
+            (actual_x + 20, actual_y + 21),
+            (actual_x + 34, actual_y + 7),
+            255,
+            3,
+        )
+
+        empty_halo, _ = extract_checkbox_halo_ink_info(
+            border_residue, marked_info.box
+        )
+        marked_halo, _ = extract_checkbox_halo_ink_info(
+            external_mark, marked_info.box
+        )
+        self.assertEqual(empty_halo, 0)
+        self.assertGreater(marked_halo, 5)
+
+    def test_file_template_remaps_reflowed_checkbox_row_by_order(self):
+        template = np.full((300, 420), 255, np.uint8)
+        expected_positions = [
+            (60, 70),
+            (160, 70),
+            (260, 70),
+            (60, 160),
+            (160, 160),
+            (260, 160),
+        ]
+        actual_positions = [
+            (60, 70),
+            (130, 70),
+            (310, 70),
+            (60, 160),
+            (160, 160),
+            (260, 160),
+        ]
+        for x, y in actual_positions:
+            cv2.rectangle(template, (x, y), (x + 23, y + 23), 0, 2)
+
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 24, 24) for x, y in expected_positions],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        remapped = _remap_checkbox_layout(config, {0: template})
+        actual_centers = [(x + 12, y + 12) for x, y in actual_positions]
+        remapped_centers = [
+            (box.x + box.w / 2, box.y + box.h / 2)
+            for box in remapped.fields[0].boxes
+        ]
+
+        self.assertEqual(config.fields[0].boxes[1].x, 160)
+        for remapped_center, actual_center in zip(remapped_centers, actual_centers):
+            self.assertAlmostEqual(remapped_center[0], actual_center[0], delta=4)
+            self.assertAlmostEqual(remapped_center[1], actual_center[1], delta=4)
+
+    def test_checkbox_layout_is_trusted_only_when_every_frame_is_detected(self):
+        template = np.full((300, 420), 255, np.uint8)
+        positions = [
+            (60, 70),
+            (160, 70),
+            (260, 70),
+            (60, 160),
+            (160, 160),
+            (260, 160),
+        ]
+        for x, y in positions:
+            cv2.rectangle(template, (x, y), (x + 23, y + 23), 0, 2)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 24, 24) for x, y in positions],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        remapped = _remap_checkbox_layout(config, {0: template})
+        incomplete = template.copy()
+        incomplete[65:100, 255:295] = 255
+
+        self.assertTrue(_checkbox_layout_is_trustworthy(remapped, {0: template}))
+        self.assertFalse(
+            _checkbox_layout_is_trustworthy(remapped, {0: incomplete})
+        )
+
+    def test_repeated_mark_is_detected_when_median_template_contains_it(self):
+        page = np.full((220, 320), 255, np.uint8)
+        first_box = Box(page_idx=0, x=70, y=90, w=24, h=24)
+        second_box = Box(page_idx=0, x=160, y=90, w=24, h=24)
+        for box in (first_box, second_box):
+            cv2.rectangle(
+                page,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+        cv2.line(page, (75, 102), (81, 108), 30, 2)
+        cv2.line(page, (81, 108), (89, 96), 30, 2)
+
+        # 모든 표본에 같은 체크가 있으면 중앙값 템플릿도 체크를 포함합니다.
+        contaminated_template = page.copy()
+        old_mask = extract_pure_ink_mask(
+            page, contaminated_template, template_dilate_pct=0.0
+        )
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[first_box, second_box],
+                    value_map=["첫째", "둘째"],
+                )
+            ],
+        )
+
+        row, _, ink_images, _, annotations, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: contaminated_template},
+        )
+
+        self.assertEqual(cv2.countNonZero(old_mask), 0)
+        self.assertEqual(row["Q"], "첫째")
+        self.assertGreater(cv2.countNonZero(cv2.bitwise_not(ink_images[0])), 0)
+        self.assertEqual([item[-1] for item in annotations[0]], [True, False])
+
+    def test_checkbox_row_remap_uses_global_one_to_one_matching_when_neighbor_missing(
+        self,
+    ):
+        template = np.full((220, 240), 255, np.uint8)
+        original_first_row = [(50, 70), (110, 70)]
+        original_second_row = [(50, 100), (110, 100)]
+        detected_second_row = [(60, 100), (130, 100)]
+        for x, y in original_first_row + detected_second_row:
+            cv2.rectangle(template, (x, y), (x + 23, y + 23), 80, 2)
+
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q1",
+                    boxes=[Box(0, x, y, 24, 24) for x, y in original_first_row],
+                    value_map=["A1", "A2"],
+                ),
+                Field(
+                    name="Q2",
+                    boxes=[Box(0, x, y, 24, 24) for x, y in original_second_row],
+                    value_map=["B1", "B2"],
+                ),
+            ],
+        )
+
+        with patch(
+            "src.processor.auto_detect_checkboxes",
+            return_value=[(x, y, 24, 24) for x, y in detected_second_row],
+        ):
+            remapped = _remap_checkbox_layout(config, {0: template})
+
+        remapped_positions = {
+            field.name: [(box.x, box.y) for box in field.boxes]
+            for field in remapped.fields
+        }
+        self.assertEqual(
+            remapped_positions,
+            {
+                "Q1": original_first_row,
+                "Q2": detected_second_row,
+            },
+        )
+        self.assertEqual(remapped.fields[0].value_map, ["A1", "A2"])
+        self.assertEqual(remapped.fields[1].value_map, ["B1", "B2"])
+
+    def test_checkbox_halo_rejects_shifted_empty_border_and_accepts_connected_check(
+        self,
+    ):
+        expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        actual_x, actual_y = 75, 57
+        empty_page = np.full((150, 220), 255, np.uint8)
+        cv2.rectangle(
+            empty_page,
+            (actual_x, actual_y),
+            (actual_x + 23, actual_y + 23),
+            80,
+            2,
+        )
+        empty_residue = np.zeros_like(empty_page)
+        cv2.rectangle(
+            empty_residue,
+            (actual_x, actual_y),
+            (actual_x + 23, actual_y + 23),
+            255,
+            2,
+        )
+
+        marked_page = empty_page.copy()
+        marked_residue = empty_residue.copy()
+        check_start = (actual_x + 20, actual_y + 21)
+        check_end = (actual_x + 34, actual_y + 7)
+        cv2.line(marked_page, check_start, check_end, 30, 3)
+        cv2.line(marked_residue, check_start, check_end, 255, 3)
+
+        empty_ink, empty_area = extract_checkbox_halo_ink_info(
+            empty_residue,
+            expected,
+            target_gray=empty_page,
+        )
+        marked_ink, marked_area = extract_checkbox_halo_ink_info(
+            marked_residue,
+            expected,
+            target_gray=marked_page,
+        )
+
+        self.assertEqual(
+            evaluate_marks([empty_ink], [empty_area], is_contiguous=False),
+            [False],
+        )
+        self.assertEqual(
+            evaluate_marks([marked_ink], [marked_area], is_contiguous=False),
+            [True],
+        )
+
+    def test_connected_halo_stroke_is_owned_by_the_box_it_marks(self):
+        boxes = [
+            Box(page_idx=0, x=70, y=60, w=24, h=24),
+            Box(page_idx=0, x=70, y=110, w=24, h=24),
+            Box(page_idx=0, x=160, y=110, w=24, h=24),
+        ]
+        template = np.full((190, 240), 255, np.uint8)
+        for box in boxes:
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cv2.line(page, (91, 131), (104, 119), 30, 3)
+        cv2.line(page, (104, 119), (91, 82), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=boxes,
+                    value_map=["grazed-blank", "actual", "empty"],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+        )
+
+        self.assertEqual(row["Q"], "actual")
+
+    def test_separate_external_checks_keep_separate_checkbox_owners(self):
+        boxes = [
+            Box(page_idx=0, x=70, y=60, w=24, h=24),
+            Box(page_idx=0, x=70, y=110, w=24, h=24),
+            Box(page_idx=0, x=160, y=110, w=24, h=24),
+        ]
+        template = np.full((190, 240), 255, np.uint8)
+        for box in boxes:
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cv2.line(page, (91, 81), (104, 68), 30, 3)
+        cv2.line(page, (91, 131), (104, 118), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=boxes,
+                    value_map=["first", "second", "empty"],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+        )
+
+        self.assertEqual(row["Q"], "first,second")
+
+    def test_neighbor_field_check_does_not_mark_grazed_blank_box(self):
+        marked_box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        blank_box = Box(page_idx=0, x=70, y=104, w=24, h=24)
+        template = np.full((170, 220), 255, np.uint8)
+        for box in (marked_box, blank_box):
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cv2.line(page, (76, 71), (82, 78), 30, 3)
+        cv2.line(page, (82, 78), (91, 105), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(name="A", boxes=[marked_box], value_map=["marked"]),
+                Field(name="B", boxes=[blank_box], value_map=["false-positive"]),
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+        )
+
+        self.assertEqual(row["A"], "marked")
+        self.assertEqual(row["B"], "")
+
+    def test_single_choice_prefers_strong_halo_check_over_three_pixel_direct_noise(
+        self,
+    ):
+        template = np.full((220, 320), 255, np.uint8)
+        boxes = [
+            Box(page_idx=0, x=70, y=90, w=24, h=24),
+            Box(page_idx=0, x=160, y=90, w=24, h=24),
+        ]
+        for box in boxes:
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        page[102, 80:83] = 30
+        cv2.line(page, (180, 111), (194, 97), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=boxes,
+                    value_map=["noise", "actual"],
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+        )
+
+        self.assertEqual(row["Q"], "actual")
+
+    def test_open_line_intersection_is_not_a_reliable_checkbox(self):
+        page = np.full((140, 180), 255, np.uint8)
+        expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        cv2.line(page, (76, 55), (76, 90), 20, 2)
+        cv2.line(page, (60, 66), (100, 66), 20, 2)
+        cv2.circle(page, (86, 76), 2, 20, -1)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[expected],
+                    value_map=["false-positive"],
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: page.copy()},
+        )
+
+        self.assertEqual(row["Q"], "")
+
+    def test_repeated_external_check_is_recovered_from_original_page(self):
+        page = np.full((220, 320), 255, np.uint8)
+        first_box = Box(page_idx=0, x=70, y=90, w=24, h=24)
+        second_box = Box(page_idx=0, x=160, y=90, w=24, h=24)
+        for box in (first_box, second_box):
+            cv2.rectangle(
+                page,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+        cv2.line(page, (90, 111), (104, 97), 30, 3)
+
+        contaminated_template = page.copy()
+        pure_ink = extract_pure_ink_mask(
+            page,
+            contaminated_template,
+            template_dilate_pct=0.0,
+        )
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[first_box, second_box],
+                    value_map=["edge-check", "empty"],
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: contaminated_template},
+        )
+
+        self.assertEqual(cv2.countNonZero(pure_ink), 0)
+        self.assertEqual(row["Q"], "edge-check")
+
+    def test_multi_response_direct_scoring_rejects_three_pixel_noise(self):
+        self.assertEqual(
+            evaluate_checkbox_marks(
+                [3, 30],
+                [14 * 14, 14 * 14],
+                strict=True,
+            ),
+            [False, True],
+        )
+
+    def test_trusted_file_layout_recovers_check_from_faded_page(self):
+        page = np.full((220, 320), 255, np.uint8)
+        first_box = Box(page_idx=0, x=70, y=90, w=24, h=24)
+        second_box = Box(page_idx=0, x=160, y=90, w=24, h=24)
+        for box in (first_box, second_box):
+            cv2.rectangle(
+                page,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                220,
+                1,
+            )
+        cv2.line(page, (76, 102), (81, 107), 30, 2)
+        cv2.line(page, (81, 107), (88, 97), 30, 2)
+
+        info = extract_checkbox_ink_info(page, first_box)
+        config = TemplatePreset(
+            page_count=1,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[first_box, second_box],
+                    value_map=["faded-check", "empty"],
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: page.copy()},
+            trust_checkbox_layout=True,
+        )
+
+        self.assertLess(info.border_confidence, 0.35)
+        self.assertEqual(row["Q"], "faded-check")
 
 
 if __name__ == "__main__":

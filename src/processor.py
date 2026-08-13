@@ -1,8 +1,9 @@
 import copy
+import gc
 import hashlib
 import os
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -11,11 +12,46 @@ import numpy as np
 
 from .export import export_to_excel
 from .models import Box, Field, TemplatePreset
-from .vision import ImageAligner, apply_rotation, load_pdf_pages
+from .vision import (
+    ImageAligner,
+    apply_rotation,
+    auto_detect_checkboxes,
+    load_pdf_pages,
+)
 
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_TEMPLATE_CACHE_VERSION = 5
+_CHECKBOX_MIN_BORDER_CONFIDENCE = 0.35
+
+
+@dataclass
+class _CheckboxInkInfo:
+    ink_pixels: int
+    area: int
+    box: Box
+    border_confidence: float
+    mask_bounds: tuple[int, int, int, int]
+    ink_mask: np.ndarray
+
+
+@dataclass
+class _CheckboxHaloInfo:
+    ink_pixels: int
+    area: int
+    box: Box
+    mask_bounds: tuple[int, int, int, int]
+    ink_mask: np.ndarray
+
+
+@dataclass
+class _CheckboxFieldAnalysis:
+    checkbox_infos: list[_CheckboxInkInfo]
+    reliable_direct: list[bool]
+    direct_inks: list[int]
+    direct_areas: list[int]
+    direct_results: list[bool]
+    halo_infos: list[_CheckboxHaloInfo]
 
 
 def _ui_template_cache_path(
@@ -772,6 +808,496 @@ def extract_ink_info_from_mask(pure_ink_mask: np.ndarray, box: Box) -> tuple[int
     return ink_pixels, area
 
 
+def _is_checkbox_like(box: Box, image_shape: tuple[int, ...]) -> bool:
+    """작은 정사각형 체크박스만 내부 잉크 직접 판독 대상으로 분류합니다."""
+    if box.w < 8 or box.h < 8:
+        return False
+
+    short_side = min(box.w, box.h)
+    long_side = max(box.w, box.h)
+    if long_side / short_side > 1.35:
+        return False
+
+    image_h, image_w = image_shape[:2]
+    max_side = max(48, round(min(image_h, image_w) * 0.045))
+    return long_side <= max_side
+
+
+def _refine_checkbox_box(
+    target_gray: np.ndarray,
+    box: Box,
+) -> tuple[Box, float]:
+    """예상 위치 주변의 네모 테두리를 찾아 체크박스 좌표를 국소 보정합니다."""
+    if target_gray.ndim == 3:
+        target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+
+    image_h, image_w = target_gray.shape[:2]
+    if box.w <= 0 or box.h <= 0 or box.w > image_w or box.h > image_h:
+        return copy.copy(box), 0.0
+
+    short_side = min(box.w, box.h)
+    search_radius = max(2, min(10, round(short_side * 0.4)))
+    min_candidate_x = max(0, box.x - search_radius)
+    min_candidate_y = max(0, box.y - search_radius)
+    max_candidate_x = min(image_w - box.w, box.x + search_radius)
+    max_candidate_y = min(image_h - box.h, box.y + search_radius)
+    if max_candidate_x < min_candidate_x or max_candidate_y < min_candidate_y:
+        return copy.copy(box), 0.0
+
+    border_width = max(1, round(short_side * 0.1))
+    edge_tolerance = max(2, round(short_side * 0.2))
+    span_padding = max(1, round(short_side * 0.1))
+    context_padding = edge_tolerance + span_padding + border_width
+    context_x1 = max(0, min_candidate_x - context_padding)
+    context_y1 = max(0, min_candidate_y - context_padding)
+    context_x2 = min(
+        image_w, max_candidate_x + box.w + context_padding
+    )
+    context_y2 = min(
+        image_h, max_candidate_y + box.h + context_padding
+    )
+    context = target_gray[context_y1:context_y2, context_x1:context_x2]
+
+    # auto_detect_checkboxes가 반환하는 좌표는 양식에 따라 외곽선 또는
+    # 사각형의 흰 내부 영역일 수 있습니다. 각 후보 가장자리 주변에서 실제
+    # 선을 독립적으로 찾으면 두 좌표 표현을 모두 처리하면서, 글자 획 두 개의
+    # 교차점은 닫힌 사각형으로 인정하지 않을 수 있습니다.
+    darkness = np.clip(
+        (230.0 - context.astype(np.float32)) / 80.0,
+        0.0,
+        1.0,
+    )
+    integral = cv2.integral(darkness, sdepth=cv2.CV_64F)
+
+    def mean_darkness(x_start: int, y_start: int, x_end: int, y_end: int) -> float:
+        local_x1 = max(0, x_start - context_x1)
+        local_y1 = max(0, y_start - context_y1)
+        local_x2 = min(context.shape[1], x_end - context_x1)
+        local_y2 = min(context.shape[0], y_end - context_y1)
+        if local_x2 <= local_x1 or local_y2 <= local_y1:
+            return 0.0
+        total = (
+            integral[local_y2, local_x2]
+            - integral[local_y1, local_x2]
+            - integral[local_y2, local_x1]
+            + integral[local_y1, local_x1]
+        )
+        return float(total) / ((local_x2 - local_x1) * (local_y2 - local_y1))
+
+    best_adjusted_score = float("-inf")
+    confidence = 0.0
+    best_x = box.x
+    best_y = box.y
+    offsets = range(-edge_tolerance, edge_tolerance + 1)
+    for candidate_y in range(min_candidate_y, max_candidate_y + 1):
+        for candidate_x in range(min_candidate_x, max_candidate_x + 1):
+            horizontal_x1 = candidate_x - span_padding
+            horizontal_x2 = candidate_x + box.w + span_padding
+            vertical_y1 = candidate_y - span_padding
+            vertical_y2 = candidate_y + box.h + span_padding
+            top = max(
+                mean_darkness(
+                    horizontal_x1,
+                    candidate_y + offset,
+                    horizontal_x2,
+                    candidate_y + offset + border_width,
+                )
+                for offset in offsets
+            )
+            bottom = max(
+                mean_darkness(
+                    horizontal_x1,
+                    candidate_y + box.h - border_width + offset,
+                    horizontal_x2,
+                    candidate_y + box.h + offset,
+                )
+                for offset in offsets
+            )
+            left = max(
+                mean_darkness(
+                    candidate_x + offset,
+                    vertical_y1,
+                    candidate_x + offset + border_width,
+                    vertical_y2,
+                )
+                for offset in offsets
+            )
+            right = max(
+                mean_darkness(
+                    candidate_x + box.w - border_width + offset,
+                    vertical_y1,
+                    candidate_x + box.w + offset,
+                    vertical_y2,
+                )
+                for offset in offsets
+            )
+            side_scores = (top, bottom, left, right)
+            side_score = min(side_scores) * 0.85 + float(np.mean(side_scores)) * 0.15
+            motion_penalty = (
+                abs(candidate_x - box.x) + abs(candidate_y - box.y)
+            ) * 0.003
+            adjusted_score = side_score - motion_penalty
+            if adjusted_score > best_adjusted_score:
+                best_adjusted_score = adjusted_score
+                confidence = side_score
+                best_x = candidate_x
+                best_y = candidate_y
+
+    refined = copy.copy(box)
+    if confidence >= _CHECKBOX_MIN_BORDER_CONFIDENCE:
+        refined.x = best_x
+        refined.y = best_y
+    return refined, confidence
+
+
+def extract_checkbox_ink_info(
+    target_gray: np.ndarray,
+    box: Box,
+) -> _CheckboxInkInfo:
+    """체크박스 테두리를 피한 내부의 실제 어두운 연결 성분을 측정합니다.
+
+    동적 템플릿에 반복 체크가 섞여도 원본 페이지의 빈 내부만 직접 보기 때문에
+    체크 표시가 템플릿과 함께 지워지지 않습니다.
+    """
+    if target_gray.ndim == 3:
+        target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+
+    refined, confidence = _refine_checkbox_box(target_gray, box)
+    image_h, image_w = target_gray.shape[:2]
+    short_side = min(refined.w, refined.h)
+    border_width = max(1, round(short_side * 0.1))
+    margin = max(border_width + 1, round(short_side * 0.2))
+
+    x1 = max(0, refined.x + margin)
+    y1 = max(0, refined.y + margin)
+    x2 = min(image_w, refined.x + refined.w - margin)
+    y2 = min(image_h, refined.y + refined.h - margin)
+    if x2 <= x1 or y2 <= y1:
+        return _CheckboxInkInfo(
+            0,
+            0,
+            refined,
+            confidence,
+            (x1, y1, x1, y1),
+            np.zeros((0, 0), np.uint8),
+        )
+
+    interior = target_gray[y1:y2, x1:x2]
+    paper_level = float(np.percentile(interior, 90))
+    ink_threshold = int(np.clip(paper_level - 18.0, 170.0, 225.0))
+    raw_mask = (interior < ink_threshold).astype(np.uint8)
+
+    component_mask = np.zeros_like(raw_mask)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        raw_mask, connectivity=8
+    )
+    min_component_area = max(2, round(raw_mask.size * 0.01))
+    for component_idx in range(1, component_count):
+        if stats[component_idx, cv2.CC_STAT_AREA] >= min_component_area:
+            component_mask[labels == component_idx] = 255
+
+    return _CheckboxInkInfo(
+        cv2.countNonZero(component_mask),
+        int(raw_mask.size),
+        refined,
+        confidence,
+        (x1, y1, x2, y2),
+        component_mask,
+    )
+
+
+def _extract_checkbox_halo_info(
+    pure_ink_mask: np.ndarray,
+    box: Box,
+    target_gray: np.ndarray | None = None,
+) -> _CheckboxHaloInfo:
+    """박스 테두리에 실제로 연결된 외부 체크 획만 추출합니다.
+
+    단순히 박스 주변의 모든 잉크를 합산하면 인접 글자와 미세하게 어긋난
+    빈 사각 테두리까지 체크로 세게 됩니다. 원본 페이지가 있으면 박스 위치를
+    다시 확인한 뒤, 테두리와 연결된 성분에서 사각 프레임과 내부를 제거합니다.
+    이렇게 하면 중앙값 템플릿에 반복 체크가 포함된 경우에도 외부 획을 복구할
+    수 있습니다.
+    """
+    working_box = copy.copy(box)
+    if target_gray is not None:
+        if target_gray.ndim == 3:
+            target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+        refined_box, confidence = _refine_checkbox_box(target_gray, working_box)
+        if confidence >= _CHECKBOX_MIN_BORDER_CONFIDENCE:
+            working_box = refined_box
+
+    image_h, image_w = pure_ink_mask.shape[:2]
+    short_side = min(working_box.w, working_box.h)
+    padding = max(4, round(short_side * 0.7))
+    x1 = max(0, working_box.x - padding)
+    y1 = max(0, working_box.y - padding)
+    x2 = min(image_w, working_box.x + working_box.w + padding)
+    y2 = min(image_h, working_box.y + working_box.h + padding)
+    if x2 <= x1 or y2 <= y1:
+        return _CheckboxHaloInfo(
+            0,
+            0,
+            working_box,
+            (x1, y1, x1, y1),
+            np.zeros((0, 0), np.uint8),
+        )
+
+    candidate = (pure_ink_mask[y1:y2, x1:x2] > 0).astype(np.uint8) * 255
+    if target_gray is not None:
+        raw_roi = target_gray[y1:y2, x1:x2]
+        paper_level = float(np.percentile(raw_roi, 90))
+        ink_threshold = int(np.clip(paper_level - 22.0, 160.0, 225.0))
+        raw_dark = (raw_roi < ink_threshold).astype(np.uint8) * 255
+        candidate = cv2.bitwise_or(candidate, raw_dark)
+
+    local_x = working_box.x - x1
+    local_y = working_box.y - y1
+    local_x2 = local_x + working_box.w
+    local_y2 = local_y + working_box.h
+
+    # 체크 획은 보통 사각 테두리를 가로질러 밖으로 나갑니다. 1px 연결
+    # 보강 후 테두리 링과 닿지 않는 인접 글자·먼지는 후보에서 제외합니다.
+    connected = cv2.dilate(candidate, np.ones((3, 3), np.uint8), iterations=1)
+    component_count, labels, _, _ = cv2.connectedComponentsWithStats(
+        (connected > 0).astype(np.uint8), connectivity=8
+    )
+    anchor_width = max(1, round(short_side * 0.1))
+    anchor = np.zeros_like(candidate)
+    cv2.rectangle(
+        anchor,
+        (max(0, local_x), max(0, local_y)),
+        (min(anchor.shape[1] - 1, local_x2 - 1), min(anchor.shape[0] - 1, local_y2 - 1)),
+        255,
+        thickness=anchor_width * 2 + 1,
+    )
+    anchored_labels = set(int(value) for value in np.unique(labels[anchor > 0]))
+    anchored_labels.discard(0)
+    anchored = np.zeros_like(candidate)
+    for component_idx in anchored_labels:
+        anchored[(labels == component_idx) & (candidate > 0)] = 255
+
+    # 실제 박스 테두리와 그 정합 잔상은 넉넉한 띠로 지우고, halo가 내부
+    # 직접 점수와 중복되지 않도록 박스 안쪽도 모두 제외합니다.
+    border_band = max(2, round(short_side * 0.2))
+    outer_x1 = max(0, local_x - border_band)
+    outer_y1 = max(0, local_y - border_band)
+    outer_x2 = min(anchored.shape[1], local_x2 + border_band)
+    outer_y2 = min(anchored.shape[0], local_y2 + border_band)
+    border_mask = np.zeros_like(anchored)
+    border_mask[outer_y1:outer_y2, outer_x1:outer_x2] = 255
+    inner_x1 = min(anchored.shape[1], max(0, local_x + border_band))
+    inner_y1 = min(anchored.shape[0], max(0, local_y + border_band))
+    inner_x2 = min(anchored.shape[1], max(0, local_x2 - border_band))
+    inner_y2 = min(anchored.shape[0], max(0, local_y2 - border_band))
+    if inner_x2 > inner_x1 and inner_y2 > inner_y1:
+        border_mask[inner_y1:inner_y2, inner_x1:inner_x2] = 0
+    anchored[border_mask > 0] = 0
+    anchored[
+        max(0, local_y) : min(anchored.shape[0], local_y2),
+        max(0, local_x) : min(anchored.shape[1], local_x2),
+    ] = 0
+
+    filtered = np.zeros_like(anchored)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (anchored > 0).astype(np.uint8), connectivity=8
+    )
+    min_component_area = max(4, round(short_side * 0.15))
+    min_component_span = max(4, round(short_side * 0.2))
+    for component_idx in range(1, component_count):
+        component_area = stats[component_idx, cv2.CC_STAT_AREA]
+        component_width = stats[component_idx, cv2.CC_STAT_WIDTH]
+        component_height = stats[component_idx, cv2.CC_STAT_HEIGHT]
+        # 정합 잔상은 대개 한 변을 따라 2~3px 폭으로 길게 남습니다. 실제
+        # 체크 꼬리는 대각선/곡선이라 가로·세로 양쪽으로 모두 퍼집니다.
+        if (
+            component_area >= min_component_area
+            and component_width >= min_component_span
+            and component_height >= min_component_span
+        ):
+            filtered[labels == component_idx] = 255
+
+    return _CheckboxHaloInfo(
+        cv2.countNonZero(filtered),
+        int(filtered.size),
+        working_box,
+        (x1, y1, x2, y2),
+        filtered,
+    )
+
+
+def extract_checkbox_halo_ink_info(
+    pure_ink_mask: np.ndarray,
+    box: Box,
+    target_gray: np.ndarray | None = None,
+) -> tuple[int, int]:
+    info = _extract_checkbox_halo_info(pure_ink_mask, box, target_gray)
+    return info.ink_pixels, info.area
+
+
+def _resolve_checkbox_halo_ownership(
+    pure_ink_masks: dict[int, np.ndarray],
+    survey_gray_pages: dict[int, np.ndarray],
+    candidates: list[tuple[_CheckboxInkInfo, bool, _CheckboxHaloInfo]],
+) -> None:
+    """Assign one connected pen stroke to its closest supported checkbox.
+
+    A long check drawn in one box can graze the border of a nearby blank box.
+    Both local halo windows then see the same connected stroke.  Resolve that
+    ambiguity page-wide: prefer a box with clear interior ink, otherwise keep
+    the box containing the larger share of the external stroke.  Only nearby
+    boxes compete, so unrelated marks connected through form lines cannot
+    suppress one another across the page.
+    """
+    by_page: dict[
+        int, list[tuple[_CheckboxInkInfo, bool, _CheckboxHaloInfo]]
+    ] = {}
+    for candidate in candidates:
+        direct_info, _direct_is_checked, halo_info = candidate
+        if halo_info.ink_pixels <= 0 or halo_info.ink_mask.size == 0:
+            continue
+        by_page.setdefault(direct_info.box.page_idx, []).append(candidate)
+
+    for page_idx, page_candidates in by_page.items():
+        target_gray = survey_gray_pages.get(page_idx)
+        if target_gray is None:
+            continue
+        if target_gray.ndim == 3:
+            target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+
+        paper_level = float(np.percentile(target_gray, 90))
+        ink_threshold = int(np.clip(paper_level - 22.0, 160.0, 225.0))
+        connected_source = (target_gray < ink_threshold).astype(np.uint8) * 255
+        pure_ink = pure_ink_masks.get(page_idx)
+        if pure_ink is not None:
+            connected_source = cv2.bitwise_or(
+                connected_source,
+                (pure_ink > 0).astype(np.uint8) * 255,
+            )
+        connected_source = cv2.dilate(
+            connected_source, np.ones((3, 3), np.uint8), iterations=1
+        )
+        _, labels, _, _ = cv2.connectedComponentsWithStats(
+            (connected_source > 0).astype(np.uint8), connectivity=8
+        )
+
+        component_members: dict[int, list[tuple[int, int]]] = {}
+        for candidate_idx, (_direct_info, _direct_is_checked, halo_info) in enumerate(
+            page_candidates
+        ):
+            x1, y1, x2, y2 = halo_info.mask_bounds
+            label_roi = labels[y1:y2, x1:x2]
+            if label_roi.shape != halo_info.ink_mask.shape:
+                continue
+            values, counts = np.unique(
+                label_roi[halo_info.ink_mask > 0], return_counts=True
+            )
+            for value, count in zip(values.tolist(), counts.tolist()):
+                component_label = int(value)
+                if component_label == 0:
+                    continue
+                component_members.setdefault(component_label, []).append(
+                    (candidate_idx, int(count))
+                )
+
+        labels_to_remove: dict[int, set[int]] = {}
+        for component_label, members in component_members.items():
+            if len(members) <= 1:
+                continue
+
+            pending = {candidate_idx for candidate_idx, _count in members}
+            counts_by_candidate = dict(members)
+            while pending:
+                seed = pending.pop()
+                cluster = {seed}
+                frontier = [seed]
+                while frontier:
+                    current_idx = frontier.pop()
+                    current_box = page_candidates[current_idx][0].box
+                    current_center = (
+                        current_box.x + current_box.w / 2,
+                        current_box.y + current_box.h / 2,
+                    )
+                    for other_idx in list(pending):
+                        other_box = page_candidates[other_idx][0].box
+                        other_center = (
+                            other_box.x + other_box.w / 2,
+                            other_box.y + other_box.h / 2,
+                        )
+                        distance = float(
+                            np.hypot(
+                                current_center[0] - other_center[0],
+                                current_center[1] - other_center[1],
+                            )
+                        )
+                        nearby_limit = max(
+                            48.0,
+                            max(
+                                min(current_box.w, current_box.h),
+                                min(other_box.w, other_box.h),
+                            )
+                            * 4.0,
+                        )
+                        if distance <= nearby_limit:
+                            pending.remove(other_idx)
+                            cluster.add(other_idx)
+                            frontier.append(other_idx)
+
+                physical_keys = {
+                    (
+                        page_candidates[index][0].box.x,
+                        page_candidates[index][0].box.y,
+                        page_candidates[index][0].box.w,
+                        page_candidates[index][0].box.h,
+                    )
+                    for index in cluster
+                }
+                if len(physical_keys) <= 1:
+                    continue
+
+                def ownership_key(index: int) -> tuple[bool, int, int, int, int]:
+                    direct_info, direct_is_checked, halo_info = page_candidates[index]
+                    strong_direct = direct_is_checked and direct_info.ink_pixels >= max(
+                        8, round(direct_info.area * 0.05)
+                    )
+                    return (
+                        strong_direct,
+                        counts_by_candidate[index],
+                        direct_info.ink_pixels,
+                        halo_info.ink_pixels,
+                        -index,
+                    )
+
+                winner_idx = max(cluster, key=ownership_key)
+                winner_box = page_candidates[winner_idx][0].box
+                winner_key = (
+                    winner_box.x,
+                    winner_box.y,
+                    winner_box.w,
+                    winner_box.h,
+                )
+                for loser_idx in cluster:
+                    loser_box = page_candidates[loser_idx][0].box
+                    loser_key = (
+                        loser_box.x,
+                        loser_box.y,
+                        loser_box.w,
+                        loser_box.h,
+                    )
+                    if loser_key != winner_key:
+                        labels_to_remove.setdefault(loser_idx, set()).add(
+                            component_label
+                        )
+
+        for candidate_idx, component_labels in labels_to_remove.items():
+            halo_info = page_candidates[candidate_idx][2]
+            x1, y1, x2, y2 = halo_info.mask_bounds
+            label_roi = labels[y1:y2, x1:x2]
+            remove = np.isin(label_roi, list(component_labels))
+            halo_info.ink_mask[remove] = 0
+            halo_info.ink_pixels = cv2.countNonZero(halo_info.ink_mask)
+
+
 # ==========================================
 # 2. 평가 및 시각화 모듈
 # ==========================================
@@ -803,6 +1329,41 @@ def evaluate_marks(
     ink, area = inks[0], areas[0]
     is_ticked = (ink > 10) or (area > 0 and (ink / area) >= 0.01)
     return [is_ticked]
+
+
+def evaluate_checkbox_marks(
+    inks: list[int], areas: list[int], strict: bool = False
+) -> list[bool]:
+    """인쇄선이 제외된 체크박스 내부 점수를 평가합니다."""
+    if not inks:
+        return []
+
+    max_ink = max(inks)
+    # 복수응답은 후보를 사후에 하나로 줄이지 않으므로 오히려 더 엄격해야 합니다.
+    relative_threshold = 0.25 if strict else 0.15
+    results = []
+    for ink, area in zip(inks, areas):
+        absolute_threshold = max(4, round(area * 0.025)) if area > 0 else 4
+        results.append(
+            ink >= absolute_threshold
+            and (max_ink == 0 or ink >= max_ink * relative_threshold)
+        )
+    return results
+
+
+def evaluate_checkbox_halo_marks(
+    inks: list[int],
+    areas: list[int],
+    is_contiguous: bool,
+    strict: bool = False,
+) -> list[bool]:
+    """외부 체크 획을 평가하되 얇은 사각 테두리 잔상은 제외합니다."""
+    relative_results = evaluate_marks(inks, areas, is_contiguous, strict=strict)
+    return [
+        is_checked
+        and ink >= max(12, round(np.sqrt(area) * 0.59))
+        for ink, area, is_checked in zip(inks, areas, relative_results)
+    ]
 
 
 def enforce_single_choice(
@@ -850,15 +1411,250 @@ def _select_working_boxes(
 
 def _prepare_field_plans(
     config: TemplatePreset,
-) -> list[tuple[Field, list[Box], bool]]:
+) -> list[tuple[Field, list[Box], list[Box], bool]]:
     """설문마다 동일한 박스 정렬·확장 결과를 분석 시작 전에 한 번만 계산합니다."""
     all_boxes = [box for field in config.fields for box in field.boxes]
     plans = []
     for field in config.fields:
         sorted_boxes = sort_boxes_z_pattern(field.boxes)
         working_boxes = _select_working_boxes(field, sorted_boxes, all_boxes)
-        plans.append((field, working_boxes, is_contiguous_group(sorted_boxes)))
+        plans.append(
+            (field, sorted_boxes, working_boxes, is_contiguous_group(sorted_boxes))
+        )
     return plans
+
+
+def _group_checkbox_rows(boxes: list[Box], tolerance: float) -> list[list[Box]]:
+    rows: list[list[Box]] = []
+    row_centers: list[float] = []
+    for box in sorted(boxes, key=lambda item: (item.y + item.h / 2, item.x)):
+        center_y = box.y + box.h / 2
+        if not rows or abs(center_y - row_centers[-1]) > tolerance:
+            rows.append([box])
+            row_centers.append(center_y)
+            continue
+        rows[-1].append(box)
+        row_centers[-1] = float(
+            np.mean([item.y + item.h / 2 for item in rows[-1]])
+        )
+
+    for row in rows:
+        row.sort(key=lambda item: item.x + item.w / 2)
+    return rows
+
+
+def _remap_checkbox_layout(
+    config: TemplatePreset,
+    templates: dict[int, np.ndarray],
+) -> TemplatePreset:
+    """현재 파일 템플릿에서 체크박스를 다시 찾아 오래된 프리셋 좌표를 보정합니다.
+
+    각 행의 체크박스 개수와 좌우 순서가 모두 일치할 때만 해당 행을 교체합니다.
+    탐지가 불완전한 행은 원래 좌표를 유지해 순서 밀림을 방지합니다.
+    """
+    adjusted = copy.deepcopy(config)
+
+    for page_idx, template in templates.items():
+        expected = [
+            box
+            for field in adjusted.fields
+            if not field.is_comment
+            for box in field.boxes
+            if box.page_idx == page_idx and _is_checkbox_like(box, template.shape)
+        ]
+        if not expected:
+            continue
+
+        median_w = float(np.median([box.w for box in expected]))
+        median_h = float(np.median([box.h for box in expected]))
+        detection_image = (
+            cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+            if template.ndim == 2
+            else template
+        )
+        detected_raw = auto_detect_checkboxes(
+            detection_image,
+            min_w=max(8, round(median_w * 0.55)),
+            max_w=max(9, round(median_w * 1.8)),
+            min_h=max(8, round(median_h * 0.55)),
+            max_h=max(9, round(median_h * 1.8)),
+        )
+        detected = [
+            Box(page_idx=page_idx, x=x, y=y, w=w, h=h)
+            for x, y, w, h in detected_raw
+            if 0.55 <= w / max(1, h) <= 1.8
+        ]
+        if not detected:
+            continue
+
+        row_tolerance = max(4.0, median_h * 0.6)
+        expected_rows = _group_checkbox_rows(expected, row_tolerance)
+        detected_rows = _group_checkbox_rows(detected, row_tolerance)
+        max_y_distance = max(12.0, median_h * 1.5)
+        max_x_distance = max(median_w * 10.0, template.shape[1] * 0.15)
+
+        # 행을 위에서부터 하나씩 소비하면 앞 행 탐지가 누락됐을 때 그 다음
+        # 문항의 행을 빼앗을 수 있습니다. 전체 행을 순서 보존 1:1로 맞추고,
+        # 가능한 대응 수가 같을 때 총 이동량이 가장 작은 조합을 선택합니다.
+        pair_costs: dict[tuple[int, int], float] = {}
+        for expected_idx, expected_row in enumerate(expected_rows):
+            expected_center_y = float(
+                np.mean([box.y + box.h / 2 for box in expected_row])
+            )
+            for detected_idx, detected_row in enumerate(detected_rows):
+                if len(detected_row) != len(expected_row):
+                    continue
+                detected_center_y = float(
+                    np.mean([box.y + box.h / 2 for box in detected_row])
+                )
+                y_distance = abs(detected_center_y - expected_center_y)
+                if y_distance > max_y_distance:
+                    continue
+                x_distances = [
+                    abs(source.x + source.w / 2 - target.x - target.w / 2)
+                    for source, target in zip(expected_row, detected_row)
+                ]
+                if any(distance > max_x_distance for distance in x_distances):
+                    continue
+                pair_costs[(expected_idx, detected_idx)] = (
+                    y_distance / max_y_distance
+                    + float(np.mean(x_distances)) / max_x_distance
+                )
+
+        # DP 값: (매칭 수, 누적 비용, [(expected_idx, detected_idx), ...])
+        row_count = len(expected_rows)
+        detected_count = len(detected_rows)
+        states: list[list[tuple[int, float, list[tuple[int, int]]] | None]] = [
+            [None] * (detected_count + 1) for _ in range(row_count + 1)
+        ]
+        states[0][0] = (0, 0.0, [])
+
+        def update_state(
+            expected_pos: int,
+            detected_pos: int,
+            candidate: tuple[int, float, list[tuple[int, int]]],
+        ) -> None:
+            current = states[expected_pos][detected_pos]
+            if current is None or candidate[0] > current[0] or (
+                candidate[0] == current[0] and candidate[1] < current[1]
+            ):
+                states[expected_pos][detected_pos] = candidate
+
+        for expected_pos in range(row_count + 1):
+            for detected_pos in range(detected_count + 1):
+                state = states[expected_pos][detected_pos]
+                if state is None:
+                    continue
+                matched_count, total_cost, pairs = state
+                if expected_pos < row_count:
+                    update_state(expected_pos + 1, detected_pos, state)
+                if detected_pos < detected_count:
+                    update_state(expected_pos, detected_pos + 1, state)
+                pair_cost = pair_costs.get((expected_pos, detected_pos))
+                if (
+                    pair_cost is not None
+                    and expected_pos < row_count
+                    and detected_pos < detected_count
+                ):
+                    update_state(
+                        expected_pos + 1,
+                        detected_pos + 1,
+                        (
+                            matched_count + 1,
+                            total_cost + pair_cost,
+                            pairs + [(expected_pos, detected_pos)],
+                        ),
+                    )
+
+        best_state = states[row_count][detected_count]
+        matched_pairs = best_state[2] if best_state is not None else []
+        for expected_idx, detected_idx in matched_pairs:
+            for source, target in zip(
+                expected_rows[expected_idx], detected_rows[detected_idx]
+            ):
+                source.x = target.x
+                source.y = target.y
+                source.w = target.w
+                source.h = target.h
+
+    return adjusted
+
+
+def _checkbox_layout_is_trustworthy(
+    config: TemplatePreset,
+    templates: dict[int, np.ndarray],
+) -> bool:
+    """Verify that every configured checkbox has a nearby detected frame."""
+    saw_checkbox = False
+    page_indices = {
+        box.page_idx
+        for field in config.fields
+        if not field.is_comment
+        for box in field.boxes
+    }
+    for page_idx in page_indices:
+        template = templates.get(page_idx)
+        if template is None:
+            return False
+        expected = [
+            box
+            for field in config.fields
+            if not field.is_comment
+            for box in field.boxes
+            if box.page_idx == page_idx and _is_checkbox_like(box, template.shape)
+        ]
+        if not expected:
+            continue
+        saw_checkbox = True
+
+        median_w = float(np.median([box.w for box in expected]))
+        median_h = float(np.median([box.h for box in expected]))
+        detection_image = (
+            cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+            if template.ndim == 2
+            else template
+        )
+        detected = [
+            Box(page_idx=page_idx, x=x, y=y, w=w, h=h)
+            for x, y, w, h in auto_detect_checkboxes(
+                detection_image,
+                min_w=max(8, round(median_w * 0.55)),
+                max_w=max(9, round(median_w * 1.8)),
+                min_h=max(8, round(median_h * 0.55)),
+                max_h=max(9, round(median_h * 1.8)),
+            )
+            if 0.55 <= w / max(1, h) <= 1.8
+        ]
+        if len(detected) < len(expected):
+            return False
+
+        unmatched = set(range(len(detected)))
+        for source in sorted(expected, key=lambda box: (box.y, box.x)):
+            source_center = (source.x + source.w / 2, source.y + source.h / 2)
+            center_tolerance = max(4.0, min(source.w, source.h) * 0.45)
+            width_tolerance = max(3.0, source.w * 0.35)
+            height_tolerance = max(3.0, source.h * 0.35)
+            viable = []
+            for candidate_idx in unmatched:
+                candidate = detected[candidate_idx]
+                center_distance = float(
+                    np.hypot(
+                        source_center[0] - candidate.x - candidate.w / 2,
+                        source_center[1] - candidate.y - candidate.h / 2,
+                    )
+                )
+                if (
+                    center_distance <= center_tolerance
+                    and abs(source.w - candidate.w) <= width_tolerance
+                    and abs(source.h - candidate.h) <= height_tolerance
+                ):
+                    viable.append((center_distance, candidate_idx))
+            if not viable:
+                return False
+            _, best_idx = min(viable)
+            unmatched.remove(best_idx)
+
+    return saw_checkbox
 
 
 def _collect_ink_data(
@@ -894,7 +1690,8 @@ def process_survey_data(
     config: TemplatePreset,
     dynamic_templates: dict[int, np.ndarray],
     template_masks: dict[int, np.ndarray] | None = None,
-    field_plans: list[tuple[Field, list[Box], bool]] | None = None,
+    field_plans: list[tuple[Field, list[Box], list[Box], bool]] | None = None,
+    trust_checkbox_layout: bool = False,
 ) -> tuple[dict, dict, dict, dict, dict, dict]:
     fname = survey_data.get("fname", "")
     survey_label = survey_data["row_title"]
@@ -917,37 +1714,174 @@ def process_survey_data(
 
     # 벡터 주석 수집기 (page_idx -> list of (x, y, w, h, label, is_ticked))
     debug_annotations = {local_p: [] for local_p in survey_gray_pages}
-    ink_annotations: dict[int, list] = {}
+    ink_annotations: dict[int, list] = {
+        local_p: [] for local_p in survey_gray_pages
+    }
 
     pure_ink_masks = {}
     for local_p, gray_img in survey_gray_pages.items():
         if local_p in dynamic_templates:
-            mask = extract_pure_ink_mask(
+            pure_ink_masks[local_p] = extract_pure_ink_mask(
                 gray_img,
                 dynamic_templates[local_p],
                 config.template_dilate_pct,
                 template_masks.get(local_p) if template_masks else None,
             )
-            pure_ink_masks[local_p] = mask
 
-            ink_display = cv2.bitwise_not(mask)
-            survey_ink_only_images[local_p] = ink_display
-            ink_annotations[local_p] = []
-
+    # 반복 응답이 중앙값 템플릿에 섞여 지워진 경우에도 검토 PDF에서 보이도록,
+    # 체크박스 내부 직접 추출 결과는 모든 문항 평가가 끝난 뒤 마스크에 합칩니다.
+    checkbox_ink_additions: dict[int, np.ndarray] = {}
     plans = field_plans if field_plans is not None else _prepare_field_plans(config)
 
-    for field, working_boxes, is_contiguous in plans:
-        inks, areas, valid_boxes = _collect_ink_data(working_boxes, pure_ink_masks)
+    checkbox_analyses: dict[int, _CheckboxFieldAnalysis] = {}
+    ownership_candidates: list[
+        tuple[_CheckboxInkInfo, bool, _CheckboxHaloInfo]
+    ] = []
+    for plan_idx, (field, scoring_boxes, _working_boxes, _is_contiguous) in enumerate(
+        plans
+    ):
+        checkbox_mode = bool(scoring_boxes) and not field.is_comment and all(
+            box.page_idx in survey_gray_pages
+            and _is_checkbox_like(box, survey_gray_pages[box.page_idx].shape)
+            for box in scoring_boxes
+        )
+        if not checkbox_mode:
+            continue
+
+        checkbox_infos = [
+            extract_checkbox_ink_info(survey_gray_pages[box.page_idx], box)
+            for box in scoring_boxes
+        ]
+        direct_inks = [info.ink_pixels for info in checkbox_infos]
+        direct_areas = [info.area for info in checkbox_infos]
+        reliable_direct = [
+            trust_checkbox_layout
+            or info.border_confidence >= _CHECKBOX_MIN_BORDER_CONFIDENCE
+            for info in checkbox_infos
+        ]
+        direct_results = evaluate_checkbox_marks(
+            direct_inks, direct_areas, strict=field.allow_duplicates
+        )
+        direct_results = [
+            is_checked and is_reliable
+            for is_checked, is_reliable in zip(direct_results, reliable_direct)
+        ]
+        halo_infos: list[_CheckboxHaloInfo] = []
+        for info, is_reliable in zip(checkbox_infos, reliable_direct):
+            if is_reliable and info.box.page_idx in pure_ink_masks:
+                halo_infos.append(
+                    _extract_checkbox_halo_info(
+                        pure_ink_masks[info.box.page_idx],
+                        info.box,
+                        target_gray=survey_gray_pages[info.box.page_idx],
+                    )
+                )
+            else:
+                halo_infos.append(
+                    _CheckboxHaloInfo(
+                        0,
+                        0,
+                        info.box,
+                        (info.box.x, info.box.y, info.box.x, info.box.y),
+                        np.zeros((0, 0), np.uint8),
+                    )
+                )
+
+        checkbox_analyses[plan_idx] = _CheckboxFieldAnalysis(
+            checkbox_infos,
+            reliable_direct,
+            direct_inks,
+            direct_areas,
+            direct_results,
+            halo_infos,
+        )
+        ownership_candidates.extend(zip(checkbox_infos, direct_results, halo_infos))
+
+    _resolve_checkbox_halo_ownership(
+        pure_ink_masks, survey_gray_pages, ownership_candidates
+    )
+
+    for plan_idx, (field, scoring_boxes, working_boxes, is_contiguous) in enumerate(
+        plans
+    ):
+        current_inks, current_areas, current_boxes = _collect_ink_data(
+            working_boxes, pure_ink_masks
+        )
+        checkbox_analysis = checkbox_analyses.get(plan_idx)
+        checkbox_mode = checkbox_analysis is not None
+
+        direct_inks: list[int] = []
+        direct_areas: list[int] = []
+        direct_results: list[bool] = []
+        halo_inks: list[int] = []
+        halo_areas: list[int] = []
+        reliable_direct: list[bool] = []
+
+        if checkbox_analysis is not None:
+            checkbox_infos = checkbox_analysis.checkbox_infos
+            reliable_direct = checkbox_analysis.reliable_direct
+            direct_inks = checkbox_analysis.direct_inks
+            direct_areas = checkbox_analysis.direct_areas
+            direct_results = checkbox_analysis.direct_results
+            halo_infos = checkbox_analysis.halo_infos
+            halo_inks = [info.ink_pixels for info in halo_infos]
+            halo_areas = [info.area for info in halo_infos]
+            halo_results = evaluate_checkbox_halo_marks(
+                halo_inks,
+                halo_areas,
+                is_contiguous,
+                strict=field.allow_duplicates,
+            )
+            check_results = [
+                direct or halo
+                for direct, halo in zip(direct_results, halo_results)
+            ]
+            valid_boxes = [
+                info.box if is_reliable else source_box
+                for info, is_reliable, source_box in zip(
+                    checkbox_infos, reliable_direct, scoring_boxes
+                )
+            ]
+
+            for info, halo_info, is_reliable, halo_is_checked in zip(
+                checkbox_infos,
+                halo_infos,
+                reliable_direct,
+                halo_results,
+            ):
+                if not is_reliable:
+                    continue
+                addition = checkbox_ink_additions.setdefault(
+                    info.box.page_idx,
+                    np.zeros_like(survey_gray_pages[info.box.page_idx], dtype=np.uint8),
+                )
+                if info.ink_mask.size > 0:
+                    x1, y1, x2, y2 = info.mask_bounds
+                    addition[y1:y2, x1:x2] = cv2.bitwise_or(
+                        addition[y1:y2, x1:x2], info.ink_mask
+                    )
+                if halo_is_checked and halo_info.ink_mask.size > 0:
+                    x1, y1, x2, y2 = halo_info.mask_bounds
+                    addition[y1:y2, x1:x2] = cv2.bitwise_or(
+                        addition[y1:y2, x1:x2], halo_info.ink_mask
+                    )
+        else:
+            check_results = evaluate_marks(
+                current_inks,
+                current_areas,
+                is_contiguous,
+                strict=field.allow_duplicates,
+            )
+            valid_boxes = current_boxes
+
+        inks = halo_inks if checkbox_mode else current_inks
+        areas = halo_areas if checkbox_mode else current_areas
 
         if field.is_comment:
             check_results = [
                 (ink > 10) or (area > 0 and (ink / area) >= 0.01)
                 for ink, area in zip(inks, areas)
             ]
-        else:
-            check_results = evaluate_marks(
-                inks, areas, is_contiguous, strict=field.allow_duplicates
-            )
 
         if field.is_comment:
             has_comment = False
@@ -976,7 +1910,23 @@ def process_survey_data(
             continue
 
         if not field.allow_duplicates:
-            check_results = enforce_single_choice(check_results, inks, areas)
+            if checkbox_mode and sum(check_results) > 1:
+                checked_indices = [
+                    index for index, is_checked in enumerate(check_results) if is_checked
+                ]
+                best_idx = max(
+                    checked_indices,
+                    key=lambda index: (
+                        direct_inks[index] * 3 + halo_inks[index],
+                        direct_inks[index] / max(1, direct_areas[index]),
+                        halo_inks[index] / max(1, halo_areas[index]),
+                    ),
+                )
+                check_results = [
+                    index == best_idx for index in range(len(check_results))
+                ]
+            else:
+                check_results = enforce_single_choice(check_results, inks, areas)
         checked_labels = []
         total_boxes = len(valid_boxes)
 
@@ -1006,6 +1956,19 @@ def process_survey_data(
             row_data[field.name] = ",".join(output_values)
         else:
             row_data[field.name] = ""
+
+    for local_p, addition in checkbox_ink_additions.items():
+        if local_p in pure_ink_masks:
+            pure_ink_masks[local_p] = cv2.bitwise_or(
+                pure_ink_masks[local_p], addition
+            )
+        elif cv2.countNonZero(addition) > 0:
+            pure_ink_masks[local_p] = addition
+
+    survey_ink_only_images = {
+        local_p: cv2.bitwise_not(mask)
+        for local_p, mask in pure_ink_masks.items()
+    }
 
     comment_pages = {
         local_p: survey_gray_pages[local_p]
@@ -1201,7 +2164,11 @@ def _analyze_single_file(
             template_masks[local_p] = cv2.threshold(
                 gray_template, 200, 255, cv2.THRESH_BINARY_INV
             )[1]
-        field_plans = _prepare_field_plans(config)
+        analysis_config = _remap_checkbox_layout(config, f_template)
+        trust_checkbox_layout = _checkbox_layout_is_trustworthy(
+            analysis_config, f_template
+        )
+        field_plans = _prepare_field_plans(analysis_config)
 
         page_count = config.page_count
         rot_code = config.rot_code
@@ -1236,10 +2203,11 @@ def _analyze_single_file(
             row_data, debug_base, ink_base, debug_ann, ink_ann, cp = (
                 process_survey_data(
                     survey_data,
-                    config,
+                    analysis_config,
                     f_template,
                     template_masks,
                     field_plans,
+                    trust_checkbox_layout=trust_checkbox_layout,
                 )
             )
 
@@ -1296,8 +2264,7 @@ def run_analysis(
         return False
     file_labels = _build_file_labels(file_paths)
 
-    # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일 작업자마다 만듭니다.
-    # 배치 처리에서 여러 스레드가 같은 OpenCV ORB 인스턴스를 동시에 쓰지 않게 합니다.
+    # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일마다 새로 만듭니다.
     alignment_references = [
         apply_rotation(p, config.rot_code, config.fine_angle)
         for p in template_pages[: config.page_count]
@@ -1306,127 +2273,124 @@ def run_analysis(
         print("페이지 정합 기준 이미지가 없습니다.")
         return False
 
-    # ══════════════════════════════════════
-    # Phase 1: 템플릿 샘플 병렬 수집
-    # ══════════════════════════════════════
-    report_progress(0, "템플릿 샘플 수집 중...")
-    sample_results: dict[str, dict[int, list[bytes]]] = {}
-    # OpenCV도 내부 스레드를 사용하므로 파일 단위 작업은 2개까지만 병렬화합니다.
-    max_workers = min(2, num_files)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _collect_template_samples, fpath, config, alignment_references
-            ): index
-            for index, fpath in enumerate(file_paths)
-        }
-        completed = 0
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                file_key, f_pages = future.result()
-                if f_pages:
-                    sample_results[file_key] = f_pages
-            except Exception as e:
-                print(f"템플릿 샘플 수집 실패 ({file_labels[index]}): {e}")
-            completed += 1
-            report_progress(
-                int(completed / num_files * 8),
-                f"템플릿 샘플 수집 중... ({completed}/{num_files})",
-            )
-
-    # ── 템플릿 빌드 (원본 순서 및 공통 정합 좌표 유지) ──
-    report_progress(8, "템플릿 생성 중...")
-    reference_templates, file_templates = _build_file_templates(
-        file_paths, sample_results
-    )
-
-    if reference_templates is None:
-        print("템플릿 생성에 실패했습니다.")
-        return False
-
-    for file_key in file_templates:
-        if not file_templates[file_key]:
-            file_templates[file_key] = reference_templates
-
-    # ── 검토용 템플릿 PDF 저장 ──
-    template_pdf = fitz.open()
-    try:
-        for local_p in sorted(reference_templates):
-            _insert_img_into_pdf(
-                template_pdf, reference_templates[local_p], quality=90
-            )
-        if len(template_pdf) > 0:
-            template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
-    finally:
-        template_pdf.close()
-
-    # ══════════════════════════════════════
-    # Phase 2: 파일별 분석 병렬 처리
-    # ══════════════════════════════════════
-    report_progress(10, "분석 시작 중...")
-    ordered_outputs: list[tuple[list[dict], list[bytes]] | None] = [None] * num_files
+    # 파일별로 표본 수집 → 템플릿 생성 → 분석을 끝낸 뒤 큰 객체를 바로 해제합니다.
+    # 모든 파일의 300 DPI PNG 표본을 한꺼번에 보관하거나 두 PDF를 동시에 분석하면
+    # 메모리가 작은 PC에서 피크 사용량이 크게 늘어나므로 파일 단위 병렬화는 하지 않습니다.
+    report_progress(0, "파일별 템플릿 생성 및 분석 중...")
+    reference_templates: dict[int, np.ndarray] | None = None
+    pending_indices: list[int] = []
+    all_results: list[dict] = []
     analysis_failures: list[str] = []
+    completed = 0
+    comment_path = Path("의견.pdf")
+    comment_doc = fitz.open()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for index, (fpath, file_label) in enumerate(zip(file_paths, file_labels)):
-            file_key = _file_key(fpath)
-            future = executor.submit(
-                _analyze_single_file,
+    def save_reference_template() -> None:
+        if reference_templates is None:
+            return
+        template_pdf = fitz.open()
+        try:
+            for local_p in sorted(reference_templates):
+                _insert_img_into_pdf(
+                    template_pdf, reference_templates[local_p], quality=90
+                )
+            if len(template_pdf) > 0:
+                template_pdf.save(review_folder / "00_추론된_템플릿.pdf")
+        finally:
+            template_pdf.close()
+
+    def analyze_file(
+        index: int,
+        file_template: dict[int, np.ndarray],
+        sample_pages: dict[int, list[bytes]] | None,
+    ) -> None:
+        nonlocal completed
+        fpath = file_paths[index]
+        file_label = file_labels[index]
+        comment_pages: list[bytes] = []
+        try:
+            if reference_templates is None:
+                raise RuntimeError("분석 기준 템플릿이 없습니다.")
+            _, file_results, comment_pages = _analyze_single_file(
                 fpath,
                 file_label,
                 config,
-                file_templates.get(file_key, reference_templates),
+                file_template,
                 reference_templates,
                 alignment_references,
                 review_folder,
-                sample_pages=sample_results.get(file_key),
+                sample_pages=sample_pages,
             )
-            futures[future] = index
-
-        completed = 0
-        for future in as_completed(futures):
-            index = futures[future]
-            file_key = _file_key(file_paths[index])
-            try:
-                _, file_results, comment_pages = future.result()
-                ordered_outputs[index] = (file_results, comment_pages)
-            except Exception as e:
-                analysis_failures.append(file_labels[index])
-                print(f"분석 실패 ({file_labels[index]}): {e}")
-            finally:
-                sample_results.pop(file_key, None)
+            all_results.extend(file_results)
+            for image_bytes in comment_pages:
+                _insert_encoded_img_into_pdf(comment_doc, image_bytes)
+        except Exception as e:
+            analysis_failures.append(file_label)
+            print(f"분석 실패 ({file_label}): {e}")
+        finally:
+            comment_pages.clear()
             completed += 1
             report_progress(
                 10 + int(completed / num_files * 88),
                 f"분석 중... ({completed}/{num_files})",
             )
 
-    sample_results.clear()
-    all_results: list[dict] = []
-    all_comment_pages: list[bytes] = []
-    for output in ordered_outputs:
-        if output is None:
-            continue
-        file_results, comment_pages = output
-        all_results.extend(file_results)
-        all_comment_pages.extend(comment_pages)
-
-    # ── 의견 PDF 병합 저장 ──
-    comment_path = Path("의견.pdf")
-    comment_doc = fitz.open()
     try:
-        for image_bytes in all_comment_pages:
-            _insert_encoded_img_into_pdf(comment_doc, image_bytes)
+        for index, (fpath, file_label) in enumerate(zip(file_paths, file_labels)):
+            report_progress(
+                10 + int(completed / num_files * 88),
+                f"템플릿 샘플 수집 중... ({index + 1}/{num_files})",
+            )
+            sample_pages: dict[int, list[bytes]] = {}
+            file_template: dict[int, np.ndarray] = {}
+            try:
+                _, sample_pages = _collect_template_samples(
+                    fpath, config, alignment_references
+                )
+                if sample_pages:
+                    file_template = generate_dynamic_templates(sample_pages)
+            except Exception as e:
+                print(f"템플릿 샘플 수집 실패 ({file_label}): {e}")
+
+            if reference_templates is None:
+                if not file_template:
+                    # 기준이 생길 때까지 경로만 기억합니다. 앞 파일의 큰 PNG 표본은
+                    # 보관하지 않고 나중에 기준 템플릿으로 다시 렌더링합니다.
+                    pending_indices.append(index)
+                    sample_pages.clear()
+                    gc.collect()
+                    continue
+
+                reference_templates = file_template
+                save_reference_template()
+                for pending_index in pending_indices:
+                    analyze_file(pending_index, reference_templates, None)
+                    gc.collect()
+                pending_indices.clear()
+
+            analyze_file(
+                index,
+                file_template or reference_templates,
+                sample_pages or None,
+            )
+
+            sample_pages.clear()
+            if file_template is not reference_templates:
+                file_template.clear()
+            gc.collect()
+
+        if reference_templates is None:
+            print("템플릿 생성에 실패했습니다.")
+            return False
+
+        # 의견 이미지는 파일 분석 직후 PDF 문서로 옮겼으므로 JPEG 목록을 따로
+        # 누적하지 않습니다.
         if len(comment_doc) > 0:
             comment_doc.save(comment_path)
         elif comment_path.exists():
             comment_path.unlink()
     finally:
         comment_doc.close()
-    del all_comment_pages
 
     # ── 엑셀 저장 ──
     report_progress(98, "엑셀 저장 중...")
