@@ -25,6 +25,12 @@ _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_TEMPLATE_CACHE_VERSION = 5
 _CHECKBOX_MIN_BORDER_CONFIDENCE = 0.35
 _MIB = 1024 * 1024
+_ANALYSIS_SAMPLE_WORK = 2.0
+_ANALYSIS_TEMPLATE_WORK = 1.0
+_ANALYSIS_REUSED_SURVEY_WORK = 1.0
+_ANALYSIS_RENDERED_SURVEY_WORK = 3.0
+_ANALYSIS_PROGRESS_START = 2.0
+_ANALYSIS_PROGRESS_SPAN = 95.0
 
 
 @dataclass
@@ -1396,6 +1402,37 @@ def _survey_count(total_pages: int, page_count: int) -> int:
     return count
 
 
+def _file_survey_counts(file_paths: list[str], page_count: int) -> list[int]:
+    """Read cheap PDF metadata up front so batch progress can be survey-based."""
+    counts: list[int] = []
+    for fpath in file_paths:
+        doc = None
+        try:
+            doc = fitz.open(fpath)
+            counts.append(_survey_count(len(doc), page_count))
+        except Exception:
+            counts.append(0)
+        finally:
+            if doc is not None:
+                doc.close()
+    return counts
+
+
+def _analysis_survey_work(
+    start: int, end: int, reusable_samples: int
+) -> float:
+    """Weight cached-sample surveys less than surveys that must be rendered."""
+    start = max(0, int(start))
+    end = max(start, int(end))
+    reusable_samples = max(0, int(reusable_samples))
+    reused = max(0, min(end, reusable_samples) - min(start, reusable_samples))
+    rendered = (end - start) - reused
+    return (
+        reused * _ANALYSIS_REUSED_SURVEY_WORK
+        + rendered * _ANALYSIS_RENDERED_SURVEY_WORK
+    )
+
+
 def _select_working_boxes(
     field, z_sorted_boxes: list[Box], all_boxes: list[Box]
 ) -> list[Box]:
@@ -2066,9 +2103,10 @@ def _collect_template_samples(
     config: TemplatePreset,
     alignment_references: list[np.ndarray],
     dpi: int = 300,
-    sample_limit: int = 31,
+    sample_limit: int = _UI_TEMPLATE_SAMPLE_LIMIT,
     resource_controller: AdaptiveResourceController | None = None,
     resource_status_cb=None,
+    progress_cb=None,
 ) -> tuple[str, dict[int, list[bytes]]]:
     fname = Path(fpath).stem
     try:
@@ -2109,6 +2147,8 @@ def _collect_template_samples(
                     continue
                 success, encoded = cv2.imencode(".png", aligned)
                 f_pages[local_p].append(encoded.tobytes() if success else b"")
+            if progress_cb:
+                progress_cb(survey_idx + 1, limit)
     finally:
         doc.close()
 
@@ -2181,6 +2221,7 @@ def _analyze_single_file(
     sample_pages: dict[int, list[bytes]] | None = None,
     resource_controller: AdaptiveResourceController | None = None,
     resource_status_cb=None,
+    progress_cb=None,
 ) -> tuple[str, list[dict], list[bytes]]:
     try:
         doc = fitz.open(fpath)
@@ -2280,6 +2321,9 @@ def _analyze_single_file(
                 if image_bytes:
                     comment_pages.append(image_bytes)
 
+            if progress_cb:
+                progress_cb(survey_idx + 1, survey_count)
+
         if len(out_orig) > 0:
             out_orig.save(review_folder / f"{file_label}_원본포함.pdf")
         if len(out_ink) > 0:
@@ -2304,7 +2348,7 @@ def run_analysis(
     review_folder = Path("검토용")
     review_folder.mkdir(exist_ok=True)
 
-    def report_progress(value: int, message: str = ""):
+    def report_progress(value: float, message: str = ""):
         if progress_cb:
             progress_cb(max(0, min(100, value)), message)
 
@@ -2314,6 +2358,16 @@ def run_analysis(
     if num_files == 0:
         return False
     file_labels = _build_file_labels(file_paths)
+    survey_counts = _file_survey_counts(file_paths, config.page_count)
+    sample_counts = [
+        min(count, _UI_TEMPLATE_SAMPLE_LIMIT) for count in survey_counts
+    ]
+    total_work = sum(
+        (sample_count * _ANALYSIS_SAMPLE_WORK)
+        + _ANALYSIS_TEMPLATE_WORK
+        + _analysis_survey_work(0, survey_count, sample_count)
+        for sample_count, survey_count in zip(sample_counts, survey_counts)
+    )
 
     # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일마다 새로 만듭니다.
     alignment_references = [
@@ -2324,10 +2378,27 @@ def run_analysis(
         print("페이지 정합 기준 이미지가 없습니다.")
         return False
 
+    completed_work = 0.0
+
+    def current_work_progress() -> float:
+        if total_work <= 0:
+            return _ANALYSIS_PROGRESS_START
+        return _ANALYSIS_PROGRESS_START + (
+            completed_work / total_work * _ANALYSIS_PROGRESS_SPAN
+        )
+
+    def report_work(message: str) -> None:
+        report_progress(current_work_progress(), message)
+
+    def advance_work(units: float, message: str) -> None:
+        nonlocal completed_work
+        completed_work = min(total_work, completed_work + max(0.0, units))
+        report_work(message)
+
     # 파일별로 표본 수집 → 템플릿 생성 → 분석을 끝낸 뒤 큰 객체를 바로 해제합니다.
     # 모든 파일의 300 DPI PNG 표본을 한꺼번에 보관하거나 두 PDF를 동시에 분석하면
     # 메모리가 작은 PC에서 피크 사용량이 크게 늘어나므로 파일 단위 병렬화는 하지 않습니다.
-    report_progress(0, "파일별 템플릿 생성 및 분석 중...")
+    report_progress(_ANALYSIS_PROGRESS_START, "파일별 템플릿 생성 및 분석 중...")
     controller = resource_controller or AdaptiveResourceController()
     controller.start()
     reference_templates: dict[int, np.ndarray] | None = None
@@ -2364,7 +2435,25 @@ def run_analysis(
         nonlocal completed
         fpath = file_paths[index]
         file_label = file_labels[index]
+        expected_surveys = survey_counts[index]
+        analysis_done = 0
         comment_pages: list[bytes] = []
+
+        def analysis_progress(done: int, total: int) -> None:
+            nonlocal analysis_done
+            bounded_done = min(expected_surveys, max(analysis_done, int(done)))
+            newly_done = bounded_done - analysis_done
+            previous_done = analysis_done
+            analysis_done = bounded_done
+            if newly_done > 0:
+                advance_work(
+                    _analysis_survey_work(
+                        previous_done, analysis_done, sample_counts[index]
+                    ),
+                    f"{file_label}: 설문 분석 중 ({done}/{total}) · "
+                    f"파일 {index + 1}/{num_files}",
+                )
+
         try:
             if reference_templates is None:
                 raise RuntimeError("분석 기준 템플릿이 없습니다.")
@@ -2378,9 +2467,8 @@ def run_analysis(
                 review_folder,
                 sample_pages=sample_pages,
                 resource_controller=controller,
-                resource_status_cb=lambda message: report_progress(
-                    10 + int(completed / num_files * 88), message
-                ),
+                resource_status_cb=report_work,
+                progress_cb=analysis_progress,
             )
             all_results.extend(file_results)
             for image_bytes in comment_pages:
@@ -2392,29 +2480,46 @@ def run_analysis(
             print(f"분석 실패 ({file_label}): {e}")
         finally:
             comment_pages.clear()
+            if analysis_done < expected_surveys:
+                advance_work(
+                    _analysis_survey_work(
+                        analysis_done, expected_surveys, sample_counts[index]
+                    ),
+                    f"{file_label}: 설문 분석 단계 정리 중...",
+                )
             completed += 1
-            report_progress(
-                10 + int(completed / num_files * 88),
-                f"분석 중... ({completed}/{num_files})",
-            )
+            report_work(f"파일 분석 완료 ({completed}/{num_files})")
 
     try:
         for index, (fpath, file_label) in enumerate(zip(file_paths, file_labels)):
-            report_progress(
-                10 + int(completed / num_files * 88),
-                f"템플릿 샘플 수집 중... ({index + 1}/{num_files})",
+            report_work(
+                f"{file_label}: 템플릿 표본 준비 중 · 파일 {index + 1}/{num_files}"
             )
             sample_pages: dict[int, list[bytes]] = {}
             file_template: dict[int, np.ndarray] = {}
+            expected_samples = sample_counts[index]
+            samples_done = 0
+
+            def sample_progress(done: int, total: int) -> None:
+                nonlocal samples_done
+                bounded_done = min(expected_samples, max(samples_done, int(done)))
+                newly_done = bounded_done - samples_done
+                samples_done = bounded_done
+                if newly_done > 0:
+                    advance_work(
+                        newly_done * _ANALYSIS_SAMPLE_WORK,
+                        f"{file_label}: 템플릿 표본 처리 중 ({done}/{total}) · "
+                        f"파일 {index + 1}/{num_files}",
+                    )
+
             try:
                 _, sample_pages = _collect_template_samples(
                     fpath,
                     config,
                     alignment_references,
                     resource_controller=controller,
-                    resource_status_cb=lambda message: report_progress(
-                        10 + int(completed / num_files * 88), message
-                    ),
+                    resource_status_cb=report_work,
+                    progress_cb=sample_progress,
                 )
                 if sample_pages:
                     controller.checkpoint(
@@ -2422,15 +2527,28 @@ def run_analysis(
                             sample_pages, alignment_references
                         ),
                         stage=f"{file_label} 템플릿 생성",
-                        status_cb=lambda message: report_progress(
-                            10 + int(completed / num_files * 88), message
-                        ),
+                        status_cb=report_work,
+                    )
+                    report_work(
+                        f"{file_label}: 동적 템플릿 생성 중 · "
+                        f"파일 {index + 1}/{num_files}"
                     )
                     file_template = generate_dynamic_templates(sample_pages)
             except ResourceUnavailableError:
                 raise
             except Exception as e:
                 print(f"템플릿 샘플 수집 실패 ({file_label}): {e}")
+            finally:
+                if samples_done < expected_samples:
+                    advance_work(
+                        (expected_samples - samples_done) * _ANALYSIS_SAMPLE_WORK,
+                        f"{file_label}: 템플릿 표본 단계 정리 중...",
+                    )
+                advance_work(
+                    _ANALYSIS_TEMPLATE_WORK,
+                    f"{file_label}: 템플릿 준비 완료 · "
+                    f"파일 {index + 1}/{num_files}",
+                )
 
             if reference_templates is None:
                 if not file_template:
@@ -2462,6 +2580,8 @@ def run_analysis(
         if reference_templates is None:
             print("템플릿 생성에 실패했습니다.")
             return False
+
+        report_progress(97, "분석 결과 정리 중...")
 
         # 의견 이미지는 파일 분석 직후 PDF 문서로 옮겼으므로 JPEG 목록을 따로
         # 누적하지 않습니다.

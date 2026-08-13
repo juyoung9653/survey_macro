@@ -275,21 +275,14 @@ class AdaptiveResourceController:
             memory_paused = memory_paused or memory_blocked
             cpu_paused = cpu_paused or cpu_blocked
             if time.monotonic() - started >= self.max_wait_seconds:
-                available_mib = memory.available_bytes / _MIB
-                needed_mib = memory_threshold / _MIB
                 raise ResourceUnavailableError(
-                    f"{stage}을(를) 위한 시스템 여유를 확보하지 못했습니다. "
-                    f"가용 RAM {available_mib:.0f} MiB / 필요 {needed_mib:.0f} MiB, "
-                    f"외부 CPU {external_cpu * 100:.0f}%"
+                    f"{stage} 중 시스템 여유를 확보하지 못했습니다. "
+                    "다른 프로그램을 닫고 다시 시도해주세요."
                 )
 
             self._set_opencv_threads(1)
             if status_cb:
-                status_cb(
-                    f"{stage} 대기 중... "
-                    f"RAM {memory.available_bytes / memory.total_bytes * 100:.0f}% 여유, "
-                    f"외부 CPU {external_cpu * 100:.0f}%"
-                )
+                status_cb(f"{stage}: 시스템 여유 확보 중...")
             self._sleep(self.poll_interval)
 
     def _set_opencv_threads(self, thread_count: int) -> None:

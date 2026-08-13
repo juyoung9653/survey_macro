@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from PyQt6.QtCore import QObject, QRectF, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QRectF, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QActionGroup, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 
 from .models import Box, Field, TemplatePreset
 from .processor import generate_ui_templates, generate_ui_templates_multi, run_analysis
+from .progress import ProgressTiming, format_duration
 from .vision import (
     ImageAligner,
     apply_rotation,
@@ -452,7 +453,7 @@ class ValueMappingDialog(QDialog):
 
 
 class _AnalysisWorker(QObject):
-    progress = pyqtSignal(int, str)
+    progress = pyqtSignal(float, str)
     finished = pyqtSignal(bool, str)
 
     def __init__(
@@ -508,6 +509,13 @@ class MainWindow(QMainWindow):
         self._analysis_worker: _AnalysisWorker | None = None
         self._analysis_progress: QProgressDialog | None = None
         self._analysis_result: tuple[bool, str] | None = None
+        self._analysis_timing: ProgressTiming | None = None
+        self._analysis_last_progress = 0.0
+        self._analysis_last_message = "분석 준비 중..."
+        self._analysis_elapsed_text = ""
+        self._analysis_timer = QTimer(self)
+        self._analysis_timer.setInterval(1000)
+        self._analysis_timer.timeout.connect(self._refresh_analysis_progress)
 
         self._init_ui()
 
@@ -1453,6 +1461,13 @@ class MainWindow(QMainWindow):
         self._analysis_progress = self._show_progress_dialog(
             "분석", "분석 준비 중..."
         )
+        self._analysis_progress.setMinimumWidth(680)
+        self._analysis_timing = ProgressTiming()
+        self._analysis_last_progress = 0.0
+        self._analysis_last_message = "분석 준비 중..."
+        self._analysis_elapsed_text = ""
+        self._refresh_analysis_progress()
+        self._analysis_timer.start()
         self._analysis_result = None
         self.exec_btn.setEnabled(False)
 
@@ -1476,19 +1491,39 @@ class MainWindow(QMainWindow):
         self._analysis_worker = worker
         thread.start()
 
-    @pyqtSlot(int, str)
-    def _update_analysis_progress(self, value: int, message: str):
+    @pyqtSlot(float, str)
+    def _update_analysis_progress(self, value: float, message: str):
         if self._analysis_progress is None:
             return
-        self._analysis_progress.setValue(max(0, min(100, value)))
+        self._analysis_last_progress = max(0.0, min(100.0, float(value)))
         if message:
-            self._analysis_progress.setLabelText(message)
+            self._analysis_last_message = message
+        self._refresh_analysis_progress()
+
+    @pyqtSlot()
+    def _refresh_analysis_progress(self):
+        if self._analysis_progress is None or self._analysis_timing is None:
+            return
+        self._analysis_progress.setValue(int(self._analysis_last_progress))
+        self._analysis_progress.setLabelText(
+            self._analysis_timing.label(
+                self._analysis_last_progress, self._analysis_last_message
+            )
+        )
 
     @pyqtSlot(bool, str)
     def _store_analysis_result(self, success: bool, error_message: str):
         self._analysis_result = (success, error_message)
+        self._analysis_timer.stop()
+        if self._analysis_timing is not None:
+            self._analysis_elapsed_text = format_duration(
+                self._analysis_timing.elapsed_seconds()
+            )
         if self._analysis_progress is not None:
-            self._analysis_progress.setValue(100)
+            if success:
+                self._analysis_last_progress = 100.0
+                self._analysis_last_message = "완료"
+                self._refresh_analysis_progress()
             self._analysis_progress.close()
 
     @pyqtSlot()
@@ -1500,20 +1535,40 @@ class MainWindow(QMainWindow):
 
         if self._analysis_progress is not None:
             self._analysis_progress.close()
+        self._analysis_timer.stop()
         self._analysis_progress = None
+        self._analysis_timing = None
         self._analysis_worker = None
         self._analysis_thread = None
         self._analysis_result = None
         self.exec_btn.setEnabled(True)
 
         if success:
-            QMessageBox.information(self, "완료", "분석이 완료되었습니다.")
+            elapsed = self._analysis_elapsed_text or "00:00"
+            QMessageBox.information(
+                self, "완료", f"분석이 완료되었습니다.\n\n총 소요 시간: {elapsed}"
+            )
         elif error_message:
+            elapsed_suffix = (
+                f"\n\n소요 시간: {self._analysis_elapsed_text}"
+                if self._analysis_elapsed_text
+                else ""
+            )
             QMessageBox.critical(
-                self, "오류", f"분석 중 문제가 발생했습니다.\n\n{error_message}"
+                self,
+                "오류",
+                f"분석 중 문제가 발생했습니다.\n\n{error_message}{elapsed_suffix}",
             )
         else:
-            QMessageBox.critical(self, "오류", "분석 중 문제가 발생했습니다.")
+            elapsed_suffix = (
+                f"\n\n소요 시간: {self._analysis_elapsed_text}"
+                if self._analysis_elapsed_text
+                else ""
+            )
+            QMessageBox.critical(
+                self, "오류", f"분석 중 문제가 발생했습니다.{elapsed_suffix}"
+            )
+        self._analysis_elapsed_text = ""
 
     def closeEvent(self, a0: QCloseEvent):
         if self._analysis_thread is not None and self._analysis_thread.isRunning():
