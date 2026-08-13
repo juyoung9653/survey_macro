@@ -1112,6 +1112,26 @@ class MainWindow(QMainWindow):
         progress.close()
         QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
 
+    def _redetect_checkboxes_with_progress(
+        self, title: str, before_detect=None
+    ) -> bool:
+        """Run a full checkbox re-detection with the same progress UI as loading."""
+        if not self.pages or not self.file_paths:
+            return False
+
+        progress = self._show_progress_dialog(title, "체크박스 재탐색 준비 중...")
+        progress_cb = self._make_progress_cb(progress)
+        try:
+            if before_detect is not None:
+                progress_cb(0, "캐시 삭제 중...")
+                before_detect()
+                progress_cb(0, "체크박스 재탐색 준비 중...")
+            self.auto_detect(progress_cb=progress_cb)
+            progress_cb(100, "체크박스 재탐색 완료")
+            return True
+        finally:
+            progress.close()
+
     def clear_cache(self):
         """체크박스 탐지 캐시를 모두 삭제하고 재탐지를 수행합니다."""
         reply = QMessageBox.question(
@@ -1123,11 +1143,12 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        clear_all_cache()
-
         if self.pages and self.file_paths:
-            self.auto_detect()
+            self._redetect_checkboxes_with_progress(
+                "캐시 삭제 후 재탐색", before_detect=clear_all_cache
+            )
         else:
+            clear_all_cache()
             QMessageBox.information(self, "완료", "캐시가 삭제되었습니다.")
 
     def change_fine_angle(self, angle: float):
@@ -1136,7 +1157,7 @@ class MainWindow(QMainWindow):
         if not self.pages:
             return
         self._update_page_size()
-        self.auto_detect()
+        self._redetect_checkboxes_with_progress("미세 회전 적용")
 
     def change_rotation(self, index: int):
         """메뉴에서 회전 방향을 선택하면 동작합니다."""
@@ -1155,7 +1176,7 @@ class MainWindow(QMainWindow):
             return
 
         self._update_page_size()
-        self.auto_detect()
+        self._redetect_checkboxes_with_progress("회전 적용")
 
     def toggle_view(self):
         if self.preset.page_count > 1:
