@@ -8,6 +8,8 @@ from src.models import Box, Field, TemplatePreset
 from src.processor import (
     _align_template_mask_by_coverage,
     _checkbox_layout_is_trustworthy,
+    _extract_checkbox_halo_info,
+    _refine_checkbox_box,
     _remap_checkbox_layout,
     evaluate_checkbox_marks,
     evaluate_marks,
@@ -135,6 +137,31 @@ class TemplateAlignmentTests(unittest.TestCase):
         find_ecc.assert_not_called()
         self.assertTrue(np.array_equal(aligned, reference))
 
+    def test_image_aligner_scales_large_ecc_inputs_and_restores_translation(self):
+        reference = cv2.resize(_make_form(), (1000, 2000), interpolation=cv2.INTER_LINEAR)
+        target_to_ref = np.array(
+            [[1.0, 0.0, -8.0], [0.0, 1.0, 6.0]], dtype=np.float32
+        )
+        ref_to_target = cv2.invertAffineTransform(target_to_ref)
+
+        with (
+            patch(
+                "src.vision.cv2.estimateAffine2D",
+                return_value=(target_to_ref.copy(), None),
+            ),
+            patch(
+                "src.vision.cv2.findTransformECC",
+                side_effect=lambda _ref, _target, initial, *_args: (0.999, initial),
+            ) as find_ecc,
+        ):
+            ImageAligner(reference).align(reference)
+
+        ecc_reference, ecc_target, ecc_initial = find_ecc.call_args.args[:3]
+        self.assertEqual(max(ecc_reference.shape), 1200)
+        self.assertEqual(ecc_reference.shape, ecc_target.shape)
+        self.assertAlmostEqual(ecc_initial[0, 2], ref_to_target[0, 2] * 0.6)
+        self.assertAlmostEqual(ecc_initial[1, 2], ref_to_target[1, 2] * 0.6)
+
     def test_ink_is_preserved_and_checkbox_detection_still_works(self):
         form = _make_form()
         ink = np.zeros_like(form)
@@ -216,6 +243,27 @@ class TemplateAlignmentTests(unittest.TestCase):
         )
         self.assertEqual(empty_halo, 0)
         self.assertGreater(marked_halo, 5)
+
+    def test_refined_checkbox_is_reused_for_halo_scoring(self):
+        expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        page = np.full((150, 180), 255, np.uint8)
+        cv2.rectangle(page, (74, 57), (97, 80), 70, 2)
+        cv2.line(page, (80, 70), (91, 60), 20, 3)
+        pure_ink = _dark_mask(page)
+
+        with patch(
+            "src.processor._refine_checkbox_box",
+            wraps=_refine_checkbox_box,
+        ) as refine:
+            direct_info = extract_checkbox_ink_info(page, expected)
+            _extract_checkbox_halo_info(
+                pure_ink,
+                direct_info.box,
+                target_gray=page,
+                box_is_refined=True,
+            )
+
+        self.assertEqual(refine.call_count, 1)
 
     def test_file_template_remaps_reflowed_checkbox_row_by_order(self):
         template = np.full((300, 420), 255, np.uint8)

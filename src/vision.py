@@ -133,14 +133,49 @@ def load_pdf_pages(
 
 
 class ImageAligner:
-    def __init__(self, ref_img: np.ndarray, refine_ecc: bool = True):
+    def __init__(
+        self,
+        ref_img: np.ndarray,
+        refine_ecc: bool = True,
+        ecc_max_dimension: int = 1200,
+    ):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
         )
         self.ref_h, self.ref_w = self.ref_gray.shape[:2]
         self.refine_ecc = refine_ecc
+        long_side = max(self.ref_h, self.ref_w)
+        if refine_ecc and ecc_max_dimension > 0 and long_side > ecc_max_dimension:
+            scale = ecc_max_dimension / long_side
+            ecc_w = max(1, round(self.ref_w * scale))
+            ecc_h = max(1, round(self.ref_h * scale))
+            self.ecc_ref_gray = cv2.resize(
+                self.ref_gray, (ecc_w, ecc_h), interpolation=cv2.INTER_AREA
+            )
+            self.ecc_scale_x = ecc_w / self.ref_w
+            self.ecc_scale_y = ecc_h / self.ref_h
+        else:
+            self.ecc_ref_gray = self.ref_gray
+            self.ecc_scale_x = 1.0
+            self.ecc_scale_y = 1.0
         self.orb = cv2.ORB_create(2000)
         self.kp1, self.des1 = self.orb.detectAndCompute(self.ref_gray, None)
+
+    def _affine_to_ecc_scale(self, matrix: np.ndarray) -> np.ndarray:
+        scaled = matrix.astype(np.float32, copy=True)
+        scaled[0, 1] *= self.ecc_scale_x / self.ecc_scale_y
+        scaled[1, 0] *= self.ecc_scale_y / self.ecc_scale_x
+        scaled[0, 2] *= self.ecc_scale_x
+        scaled[1, 2] *= self.ecc_scale_y
+        return scaled
+
+    def _affine_from_ecc_scale(self, matrix: np.ndarray) -> np.ndarray:
+        full_size = matrix.astype(np.float32, copy=True)
+        full_size[0, 1] *= self.ecc_scale_y / self.ecc_scale_x
+        full_size[1, 0] *= self.ecc_scale_x / self.ecc_scale_y
+        full_size[0, 2] /= self.ecc_scale_x
+        full_size[1, 2] /= self.ecc_scale_y
+        return full_size
 
     def _resize_to_ref(self, img: np.ndarray) -> np.ndarray:
         if img.shape[:2] == (self.ref_h, self.ref_w):
@@ -190,10 +225,20 @@ class ImageAligner:
                     50,
                     1e-6,
                 )
-                ecc_initial = cv2.invertAffineTransform(M).astype(np.float32)
+                ecc_gray = (
+                    cv2.resize(
+                        gray,
+                        (self.ecc_ref_gray.shape[1], self.ecc_ref_gray.shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    if self.ecc_scale_x < 1.0 or self.ecc_scale_y < 1.0
+                    else gray
+                )
+                ecc_initial_full = cv2.invertAffineTransform(M).astype(np.float32)
+                ecc_initial = self._affine_to_ecc_scale(ecc_initial_full)
                 _, M_refined = cv2.findTransformECC(
-                    self.ref_gray,
-                    gray,
+                    self.ecc_ref_gray,
+                    ecc_gray,
                     ecc_initial,
                     cv2.MOTION_AFFINE,
                     criteria,
@@ -201,7 +246,9 @@ class ImageAligner:
                     5,
                 )
                 if np.isfinite(M_refined).all():
-                    M = cv2.invertAffineTransform(M_refined)
+                    M = cv2.invertAffineTransform(
+                        self._affine_from_ecc_scale(M_refined)
+                    )
             except Exception:
                 pass  # ECC 실패 시 ORB 결과 그대로 사용
 

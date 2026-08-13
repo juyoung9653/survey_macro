@@ -22,6 +22,22 @@ from src.models import TemplatePreset
 from src.vision import load_pdf_pages
 
 
+class _ResourceControllerStub:
+    def __init__(self):
+        self.started = False
+        self.closed = False
+        self.checkpoints = []
+
+    def start(self):
+        self.started = True
+
+    def close(self):
+        self.closed = True
+
+    def checkpoint(self, required_memory_bytes=0, stage="", status_cb=None):
+        self.checkpoints.append((required_memory_bytes, stage))
+
+
 class PipelineOptimizationTests(unittest.TestCase):
     def test_uint8_median_matches_numpy(self):
         rng = np.random.default_rng(17)
@@ -131,6 +147,7 @@ class PipelineOptimizationTests(unittest.TestCase):
 
         config = TemplatePreset(page_count=1)
         template_page = np.full((8, 8), 255, np.uint8)
+        resource_controller = _ResourceControllerStub()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             previous_cwd = os.getcwd()
@@ -152,7 +169,12 @@ class PipelineOptimizationTests(unittest.TestCase):
                     patch("src.processor._insert_img_into_pdf"),
                     patch("src.processor.export_to_excel", side_effect=export_rows),
                 ):
-                    success = run_analysis(file_paths, [template_page], config)
+                    success = run_analysis(
+                        file_paths,
+                        [template_page],
+                        config,
+                        resource_controller=resource_controller,
+                    )
             finally:
                 os.chdir(previous_cwd)
 
@@ -175,6 +197,9 @@ class PipelineOptimizationTests(unittest.TestCase):
             [row["파일명"] for row in exported_rows],
             ["first", "second", "third"],
         )
+        self.assertTrue(resource_controller.started)
+        self.assertTrue(resource_controller.closed)
+        self.assertEqual(len(resource_controller.checkpoints), 3)
 
     def test_batch_analysis_defers_files_until_a_reference_template_exists(self):
         file_paths = ["broken.pdf", "valid.pdf"]
@@ -208,6 +233,7 @@ class PipelineOptimizationTests(unittest.TestCase):
             return True
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            resource_controller = _ResourceControllerStub()
             previous_cwd = os.getcwd()
             os.chdir(temp_dir)
             try:
@@ -231,6 +257,7 @@ class PipelineOptimizationTests(unittest.TestCase):
                         file_paths,
                         [np.full((8, 8), 255, np.uint8)],
                         TemplatePreset(page_count=1),
+                        resource_controller=resource_controller,
                     )
             finally:
                 os.chdir(previous_cwd)
@@ -246,6 +273,8 @@ class PipelineOptimizationTests(unittest.TestCase):
         self.assertEqual(
             [row["파일명"] for row in exported_rows], ["broken", "valid"]
         )
+        self.assertTrue(resource_controller.started)
+        self.assertTrue(resource_controller.closed)
 
     def test_ui_template_cache_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -12,6 +12,7 @@ import numpy as np
 
 from .export import export_to_excel
 from .models import Box, Field, TemplatePreset
+from .resources import AdaptiveResourceController, ResourceUnavailableError
 from .vision import (
     ImageAligner,
     apply_rotation,
@@ -23,6 +24,7 @@ from .vision import (
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_TEMPLATE_CACHE_VERSION = 5
 _CHECKBOX_MIN_BORDER_CONFIDENCE = 0.35
+_MIB = 1024 * 1024
 
 
 @dataclass
@@ -868,80 +870,73 @@ def _refine_checkbox_box(
         1.0,
     )
     integral = cv2.integral(darkness, sdepth=cv2.CV_64F)
+    context_h, context_w = context.shape[:2]
+    candidate_xs = np.arange(min_candidate_x, max_candidate_x + 1, dtype=np.int32)
+    candidate_ys = np.arange(min_candidate_y, max_candidate_y + 1, dtype=np.int32)
+    offsets = np.arange(-edge_tolerance, edge_tolerance + 1, dtype=np.int32)
 
-    def mean_darkness(x_start: int, y_start: int, x_end: int, y_end: int) -> float:
-        local_x1 = max(0, x_start - context_x1)
-        local_y1 = max(0, y_start - context_y1)
-        local_x2 = min(context.shape[1], x_end - context_x1)
-        local_y2 = min(context.shape[0], y_end - context_y1)
-        if local_x2 <= local_x1 or local_y2 <= local_y1:
-            return 0.0
-        total = (
+    def rectangle_means(
+        x_start: np.ndarray,
+        y_start: np.ndarray,
+        x_end: np.ndarray,
+        y_end: np.ndarray,
+    ) -> np.ndarray:
+        local_x1 = np.clip(x_start - context_x1, 0, context_w)
+        local_y1 = np.clip(y_start - context_y1, 0, context_h)
+        local_x2 = np.clip(x_end - context_x1, 0, context_w)
+        local_y2 = np.clip(y_end - context_y1, 0, context_h)
+        local_x1, local_y1, local_x2, local_y2 = np.broadcast_arrays(
+            local_x1, local_y1, local_x2, local_y2
+        )
+        totals = (
             integral[local_y2, local_x2]
             - integral[local_y1, local_x2]
             - integral[local_y2, local_x1]
             + integral[local_y1, local_x1]
         )
-        return float(total) / ((local_x2 - local_x1) * (local_y2 - local_y1))
+        areas = (local_x2 - local_x1) * (local_y2 - local_y1)
+        means = np.zeros_like(totals, dtype=np.float64)
+        np.divide(totals, areas, out=means, where=areas > 0)
+        return means
 
-    best_adjusted_score = float("-inf")
-    confidence = 0.0
-    best_x = box.x
-    best_y = box.y
-    offsets = range(-edge_tolerance, edge_tolerance + 1)
-    for candidate_y in range(min_candidate_y, max_candidate_y + 1):
-        for candidate_x in range(min_candidate_x, max_candidate_x + 1):
-            horizontal_x1 = candidate_x - span_padding
-            horizontal_x2 = candidate_x + box.w + span_padding
-            vertical_y1 = candidate_y - span_padding
-            vertical_y2 = candidate_y + box.h + span_padding
-            top = max(
-                mean_darkness(
-                    horizontal_x1,
-                    candidate_y + offset,
-                    horizontal_x2,
-                    candidate_y + offset + border_width,
-                )
-                for offset in offsets
-            )
-            bottom = max(
-                mean_darkness(
-                    horizontal_x1,
-                    candidate_y + box.h - border_width + offset,
-                    horizontal_x2,
-                    candidate_y + box.h + offset,
-                )
-                for offset in offsets
-            )
-            left = max(
-                mean_darkness(
-                    candidate_x + offset,
-                    vertical_y1,
-                    candidate_x + offset + border_width,
-                    vertical_y2,
-                )
-                for offset in offsets
-            )
-            right = max(
-                mean_darkness(
-                    candidate_x + box.w - border_width + offset,
-                    vertical_y1,
-                    candidate_x + box.w + offset,
-                    vertical_y2,
-                )
-                for offset in offsets
-            )
-            side_scores = (top, bottom, left, right)
-            side_score = min(side_scores) * 0.85 + float(np.mean(side_scores)) * 0.15
-            motion_penalty = (
-                abs(candidate_x - box.x) + abs(candidate_y - box.y)
-            ) * 0.003
-            adjusted_score = side_score - motion_penalty
-            if adjusted_score > best_adjusted_score:
-                best_adjusted_score = adjusted_score
-                confidence = side_score
-                best_x = candidate_x
-                best_y = candidate_y
+    horizontal_x1 = candidate_xs[None, :, None] - span_padding
+    horizontal_x2 = candidate_xs[None, :, None] + box.w + span_padding
+    top_y1 = candidate_ys[:, None, None] + offsets[None, None, :]
+    top_y2 = top_y1 + border_width
+    bottom_y2 = candidate_ys[:, None, None] + box.h + offsets[None, None, :]
+    bottom_y1 = bottom_y2 - border_width
+    top = rectangle_means(horizontal_x1, top_y1, horizontal_x2, top_y2).max(
+        axis=2
+    )
+    bottom = rectangle_means(
+        horizontal_x1, bottom_y1, horizontal_x2, bottom_y2
+    ).max(axis=2)
+
+    vertical_y1 = candidate_ys[:, None, None] - span_padding
+    vertical_y2 = candidate_ys[:, None, None] + box.h + span_padding
+    left_x1 = candidate_xs[None, :, None] + offsets[None, None, :]
+    left_x2 = left_x1 + border_width
+    right_x2 = candidate_xs[None, :, None] + box.w + offsets[None, None, :]
+    right_x1 = right_x2 - border_width
+    left = rectangle_means(left_x1, vertical_y1, left_x2, vertical_y2).max(axis=2)
+    right = rectangle_means(right_x1, vertical_y1, right_x2, vertical_y2).max(
+        axis=2
+    )
+
+    side_scores = np.stack((top, bottom, left, right))
+    scores = side_scores.min(axis=0) * 0.85 + side_scores.mean(axis=0) * 0.15
+    motion_penalty = (
+        np.abs(candidate_xs[None, :] - box.x)
+        + np.abs(candidate_ys[:, None] - box.y)
+    ) * 0.003
+    adjusted_scores = scores - motion_penalty
+    best_flat_index = int(np.argmax(adjusted_scores))
+    best_y_index, best_x_index = np.unravel_index(
+        best_flat_index, adjusted_scores.shape
+    )
+    confidence = float(scores[best_y_index, best_x_index])
+    best_x = int(candidate_xs[best_x_index])
+    best_y = int(candidate_ys[best_y_index])
 
     refined = copy.copy(box)
     if confidence >= _CHECKBOX_MIN_BORDER_CONFIDENCE:
@@ -1010,6 +1005,7 @@ def _extract_checkbox_halo_info(
     pure_ink_mask: np.ndarray,
     box: Box,
     target_gray: np.ndarray | None = None,
+    box_is_refined: bool = False,
 ) -> _CheckboxHaloInfo:
     """박스 테두리에 실제로 연결된 외부 체크 획만 추출합니다.
 
@@ -1020,7 +1016,7 @@ def _extract_checkbox_halo_info(
     수 있습니다.
     """
     working_box = copy.copy(box)
-    if target_gray is not None:
+    if target_gray is not None and not box_is_refined:
         if target_gray.ndim == 3:
             target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
         refined_box, confidence = _refine_checkbox_box(target_gray, working_box)
@@ -1774,6 +1770,7 @@ def process_survey_data(
                         pure_ink_masks[info.box.page_idx],
                         info.box,
                         target_gray=survey_gray_pages[info.box.page_idx],
+                        box_is_refined=True,
                     )
                 )
             else:
@@ -2027,6 +2024,42 @@ def _render_survey_pages(
     return sequential_result
 
 
+def _reference_page_pixels(alignment_references: list[np.ndarray]) -> list[int]:
+    return [
+        int(reference.shape[0] * reference.shape[1])
+        for reference in alignment_references
+    ]
+
+
+def _estimate_render_memory_bytes(
+    alignment_references: list[np.ndarray],
+) -> int:
+    pixels = _reference_page_pixels(alignment_references)
+    return (max(pixels, default=0) * 10) + 64 * _MIB
+
+
+def _estimate_survey_memory_bytes(
+    alignment_references: list[np.ndarray],
+) -> int:
+    pixels = _reference_page_pixels(alignment_references)
+    return (sum(pixels) * 7) + (max(pixels, default=0) * 4) + 64 * _MIB
+
+
+def _estimate_template_memory_bytes(
+    sample_pages: dict[int, list[bytes]],
+    alignment_references: list[np.ndarray],
+) -> int:
+    pixels = _reference_page_pixels(alignment_references)
+    peak_bytes = 0
+    for local_p, samples in sample_pages.items():
+        page_pixels = (
+            pixels[local_p] if local_p < len(pixels) else max(pixels, default=0)
+        )
+        # PNG 디코딩 배열과 중앙값 partition 스택이 동시에 존재합니다.
+        peak_bytes = max(peak_bytes, page_pixels * max(1, len(samples)) * 2)
+    return peak_bytes + (max(pixels, default=0) * 4) + 64 * _MIB
+
+
 # ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
 def _collect_template_samples(
     fpath: str,
@@ -2034,6 +2067,8 @@ def _collect_template_samples(
     alignment_references: list[np.ndarray],
     dpi: int = 300,
     sample_limit: int = 31,
+    resource_controller: AdaptiveResourceController | None = None,
+    resource_status_cb=None,
 ) -> tuple[str, dict[int, list[bytes]]]:
     fname = Path(fpath).stem
     try:
@@ -2054,6 +2089,12 @@ def _collect_template_samples(
 
     try:
         for survey_idx in range(limit):
+            if resource_controller is not None:
+                resource_controller.checkpoint(
+                    _estimate_render_memory_bytes(alignment_references),
+                    stage=f"{fname} 템플릿 표본 처리",
+                    status_cb=resource_status_cb,
+                )
             pages = _render_survey_pages(
                 doc,
                 survey_idx,
@@ -2138,6 +2179,8 @@ def _analyze_single_file(
     review_folder: Path,
     dpi: int = 300,
     sample_pages: dict[int, list[bytes]] | None = None,
+    resource_controller: AdaptiveResourceController | None = None,
+    resource_status_cb=None,
 ) -> tuple[str, list[dict], list[bytes]]:
     try:
         doc = fitz.open(fpath)
@@ -2175,8 +2218,15 @@ def _analyze_single_file(
         fine_angle = config.fine_angle
         file_results: list[dict] = []
         comment_pages: list[bytes] = []
+        survey_memory_bytes = _estimate_survey_memory_bytes(alignment_references)
 
         for survey_idx in range(survey_count):
+            if resource_controller is not None:
+                resource_controller.checkpoint(
+                    survey_memory_bytes,
+                    stage=f"{file_label} 설문 분석",
+                    status_cb=resource_status_cb,
+                )
             expected_pages = min(
                 page_count, max(0, len(doc) - survey_idx * page_count)
             )
@@ -2249,6 +2299,7 @@ def run_analysis(
     template_pages: list,
     config: TemplatePreset,
     progress_cb=None,
+    resource_controller: AdaptiveResourceController | None = None,
 ) -> bool:
     review_folder = Path("검토용")
     review_folder.mkdir(exist_ok=True)
@@ -2277,13 +2328,19 @@ def run_analysis(
     # 모든 파일의 300 DPI PNG 표본을 한꺼번에 보관하거나 두 PDF를 동시에 분석하면
     # 메모리가 작은 PC에서 피크 사용량이 크게 늘어나므로 파일 단위 병렬화는 하지 않습니다.
     report_progress(0, "파일별 템플릿 생성 및 분석 중...")
+    controller = resource_controller or AdaptiveResourceController()
+    controller.start()
     reference_templates: dict[int, np.ndarray] | None = None
     pending_indices: list[int] = []
     all_results: list[dict] = []
     analysis_failures: list[str] = []
     completed = 0
     comment_path = Path("의견.pdf")
-    comment_doc = fitz.open()
+    try:
+        comment_doc = fitz.open()
+    except Exception:
+        controller.close()
+        raise
 
     def save_reference_template() -> None:
         if reference_templates is None:
@@ -2320,10 +2377,16 @@ def run_analysis(
                 alignment_references,
                 review_folder,
                 sample_pages=sample_pages,
+                resource_controller=controller,
+                resource_status_cb=lambda message: report_progress(
+                    10 + int(completed / num_files * 88), message
+                ),
             )
             all_results.extend(file_results)
             for image_bytes in comment_pages:
                 _insert_encoded_img_into_pdf(comment_doc, image_bytes)
+        except ResourceUnavailableError:
+            raise
         except Exception as e:
             analysis_failures.append(file_label)
             print(f"분석 실패 ({file_label}): {e}")
@@ -2345,10 +2408,27 @@ def run_analysis(
             file_template: dict[int, np.ndarray] = {}
             try:
                 _, sample_pages = _collect_template_samples(
-                    fpath, config, alignment_references
+                    fpath,
+                    config,
+                    alignment_references,
+                    resource_controller=controller,
+                    resource_status_cb=lambda message: report_progress(
+                        10 + int(completed / num_files * 88), message
+                    ),
                 )
                 if sample_pages:
+                    controller.checkpoint(
+                        _estimate_template_memory_bytes(
+                            sample_pages, alignment_references
+                        ),
+                        stage=f"{file_label} 템플릿 생성",
+                        status_cb=lambda message: report_progress(
+                            10 + int(completed / num_files * 88), message
+                        ),
+                    )
                     file_template = generate_dynamic_templates(sample_pages)
+            except ResourceUnavailableError:
+                raise
             except Exception as e:
                 print(f"템플릿 샘플 수집 실패 ({file_label}): {e}")
 
@@ -2391,6 +2471,7 @@ def run_analysis(
             comment_path.unlink()
     finally:
         comment_doc.close()
+        controller.close()
 
     # ── 엑셀 저장 ──
     report_progress(98, "엑셀 저장 중...")
