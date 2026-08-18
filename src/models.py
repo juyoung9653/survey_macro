@@ -66,6 +66,13 @@ class TemplatePreset:
     page_count: int = 1
     fine_angle: float = 0.0
     rot_code: int = -1
-    reverse_numbering: bool = False
+    reverse_numbering: bool = True
     template_dilate_pct: float = 0.5
     fields: list[Field] = field(default_factory=list)
+    page_fine_angles: list[float] = field(default_factory=list)
+
+    def fine_angle_for_page(self, page_idx: int) -> float:
+        page_angle = 0.0
+        if 0 <= page_idx < len(self.page_fine_angles):
+            page_angle = float(self.page_fine_angles[page_idx])
+        return float(self.fine_angle) + page_angle

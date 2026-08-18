@@ -6,17 +6,21 @@ import numpy as np
 
 from src.models import Box, Field, TemplatePreset
 from src.processor import (
+    _CheckboxHaloInfo,
+    _CheckboxInkInfo,
     _align_template_mask_by_coverage,
     _checkbox_layout_is_trustworthy,
     _extract_checkbox_halo_info,
     _refine_checkbox_box,
     _remap_checkbox_layout,
+    _resolve_checkbox_halo_ownership,
     evaluate_checkbox_marks,
     evaluate_marks,
     extract_checkbox_halo_ink_info,
     extract_checkbox_ink_info,
     extract_pure_ink_mask,
     process_survey_data,
+    remap_preset_to_detected_layout,
 )
 from src.vision import ImageAligner, auto_detect_checkboxes
 
@@ -309,6 +313,226 @@ class TemplateAlignmentTests(unittest.TestCase):
             self.assertAlmostEqual(remapped_center[0], actual_center[0], delta=4)
             self.assertAlmostEqual(remapped_center[1], actual_center[1], delta=4)
 
+    def test_preset_layout_uses_detected_boxes_across_render_dpi_changes(self):
+        source = np.full((400, 300), 255, np.uint8)
+        target = np.full((600, 450), 255, np.uint8)
+        source_positions = [
+            (50, 90),
+            (120, 90),
+            (190, 90),
+            (50, 190),
+            (120, 190),
+            (190, 190),
+        ]
+        target_positions = [
+            (round(x * 1.5 + 10), round(y * 1.5 - 12))
+            for x, y in source_positions
+        ]
+        for x, y in target_positions:
+            cv2.rectangle(target, (x, y), (x + 29, y + 29), 0, 2)
+
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
+                ),
+                Field(
+                    name="의견",
+                    boxes=[Box(0, 40, 280, 200, 60)],
+                    is_comment=True,
+                ),
+            ],
+        )
+        auxiliary = [Box(0, 245, 300, 25, 25)]
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+            auxiliary_boxes=auxiliary,
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.matched_boxes, 6)
+        for box, (target_x, target_y) in zip(
+            result.config.fields[0].boxes, target_positions
+        ):
+            self.assertAlmostEqual(box.x, target_x, delta=4)
+            self.assertAlmostEqual(box.y, target_y, delta=4)
+        comment = result.config.fields[1].boxes[0]
+        self.assertAlmostEqual(comment.x, 70, delta=3)
+        self.assertAlmostEqual(comment.y, 408, delta=3)
+        self.assertAlmostEqual(comment.w, 300, delta=4)
+        pending = result.auxiliary_boxes[0]
+        self.assertAlmostEqual(pending.x, 378, delta=3)
+        self.assertAlmostEqual(pending.y, 438, delta=3)
+
+    def test_preset_layout_rejects_incomplete_checkbox_detection(self):
+        source = np.full((400, 300), 255, np.uint8)
+        target = np.full((600, 450), 255, np.uint8)
+        source_positions = [
+            (50, 90),
+            (120, 90),
+            (190, 90),
+            (50, 190),
+            (120, 190),
+            (190, 190),
+        ]
+        for x, y in source_positions[:-1]:
+            target_x = round(x * 1.5 + 10)
+            target_y = round(y * 1.5 - 12)
+            cv2.rectangle(
+                target,
+                (target_x, target_y),
+                (target_x + 29, target_y + 29),
+                0,
+                2,
+            )
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
+                )
+            ],
+        )
+        auxiliary = [Box(0, 245, 300, 25, 25)]
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+            auxiliary_boxes=auxiliary,
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.config.fields[0].boxes[0].x, 50)
+        self.assertEqual(result.auxiliary_boxes[0].x, 245)
+
+    def test_preset_layout_rejects_a_missing_required_template_page(self):
+        source_pages = {
+            0: np.full((300, 220), 255, np.uint8),
+            1: np.full((300, 220), 255, np.uint8),
+        }
+        target_page = np.full((450, 330), 255, np.uint8)
+        fields = []
+        positions = [
+            (40, 70),
+            (100, 70),
+            (160, 70),
+            (40, 160),
+            (100, 160),
+            (160, 160),
+        ]
+        for page_idx in range(2):
+            boxes = []
+            for x, y in positions:
+                boxes.append(Box(page_idx, x, y, 20, 20))
+                if page_idx == 0:
+                    target_x = round(x * 1.5)
+                    target_y = round(y * 1.5)
+                    cv2.rectangle(
+                        target_page,
+                        (target_x, target_y),
+                        (target_x + 29, target_y + 29),
+                        0,
+                        2,
+                    )
+            fields.append(Field(name=f"Q{page_idx + 1}", boxes=boxes))
+        config = TemplatePreset(page_count=2, fields=fields)
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target_page},
+            source_templates=source_pages,
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.expected_boxes, 12)
+        self.assertEqual(result.page_transforms, {})
+
+    def test_preset_layout_interpolates_a_few_obscured_checkbox_frames(self):
+        source = np.full((400, 300), 255, np.uint8)
+        target = np.full((600, 450), 255, np.uint8)
+        source_positions = [
+            (50 + column * 70, 60 + row * 70)
+            for row in range(4)
+            for column in range(3)
+        ]
+        missing_index = 7
+        target_positions = [
+            (round(x * 1.4 + 18), round(y * 1.4 - 6))
+            for x, y in source_positions
+        ]
+        for index, (x, y) in enumerate(target_positions):
+            if index == missing_index:
+                continue
+            cv2.rectangle(target, (x, y), (x + 27, y + 27), 0, 2)
+
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
+                ),
+                Field(
+                    name="comment",
+                    boxes=[Box(0, 40, 340, 200, 40)],
+                    is_comment=True,
+                ),
+            ],
+        )
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertTrue(result.compatible)
+        self.assertEqual(result.matched_boxes, 11)
+        for index, (box, (target_x, target_y)) in enumerate(
+            zip(result.config.fields[0].boxes, target_positions)
+        ):
+            tolerance = 5 if index == missing_index else 4
+            self.assertAlmostEqual(box.x, target_x, delta=tolerance)
+            self.assertAlmostEqual(box.y, target_y, delta=tolerance)
+
+    def test_preset_layout_marks_a_different_form_as_incompatible(self):
+        source = np.full((400, 300), 255, np.uint8)
+        target = np.full((600, 450), 255, np.uint8)
+        source_positions = [
+            (50 + column * 70, 60 + row * 70)
+            for row in range(4)
+            for column in range(3)
+        ]
+        for x, y in [(80, 420), (160, 420), (240, 420)]:
+            cv2.rectangle(target, (x, y), (x + 27, y + 27), 0, 2)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
+                )
+            ],
+        )
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertFalse(result.compatible)
+        self.assertLess(result.matched_boxes, len(source_positions) * 0.45)
+
     def test_checkbox_layout_is_trusted_only_when_every_frame_is_detected(self):
         template = np.full((300, 420), 255, np.uint8)
         positions = [
@@ -363,6 +587,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         )
         config = TemplatePreset(
             page_count=1,
+            reverse_numbering=False,
             template_dilate_pct=0.0,
             fields=[
                 Field(
@@ -483,6 +708,75 @@ class TemplateAlignmentTests(unittest.TestCase):
             [True],
         )
 
+    def test_checkbox_halo_rejects_a_compact_scan_speck_near_frame(self):
+        box = Box(page_idx=0, x=90, y=80, w=19, h=19)
+        page = np.full((180, 240), 255, np.uint8)
+        residue = np.zeros_like(page)
+        cv2.rectangle(
+            page,
+            (box.x, box.y),
+            (box.x + box.w - 1, box.y + box.h - 1),
+            80,
+            2,
+        )
+        cv2.rectangle(
+            page,
+            (box.x - 7, box.y - 11),
+            (box.x - 3, box.y - 3),
+            20,
+            -1,
+        )
+        cv2.rectangle(
+            residue,
+            (box.x - 7, box.y - 11),
+            (box.x - 3, box.y - 3),
+            255,
+            -1,
+        )
+
+        ink, _area = extract_checkbox_halo_ink_info(
+            residue,
+            box,
+            target_gray=page,
+        )
+
+        self.assertEqual(ink, 0)
+
+    def test_checkbox_halo_keeps_a_compact_tail_connected_to_interior_ink(self):
+        box = Box(page_idx=0, x=90, y=80, w=19, h=19)
+        page = np.full((180, 240), 255, np.uint8)
+        residue = np.zeros_like(page)
+        cv2.rectangle(
+            page,
+            (box.x, box.y),
+            (box.x + box.w - 1, box.y + box.h - 1),
+            80,
+            2,
+        )
+        cv2.rectangle(
+            page,
+            (box.x - 3, box.y - 9),
+            (box.x + 2, box.y - 2),
+            20,
+            -1,
+        )
+        cv2.line(
+            page,
+            (box.x, box.y - 2),
+            (box.x + 9, box.y + 10),
+            20,
+            3,
+        )
+        residue[page < 60] = 255
+
+        ink, _area = extract_checkbox_halo_ink_info(
+            residue,
+            box,
+            target_gray=page,
+        )
+
+        self.assertGreater(ink, 0)
+
     def test_connected_halo_stroke_is_owned_by_the_box_it_marks(self):
         boxes = [
             Box(page_idx=0, x=70, y=60, w=24, h=24),
@@ -527,6 +821,63 @@ class TemplateAlignmentTests(unittest.TestCase):
 
         self.assertEqual(row["Q"], "actual")
 
+    def test_halo_stroke_can_be_owned_by_a_direct_only_neighbor(self):
+        upper_box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        lower_box = Box(page_idx=0, x=70, y=110, w=24, h=24)
+        page = np.full((180, 180), 255, np.uint8)
+        cv2.line(page, (82, 75), (82, 125), 30, 3)
+        pure_ink = _dark_mask(page)
+
+        upper_direct_mask = np.zeros((12, 12), np.uint8)
+        upper_direct = _CheckboxInkInfo(
+            0,
+            upper_direct_mask.size,
+            upper_box,
+            0.8,
+            (76, 66, 88, 78),
+            upper_direct_mask,
+        )
+        upper_halo_mask = np.zeros((50, 35), np.uint8)
+        cv2.line(upper_halo_mask, (17, 20), (17, 49), 255, 3)
+        upper_halo = _CheckboxHaloInfo(
+            cv2.countNonZero(upper_halo_mask),
+            upper_halo_mask.size,
+            upper_box,
+            (65, 55, 100, 105),
+            upper_halo_mask,
+        )
+
+        lower_direct_mask = np.zeros((12, 12), np.uint8)
+        cv2.line(lower_direct_mask, (6, 0), (6, 11), 255, 3)
+        lower_direct = _CheckboxInkInfo(
+            cv2.countNonZero(lower_direct_mask),
+            lower_direct_mask.size,
+            lower_box,
+            0.8,
+            (76, 116, 88, 128),
+            lower_direct_mask,
+        )
+        lower_halo_mask = np.zeros((50, 35), np.uint8)
+        lower_halo = _CheckboxHaloInfo(
+            0,
+            lower_halo_mask.size,
+            lower_box,
+            (65, 105, 100, 155),
+            lower_halo_mask,
+        )
+
+        _resolve_checkbox_halo_ownership(
+            {0: pure_ink},
+            {0: page},
+            [
+                (upper_direct, False, upper_halo),
+                (lower_direct, True, lower_halo),
+            ],
+        )
+
+        self.assertEqual(upper_halo.ink_pixels, 0)
+        self.assertGreater(lower_direct.ink_pixels, 0)
+
     def test_separate_external_checks_keep_separate_checkbox_owners(self):
         boxes = [
             Box(page_idx=0, x=70, y=60, w=24, h=24),
@@ -548,6 +899,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         cv2.line(page, (91, 131), (104, 118), 30, 3)
         config = TemplatePreset(
             page_count=1,
+            reverse_numbering=False,
             template_dilate_pct=0.0,
             fields=[
                 Field(
@@ -631,6 +983,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         cv2.line(page, (180, 111), (194, 97), 30, 3)
         config = TemplatePreset(
             page_count=1,
+            reverse_numbering=False,
             template_dilate_pct=0.0,
             fields=[
                 Field(
@@ -705,6 +1058,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         )
         config = TemplatePreset(
             page_count=1,
+            reverse_numbering=False,
             template_dilate_pct=0.0,
             fields=[
                 Field(
@@ -756,6 +1110,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         info = extract_checkbox_ink_info(page, first_box)
         config = TemplatePreset(
             page_count=1,
+            reverse_numbering=False,
             template_dilate_pct=0.0,
             fields=[
                 Field(

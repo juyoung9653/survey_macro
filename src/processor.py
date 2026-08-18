@@ -22,7 +22,7 @@ from .vision import (
 
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
-_UI_TEMPLATE_CACHE_VERSION = 5
+_UI_TEMPLATE_CACHE_VERSION = 6
 _CHECKBOX_MIN_BORDER_CONFIDENCE = 0.35
 _MIB = 1024 * 1024
 _ANALYSIS_SAMPLE_WORK = 2.0
@@ -62,12 +62,35 @@ class _CheckboxFieldAnalysis:
     halo_infos: list[_CheckboxHaloInfo]
 
 
+@dataclass
+class PresetLayoutRemapResult:
+    config: TemplatePreset
+    auxiliary_boxes: list[Box]
+    page_transforms: dict[int, np.ndarray]
+    matched_boxes: int
+    expected_boxes: int
+    accepted: bool
+    compatible: bool = True
+
+
+def _fine_angle_for_page(
+    fine_angle: float,
+    page_fine_angles: list[float] | None,
+    page_idx: int,
+) -> float:
+    page_angle = 0.0
+    if page_fine_angles and 0 <= page_idx < len(page_fine_angles):
+        page_angle = float(page_fine_angles[page_idx])
+    return float(fine_angle) + page_angle
+
+
 def _ui_template_cache_path(
     pdf_paths: list[str],
     page_count: int,
     rot_code: int,
     fine_angle: float,
     mode: str,
+    page_fine_angles: list[float] | None = None,
 ) -> Path | None:
     parts = [
         f"v{_UI_TEMPLATE_CACHE_VERSION}",
@@ -75,6 +98,7 @@ def _ui_template_cache_path(
         str(page_count),
         str(rot_code),
         str(fine_angle),
+        str(page_fine_angles or []),
         str(_UI_TEMPLATE_SAMPLE_LIMIT),
     ]
     try:
@@ -378,13 +402,19 @@ def generate_ui_templates(
     rot_code: int,
     fine_angle: float,
     progress_cb=None,
+    page_fine_angles: list[float] | None = None,
 ) -> dict[int, np.ndarray]:
     """UI에서 자동 탐지를 수행하기 전, PDF 전체를 읽어 깔끔한 빈 템플릿을 생성해 반환합니다."""
     if page_count <= 0:
         return {}
 
     cache_path = _ui_template_cache_path(
-        [pdf_path], page_count, rot_code, fine_angle, "single"
+        [pdf_path],
+        page_count,
+        rot_code,
+        fine_angle,
+        "single",
+        page_fine_angles,
     )
     cached_templates = _load_ui_template_cache(cache_path)
     if cached_templates is not None:
@@ -416,10 +446,14 @@ def generate_ui_templates(
     # 중앙값 템플릿에서 끊어질 수 있습니다. 템플릿 합성은 ORB 정합만 사용합니다.
     aligners = [
         ImageAligner(
-            apply_rotation(p, rot_code, fine_angle),
+            apply_rotation(
+                p,
+                rot_code,
+                _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
+            ),
             refine_ecc=False,
         )
-        for p in pages[:page_count]
+        for local_p, p in enumerate(pages[:page_count])
     ]
 
     survey_count = _survey_count(len(pages), page_count)
@@ -432,7 +466,11 @@ def generate_ui_templates(
             if global_p >= len(pages):
                 break
 
-            orig = apply_rotation(pages[global_p], rot_code, fine_angle)
+            orig = apply_rotation(
+                pages[global_p],
+                rot_code,
+                _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
+            )
             aligner = aligners[local_p] if local_p < len(aligners) else aligners[-1]
 
             aligned = aligner.align(orig)
@@ -458,13 +496,19 @@ def generate_ui_templates_multi(
     rot_code: int,
     fine_angle: float,
     progress_cb=None,
+    page_fine_angles: list[float] | None = None,
 ) -> dict[int, np.ndarray]:
     """여러 PDF에서 템플릿을 생성하고 병합하여 더 정확한 템플릿을 만듭니다."""
     if not pdf_paths or page_count <= 0:
         return {}
 
     cache_path = _ui_template_cache_path(
-        pdf_paths, page_count, rot_code, fine_angle, "multi"
+        pdf_paths,
+        page_count,
+        rot_code,
+        fine_angle,
+        "multi",
+        page_fine_angles,
     )
     cached_templates = _load_ui_template_cache(cache_path)
     if cached_templates is not None:
@@ -544,7 +588,13 @@ def generate_ui_templates_multi(
                 if global_p >= len(pages):
                     break
 
-                orig = apply_rotation(pages[global_p], rot_code, fine_angle)
+                orig = apply_rotation(
+                    pages[global_p],
+                    rot_code,
+                    _fine_angle_for_page(
+                        fine_angle, page_fine_angles, local_p
+                    ),
+                )
                 aligner = ref_aligners.get(local_p)
                 if aligner is None:
                     aligner = ImageAligner(orig, refine_ecc=False)
@@ -1061,7 +1111,7 @@ def _extract_checkbox_halo_info(
     # 체크 획은 보통 사각 테두리를 가로질러 밖으로 나갑니다. 1px 연결
     # 보강 후 테두리 링과 닿지 않는 인접 글자·먼지는 후보에서 제외합니다.
     connected = cv2.dilate(candidate, np.ones((3, 3), np.uint8), iterations=1)
-    component_count, labels, _, _ = cv2.connectedComponentsWithStats(
+    component_count, connected_labels, _, _ = cv2.connectedComponentsWithStats(
         (connected > 0).astype(np.uint8), connectivity=8
     )
     anchor_width = max(1, round(short_side * 0.1))
@@ -1073,11 +1123,13 @@ def _extract_checkbox_halo_info(
         255,
         thickness=anchor_width * 2 + 1,
     )
-    anchored_labels = set(int(value) for value in np.unique(labels[anchor > 0]))
+    anchored_labels = set(
+        int(value) for value in np.unique(connected_labels[anchor > 0])
+    )
     anchored_labels.discard(0)
     anchored = np.zeros_like(candidate)
     for component_idx in anchored_labels:
-        anchored[(labels == component_idx) & (candidate > 0)] = 255
+        anchored[(connected_labels == component_idx) & (candidate > 0)] = 255
 
     # 실제 박스 테두리와 그 정합 잔상은 넉넉한 띠로 지우고, halo가 내부
     # 직접 점수와 중복되지 않도록 박스 안쪽도 모두 제외합니다.
@@ -1092,8 +1144,20 @@ def _extract_checkbox_halo_info(
     inner_y1 = min(anchored.shape[0], max(0, local_y + border_band))
     inner_x2 = min(anchored.shape[1], max(0, local_x2 - border_band))
     inner_y2 = min(anchored.shape[0], max(0, local_y2 - border_band))
+    interior_connected_labels: set[int] = set()
     if inner_x2 > inner_x1 and inner_y2 > inner_y1:
         border_mask[inner_y1:inner_y2, inner_x1:inner_x2] = 0
+        interior_pixels = candidate[inner_y1:inner_y2, inner_x1:inner_x2] > 0
+        if np.any(interior_pixels):
+            interior_connected_labels = set(
+                int(value)
+                for value in np.unique(
+                    connected_labels[inner_y1:inner_y2, inner_x1:inner_x2][
+                        interior_pixels
+                    ]
+                )
+            )
+            interior_connected_labels.discard(0)
     anchored[border_mask > 0] = 0
     anchored[
         max(0, local_y) : min(anchored.shape[0], local_y2),
@@ -1101,7 +1165,7 @@ def _extract_checkbox_halo_info(
     ] = 0
 
     filtered = np.zeros_like(anchored)
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+    component_count, filtered_labels, stats, _ = cv2.connectedComponentsWithStats(
         (anchored > 0).astype(np.uint8), connectivity=8
     )
     min_component_area = max(4, round(short_side * 0.15))
@@ -1110,14 +1174,41 @@ def _extract_checkbox_halo_info(
         component_area = stats[component_idx, cv2.CC_STAT_AREA]
         component_width = stats[component_idx, cv2.CC_STAT_WIDTH]
         component_height = stats[component_idx, cv2.CC_STAT_HEIGHT]
-        # 정합 잔상은 대개 한 변을 따라 2~3px 폭으로 길게 남습니다. 실제
-        # 체크 꼬리는 대각선/곡선이라 가로·세로 양쪽으로 모두 퍼집니다.
+        component_left = stats[component_idx, cv2.CC_STAT_LEFT]
+        component_top = stats[component_idx, cv2.CC_STAT_TOP]
+        component_right = component_left + component_width
+        component_bottom = component_top + component_height
+        component_fill = component_area / max(
+            1, component_width * component_height
+        )
+        source_component_labels = set(
+            int(value)
+            for value in np.unique(
+                connected_labels[filtered_labels == component_idx]
+            )
+        )
+        source_component_labels.discard(0)
+        connected_to_interior = bool(
+            source_component_labels & interior_connected_labels
+        )
+        overlaps_box_x = component_left < local_x2 and component_right > local_x
+        overlaps_box_y = component_top < local_y2 and component_bottom > local_y
+        diagonally_outside = not overlaps_box_x and not overlaps_box_y
+        compact_speck = (
+            component_fill >= 0.65
+            and max(component_width, component_height) <= short_side * 0.5
+            and not connected_to_interior
+            and diagonally_outside
+        )
+        # 대각선 모서리 밖에 고립된 작고 조밀한 얼룩만 제거합니다. 실제 큰
+        # 체크의 짧은 꼬리는 박스의 위·아래 또는 좌·우 축과 겹칠 수 있습니다.
         if (
             component_area >= min_component_area
             and component_width >= min_component_span
             and component_height >= min_component_span
+            and not compact_speck
         ):
-            filtered[labels == component_idx] = 255
+            filtered[filtered_labels == component_idx] = 255
 
     return _CheckboxHaloInfo(
         cv2.countNonZero(filtered),
@@ -1155,8 +1246,16 @@ def _resolve_checkbox_halo_ownership(
         int, list[tuple[_CheckboxInkInfo, bool, _CheckboxHaloInfo]]
     ] = {}
     for candidate in candidates:
-        direct_info, _direct_is_checked, halo_info = candidate
-        if halo_info.ink_pixels <= 0 or halo_info.ink_mask.size == 0:
+        direct_info, direct_is_checked, halo_info = candidate
+        has_halo = halo_info.ink_pixels > 0 and halo_info.ink_mask.size > 0
+        has_strong_direct = (
+            direct_is_checked
+            and direct_info.ink_pixels >= max(
+                8, round(direct_info.area * 0.05)
+            )
+            and direct_info.ink_mask.size > 0
+        )
+        if not has_halo and not has_strong_direct:
             continue
         by_page.setdefault(direct_info.box.page_idx, []).append(candidate)
 
@@ -1183,32 +1282,63 @@ def _resolve_checkbox_halo_ownership(
             (connected_source > 0).astype(np.uint8), connectivity=8
         )
 
-        component_members: dict[int, list[tuple[int, int]]] = {}
-        for candidate_idx, (_direct_info, _direct_is_checked, halo_info) in enumerate(
-            page_candidates
-        ):
-            x1, y1, x2, y2 = halo_info.mask_bounds
+        component_members: dict[int, dict[int, int]] = {}
+        halo_component_labels: set[int] = set()
+
+        def add_component_members(
+            candidate_idx: int,
+            mask_bounds: tuple[int, int, int, int],
+            ink_mask: np.ndarray,
+            *,
+            is_halo: bool,
+        ) -> None:
+            if ink_mask.size == 0:
+                return
+            x1, y1, x2, y2 = mask_bounds
             label_roi = labels[y1:y2, x1:x2]
-            if label_roi.shape != halo_info.ink_mask.shape:
-                continue
+            if label_roi.shape != ink_mask.shape:
+                return
             values, counts = np.unique(
-                label_roi[halo_info.ink_mask > 0], return_counts=True
+                label_roi[ink_mask > 0], return_counts=True
             )
             for value, count in zip(values.tolist(), counts.tolist()):
                 component_label = int(value)
                 if component_label == 0:
                     continue
-                component_members.setdefault(component_label, []).append(
-                    (candidate_idx, int(count))
+                members = component_members.setdefault(component_label, {})
+                members[candidate_idx] = members.get(candidate_idx, 0) + int(count)
+                if is_halo:
+                    halo_component_labels.add(component_label)
+
+        for candidate_idx, (direct_info, direct_is_checked, halo_info) in enumerate(
+            page_candidates
+        ):
+            if halo_info.ink_pixels > 0:
+                add_component_members(
+                    candidate_idx,
+                    halo_info.mask_bounds,
+                    halo_info.ink_mask,
+                    is_halo=True,
+                )
+            if direct_is_checked and direct_info.ink_pixels >= max(
+                8, round(direct_info.area * 0.05)
+            ):
+                add_component_members(
+                    candidate_idx,
+                    direct_info.mask_bounds,
+                    direct_info.ink_mask,
+                    is_halo=False,
                 )
 
         labels_to_remove: dict[int, set[int]] = {}
-        for component_label, members in component_members.items():
-            if len(members) <= 1:
+        for component_label, counts_by_candidate in component_members.items():
+            if (
+                component_label not in halo_component_labels
+                or len(counts_by_candidate) <= 1
+            ):
                 continue
 
-            pending = {candidate_idx for candidate_idx, _count in members}
-            counts_by_candidate = dict(members)
+            pending = set(counts_by_candidate)
             while pending:
                 seed = pending.pop()
                 cluster = {seed}
@@ -1474,6 +1604,576 @@ def _group_checkbox_rows(boxes: list[Box], tolerance: float) -> list[list[Box]]:
     for row in rows:
         row.sort(key=lambda item: item.x + item.w / 2)
     return rows
+
+
+def _config_checkbox_refs(
+    config: TemplatePreset,
+    page_idx: int,
+    image_shape: tuple[int, ...],
+) -> list[tuple[int, int, Box]]:
+    return [
+        (field_idx, box_idx, box)
+        for field_idx, field in enumerate(config.fields)
+        if not field.is_comment
+        for box_idx, box in enumerate(field.boxes)
+        if box.page_idx == page_idx and _is_checkbox_like(box, image_shape)
+    ]
+
+
+def _transform_box_in_place(
+    box: Box,
+    matrix: np.ndarray,
+    target_shape: tuple[int, ...],
+) -> None:
+    height, width = target_shape[:2]
+    corners = np.float32(
+        [
+            [box.x, box.y],
+            [box.x + box.w, box.y],
+            [box.x, box.y + box.h],
+            [box.x + box.w, box.y + box.h],
+        ]
+    ).reshape(-1, 1, 2)
+    transformed = cv2.transform(corners, matrix).reshape(-1, 2)
+    x1 = max(0, min(width - 1, int(np.floor(transformed[:, 0].min()))))
+    y1 = max(0, min(height - 1, int(np.floor(transformed[:, 1].min()))))
+    x2 = max(x1 + 1, min(width, int(np.ceil(transformed[:, 0].max()))))
+    y2 = max(y1 + 1, min(height, int(np.ceil(transformed[:, 1].max()))))
+    box.x = x1
+    box.y = y1
+    box.w = x2 - x1
+    box.h = y2 - y1
+
+
+def _fit_checkbox_anchor_transform(
+    source_boxes: list[Box],
+    target_boxes: list[Box],
+    source_shape: tuple[int, ...],
+    target_shape: tuple[int, ...],
+) -> np.ndarray | None:
+    if not source_boxes or len(source_boxes) != len(target_boxes):
+        return None
+
+    source_points = np.float32(
+        [[box.x + box.w / 2, box.y + box.h / 2] for box in source_boxes]
+    )
+    target_points = np.float32(
+        [[box.x + box.w / 2, box.y + box.h / 2] for box in target_boxes]
+    )
+    source_h, source_w = source_shape[:2]
+    target_h, target_w = target_shape[:2]
+    expected_scale = float(
+        np.mean([target_w / max(1, source_w), target_h / max(1, source_h)])
+    )
+    median_target_side = float(
+        np.median([min(box.w, box.h) for box in target_boxes])
+    )
+
+    matrix = None
+    inliers = None
+    if len(source_boxes) >= 3:
+        matrix, inliers = cv2.estimateAffinePartial2D(
+            source_points,
+            target_points,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=max(8.0, median_target_side * 1.5),
+            maxIters=5000,
+            confidence=0.999,
+            refineIters=20,
+        )
+
+    if matrix is None:
+        scale_x = target_w / max(1, source_w)
+        scale_y = target_h / max(1, source_h)
+        offsets = target_points - source_points * np.float32([scale_x, scale_y])
+        offset_x, offset_y = np.median(offsets, axis=0)
+        matrix = np.float64(
+            [[scale_x, 0.0, offset_x], [0.0, scale_y, offset_y]]
+        )
+
+    if not np.isfinite(matrix).all():
+        return None
+    affine_scale = float(np.hypot(matrix[0, 0], matrix[1, 0]))
+    if expected_scale <= 0 or not 0.75 <= affine_scale / expected_scale <= 1.25:
+        return None
+    rotation = float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0])))
+    if abs(rotation) > 5.0:
+        return None
+
+    projected = cv2.transform(source_points.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    residuals = np.linalg.norm(projected - target_points, axis=1)
+    if float(np.median(residuals)) > max(8.0, median_target_side):
+        return None
+    if float(np.percentile(residuals, 90)) > max(15.0, median_target_side * 2.0):
+        return None
+    if inliers is not None and float(np.mean(inliers)) < 0.7:
+        return None
+    return np.asarray(matrix, dtype=np.float64)
+
+
+def _group_checkbox_ref_rows(
+    refs: list[tuple[int, int, Box]], tolerance: float
+) -> list[list[tuple[int, int, Box]]]:
+    rows: list[list[tuple[int, int, Box]]] = []
+    row_centers: list[float] = []
+    for ref in sorted(refs, key=lambda item: (item[2].y + item[2].h / 2, item[2].x)):
+        box = ref[2]
+        center_y = box.y + box.h / 2
+        if not rows or abs(center_y - row_centers[-1]) > tolerance:
+            rows.append([ref])
+            row_centers.append(center_y)
+            continue
+        rows[-1].append(ref)
+        row_centers[-1] = float(
+            np.mean([item[2].y + item[2].h / 2 for item in rows[-1]])
+        )
+
+    for row in rows:
+        row.sort(key=lambda item: item[2].x + item[2].w / 2)
+    return rows
+
+
+def _match_checkbox_row_boxes(
+    expected_row: list[tuple[int, int, Box]],
+    detected_row: list[Box],
+    max_x_distance: float,
+) -> tuple[list[tuple[tuple[int, int, Box], Box]], float]:
+    """Match an ordered row while allowing obscured or spurious frames."""
+    expected_count = len(expected_row)
+    detected_count = len(detected_row)
+    states: list[
+        list[
+            tuple[
+                int,
+                float,
+                list[tuple[tuple[int, int, Box], Box]],
+            ]
+            | None
+        ]
+    ] = [[None] * (detected_count + 1) for _ in range(expected_count + 1)]
+    states[0][0] = (0, 0.0, [])
+
+    def update(
+        expected_pos: int,
+        detected_pos: int,
+        candidate: tuple[
+            int,
+            float,
+            list[tuple[tuple[int, int, Box], Box]],
+        ],
+    ) -> None:
+        current = states[expected_pos][detected_pos]
+        if current is None or candidate[0] > current[0] or (
+            candidate[0] == current[0] and candidate[1] < current[1]
+        ):
+            states[expected_pos][detected_pos] = candidate
+
+    for expected_pos in range(expected_count + 1):
+        for detected_pos in range(detected_count + 1):
+            state = states[expected_pos][detected_pos]
+            if state is None:
+                continue
+            if expected_pos < expected_count:
+                update(expected_pos + 1, detected_pos, state)
+            if detected_pos < detected_count:
+                update(expected_pos, detected_pos + 1, state)
+            if expected_pos >= expected_count or detected_pos >= detected_count:
+                continue
+
+            expected_ref = expected_row[expected_pos]
+            expected_box = expected_ref[2]
+            detected_box = detected_row[detected_pos]
+            x_distance = abs(
+                expected_box.x
+                + expected_box.w / 2
+                - detected_box.x
+                - detected_box.w / 2
+            )
+            if x_distance > max_x_distance:
+                continue
+            size_cost = (
+                abs(expected_box.w - detected_box.w)
+                + abs(expected_box.h - detected_box.h)
+            ) / max(1.0, expected_box.w + expected_box.h)
+            update(
+                expected_pos + 1,
+                detected_pos + 1,
+                (
+                    state[0] + 1,
+                    state[1] + x_distance / max_x_distance + size_cost,
+                    state[2] + [(expected_ref, detected_box)],
+                ),
+            )
+
+    best = states[expected_count][detected_count]
+    if best is None:
+        return [], 0.0
+    return best[2], best[1]
+
+
+def _match_checkbox_anchor_rows(
+    expected_refs: list[tuple[int, int, Box]],
+    detected: list[Box],
+    target_shape: tuple[int, ...],
+    *,
+    tight: bool = False,
+) -> tuple[list[tuple[tuple[int, int, Box], Box]], int, int]:
+    """Match checkbox rows by order, then boxes within each matched row."""
+    if not expected_refs or not detected:
+        return [], 0, 0
+
+    target_h, target_w = target_shape[:2]
+    median_w = float(np.median([ref[2].w for ref in expected_refs]))
+    median_h = float(np.median([ref[2].h for ref in expected_refs]))
+    row_tolerance = max(4.0, median_h * 0.6)
+    expected_rows = _group_checkbox_ref_rows(expected_refs, row_tolerance)
+    detected_rows = _group_checkbox_rows(detected, row_tolerance)
+    if tight:
+        max_y_distance = max(median_h * 2.0, target_h * 0.012)
+        max_x_distance = max(median_w * 2.5, target_w * 0.02)
+    else:
+        max_y_distance = max(median_h * 6.0, target_h * 0.06)
+        max_x_distance = max(median_w * 6.0, target_w * 0.08)
+
+    pair_options: dict[
+        tuple[int, int],
+        tuple[list[tuple[tuple[int, int, Box], Box]], float],
+    ] = {}
+    for expected_idx, expected_row in enumerate(expected_rows):
+        expected_y = float(
+            np.mean([ref[2].y + ref[2].h / 2 for ref in expected_row])
+        )
+        for detected_idx, detected_row in enumerate(detected_rows):
+            detected_y = float(
+                np.mean([box.y + box.h / 2 for box in detected_row])
+            )
+            y_distance = abs(detected_y - expected_y)
+            if y_distance > max_y_distance:
+                continue
+            matches, box_cost = _match_checkbox_row_boxes(
+                expected_row, detected_row, max_x_distance
+            )
+            minimum_matches = max(1, int(np.ceil(len(expected_row) * 0.5)))
+            if len(matches) < minimum_matches:
+                continue
+            pair_options[(expected_idx, detected_idx)] = (
+                matches,
+                box_cost
+                + y_distance / max_y_distance
+                + abs(len(expected_row) - len(detected_row)) * 0.25,
+            )
+
+    row_count = len(expected_rows)
+    detected_row_count = len(detected_rows)
+    states: list[
+        list[
+            tuple[
+                int,
+                int,
+                float,
+                list[tuple[tuple[int, int, Box], Box]],
+            ]
+            | None
+        ]
+    ] = [[None] * (detected_row_count + 1) for _ in range(row_count + 1)]
+    states[0][0] = (0, 0, 0.0, [])
+
+    def update(
+        expected_pos: int,
+        detected_pos: int,
+        candidate: tuple[
+            int,
+            int,
+            float,
+            list[tuple[tuple[int, int, Box], Box]],
+        ],
+    ) -> None:
+        current = states[expected_pos][detected_pos]
+        if current is None:
+            states[expected_pos][detected_pos] = candidate
+            return
+        candidate_rank = (candidate[0], candidate[1], -candidate[2])
+        current_rank = (current[0], current[1], -current[2])
+        if candidate_rank > current_rank:
+            states[expected_pos][detected_pos] = candidate
+
+    for expected_pos in range(row_count + 1):
+        for detected_pos in range(detected_row_count + 1):
+            state = states[expected_pos][detected_pos]
+            if state is None:
+                continue
+            if expected_pos < row_count:
+                update(expected_pos + 1, detected_pos, state)
+            if detected_pos < detected_row_count:
+                update(expected_pos, detected_pos + 1, state)
+            option = pair_options.get((expected_pos, detected_pos))
+            if option is None:
+                continue
+            matches, pair_cost = option
+            update(
+                expected_pos + 1,
+                detected_pos + 1,
+                (
+                    state[0] + len(matches),
+                    state[1] + 1,
+                    state[2] + pair_cost,
+                    state[3] + matches,
+                ),
+            )
+
+    best = states[row_count][detected_row_count]
+    if best is None:
+        return [], 0, row_count
+    return best[3], best[1], row_count
+
+
+def _detect_preset_checkbox_anchors(
+    template: np.ndarray,
+    expected_refs: list[tuple[int, int, Box]],
+    page_idx: int,
+) -> list[Box]:
+    if not expected_refs:
+        return []
+    median_w = float(np.median([ref[2].w for ref in expected_refs]))
+    median_h = float(np.median([ref[2].h for ref in expected_refs]))
+    detection_image = (
+        cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+        if template.ndim == 2
+        else template
+    )
+    return [
+        Box(page_idx=page_idx, x=x, y=y, w=w, h=h)
+        for x, y, w, h in auto_detect_checkboxes(
+            detection_image,
+            min_w=max(8, round(median_w * 0.55)),
+            max_w=max(9, round(median_w * 1.8)),
+            min_h=max(8, round(median_h * 0.55)),
+            max_h=max(9, round(median_h * 1.8)),
+        )
+        if 0.55 <= w / max(1, h) <= 1.8
+    ]
+
+
+def remap_preset_to_detected_layout(
+    config: TemplatePreset,
+    templates: dict[int, np.ndarray],
+    source_templates: dict[int, np.ndarray] | None = None,
+    auxiliary_boxes: list[Box] | None = None,
+) -> PresetLayoutRemapResult:
+    """Move a saved preset into the current document's detected box coordinates.
+
+    A saved template can have a different render DPI from the current PDF. Match
+    ordered checkbox rows after a coarse page-size scale, fit a robust transform,
+    and repeat the match around that transform. A small number of obscured frames
+    may be interpolated, but broad row coverage and plausible geometry are still
+    required. Comment and auxiliary boxes follow the same transform.
+    """
+    original_config = copy.deepcopy(config)
+    original_auxiliary = copy.deepcopy(auxiliary_boxes or [])
+    if not templates:
+        return PresetLayoutRemapResult(
+            original_config, original_auxiliary, {}, 0, 0, False
+        )
+
+    source_templates = source_templates or {}
+    layout_pages = set(range(max(0, int(config.page_count))))
+    if not layout_pages or any(
+        page_idx not in source_templates for page_idx in layout_pages
+    ):
+        return PresetLayoutRemapResult(
+            original_config, original_auxiliary, {}, 0, 0, False
+        )
+
+    source_refs_by_page = {
+        page_idx: _config_checkbox_refs(
+            config, page_idx, source_templates[page_idx].shape
+        )
+        for page_idx in layout_pages
+    }
+    source_refs_by_page = {
+        page_idx: refs
+        for page_idx, refs in source_refs_by_page.items()
+        if refs
+    }
+    required_pages = set(source_refs_by_page)
+    expected_total = sum(len(refs) for refs in source_refs_by_page.values())
+    if not required_pages:
+        return PresetLayoutRemapResult(
+            original_config, original_auxiliary, {}, 0, expected_total, False
+        )
+    if any(page_idx not in templates for page_idx in layout_pages):
+        return PresetLayoutRemapResult(
+            original_config, original_auxiliary, {}, 0, expected_total, False
+        )
+
+    scaled_config = copy.deepcopy(config)
+    source_shapes: dict[int, tuple[int, ...]] = {}
+    scale_transforms: dict[int, np.ndarray] = {}
+
+    for page_idx, target in templates.items():
+        source = source_templates.get(page_idx)
+        source_shape = source.shape if source is not None else target.shape
+        source_shapes[page_idx] = source_shape
+        source_h, source_w = source_shape[:2]
+        target_h, target_w = target.shape[:2]
+        scale_matrix = np.float64(
+            [
+                [target_w / max(1, source_w), 0.0, 0.0],
+                [0.0, target_h / max(1, source_h), 0.0],
+            ]
+        )
+        scale_transforms[page_idx] = scale_matrix
+        for field in scaled_config.fields:
+            for box in field.boxes:
+                if box.page_idx == page_idx:
+                    _transform_box_in_place(box, scale_matrix, target.shape)
+
+    page_transforms: dict[int, np.ndarray] = {}
+    snapped_refs_by_page: dict[int, list[tuple[int, int, Box]]] = {}
+    matched_total = 0
+    compatible = True
+    for page_idx in required_pages:
+        source_shape = source_shapes[page_idx]
+        source_refs = source_refs_by_page[page_idx]
+        scaled_refs = _config_checkbox_refs(
+            scaled_config, page_idx, templates[page_idx].shape
+        )
+        detected = _detect_preset_checkbox_anchors(
+            templates[page_idx], scaled_refs, page_idx
+        )
+        initial_matches, initial_row_matches, expected_row_count = (
+            _match_checkbox_anchor_rows(
+                scaled_refs, detected, templates[page_idx].shape
+            )
+        )
+        initial_coverage = len(initial_matches) / max(1, len(source_refs))
+        initial_row_coverage = initial_row_matches / max(1, expected_row_count)
+        page_compatible = (
+            initial_coverage >= 0.45 and initial_row_coverage >= 0.5
+        )
+        compatible = compatible and page_compatible
+        if len(initial_matches) < 3:
+            continue
+
+        initial_source = [
+            config.fields[field_idx].boxes[box_idx]
+            for (field_idx, box_idx, _scaled_box), _target_box in initial_matches
+        ]
+        initial_target = [target_box for _source_ref, target_box in initial_matches]
+        initial_matrix = _fit_checkbox_anchor_transform(
+            initial_source,
+            initial_target,
+            source_shape,
+            templates[page_idx].shape,
+        )
+        if initial_matrix is None:
+            continue
+
+        projected_refs = []
+        for field_idx, box_idx, source_box in source_refs:
+            projected = copy.copy(source_box)
+            _transform_box_in_place(
+                projected, initial_matrix, templates[page_idx].shape
+            )
+            projected_refs.append((field_idx, box_idx, projected))
+        refined_matches, matched_rows, expected_row_count = (
+            _match_checkbox_anchor_rows(
+                projected_refs,
+                detected,
+                templates[page_idx].shape,
+                tight=True,
+            )
+        )
+        page_matched = len(refined_matches)
+        matched_total += page_matched
+        coverage = page_matched / max(1, len(source_refs))
+        row_coverage = matched_rows / max(1, expected_row_count)
+        matched_source = [
+            config.fields[field_idx].boxes[box_idx]
+            for (field_idx, box_idx, _projected), _target in refined_matches
+        ]
+        matched_target = [target for _source, target in refined_matches]
+        matrix = _fit_checkbox_anchor_transform(
+            matched_source,
+            matched_target,
+            source_shape,
+            templates[page_idx].shape,
+        )
+        if matrix is None:
+            continue
+
+        all_y = np.asarray(
+            [box.y + box.h / 2 for _field_idx, _box_idx, box in source_refs],
+            dtype=np.float64,
+        )
+        matched_y = np.asarray(
+            [box.y + box.h / 2 for box in matched_source], dtype=np.float64
+        )
+        if len(all_y) <= 1 or float(np.ptp(all_y)) <= 0:
+            vertical_span = 1.0
+        else:
+            vertical_span = float(np.ptp(matched_y) / np.ptp(all_y))
+        page_accepted = (
+            coverage >= 0.85
+            and row_coverage >= 0.8
+            and vertical_span >= 0.7
+        )
+        if not page_accepted:
+            continue
+
+        page_transforms[page_idx] = matrix
+        snapped_refs_by_page[page_idx] = [
+            (field_idx, box_idx, target)
+            for (field_idx, box_idx, _projected), target in refined_matches
+        ]
+
+    if set(page_transforms) != required_pages:
+        return PresetLayoutRemapResult(
+            original_config,
+            original_auxiliary,
+            {},
+            matched_total,
+            expected_total,
+            False,
+            compatible,
+        )
+
+    for page_idx, matrix in scale_transforms.items():
+        page_transforms.setdefault(page_idx, matrix)
+
+    adjusted_config = copy.deepcopy(config)
+    adjusted_auxiliary = copy.deepcopy(auxiliary_boxes or [])
+    for field in adjusted_config.fields:
+        for box in field.boxes:
+            matrix = page_transforms.get(box.page_idx)
+            target = templates.get(box.page_idx)
+            if matrix is not None and target is not None:
+                _transform_box_in_place(box, matrix, target.shape)
+    for box in adjusted_auxiliary:
+        matrix = page_transforms.get(box.page_idx)
+        target = templates.get(box.page_idx)
+        if matrix is not None and target is not None:
+            _transform_box_in_place(box, matrix, target.shape)
+
+    # Global anchors move comments and manually drawn regions. Checkbox frames
+    # themselves use the exact detector result so their borders remain precise.
+    for page_idx, snapped_refs in snapped_refs_by_page.items():
+        for field_idx, box_idx, target_box in snapped_refs:
+            output_box = adjusted_config.fields[field_idx].boxes[box_idx]
+            output_box.x = target_box.x
+            output_box.y = target_box.y
+            output_box.w = target_box.w
+            output_box.h = target_box.h
+
+    return PresetLayoutRemapResult(
+        adjusted_config,
+        adjusted_auxiliary,
+        page_transforms,
+        matched_total,
+        expected_total,
+        True,
+        True,
+    )
 
 
 def _remap_checkbox_layout(
@@ -2030,11 +2730,16 @@ def _render_aligned_page(
     rot_code: int,
     fine_angle: float,
     dpi: int,
+    page_fine_angles: list[float] | None = None,
 ) -> tuple[int, np.ndarray]:
     page = doc[global_p]
     pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
     page_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
-    orig = apply_rotation(page_img, rot_code, fine_angle)
+    orig = apply_rotation(
+        page_img,
+        rot_code,
+        _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
+    )
     a = aligners[local_p] if local_p < len(aligners) else aligners[-1]
     return local_p, a.align(orig)
 
@@ -2047,6 +2752,7 @@ def _render_survey_pages(
     rot_code: int,
     fine_angle: float,
     dpi: int,
+    page_fine_angles: list[float] | None = None,
 ) -> dict[int, np.ndarray]:
     """한 설문의 페이지를 순차 렌더링·정합합니다."""
     sequential_result: dict[int, np.ndarray] = {}
@@ -2055,7 +2761,14 @@ def _render_survey_pages(
         if global_p >= len(doc):
             break
         _, aligned = _render_aligned_page(
-            doc, global_p, local_p, aligners, rot_code, fine_angle, dpi
+            doc,
+            global_p,
+            local_p,
+            aligners,
+            rot_code,
+            fine_angle,
+            dpi,
+            page_fine_angles,
         )
         sequential_result[local_p] = aligned
     return sequential_result
@@ -2141,6 +2854,7 @@ def _collect_template_samples(
                 config.rot_code,
                 config.fine_angle,
                 dpi,
+                config.page_fine_angles,
             )
             for local_p, aligned in pages.items():
                 if len(f_pages[local_p]) >= sample_limit:
@@ -2283,6 +2997,7 @@ def _analyze_single_file(
                     rot_code,
                     fine_angle,
                     dpi,
+                    config.page_fine_angles,
                 )
 
             survey_data = {
@@ -2338,12 +3053,30 @@ def _analyze_single_file(
             out_ink.close()
 
 
+def _prepare_alignment_references(
+    template_pages: list,
+    config: TemplatePreset,
+    template_pages_preprocessed: bool = False,
+) -> list:
+    if template_pages_preprocessed:
+        return list(template_pages[: config.page_count])
+    return [
+        apply_rotation(
+            page,
+            config.rot_code,
+            config.fine_angle_for_page(page_idx),
+        )
+        for page_idx, page in enumerate(template_pages[: config.page_count])
+    ]
+
+
 def run_analysis(
     file_paths: list[str],
     template_pages: list,
     config: TemplatePreset,
     progress_cb=None,
     resource_controller: AdaptiveResourceController | None = None,
+    template_pages_preprocessed: bool = False,
 ) -> bool:
     review_folder = Path("검토용")
     review_folder.mkdir(exist_ok=True)
@@ -2370,10 +3103,14 @@ def run_analysis(
     )
 
     # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일마다 새로 만듭니다.
-    alignment_references = [
-        apply_rotation(p, config.rot_code, config.fine_angle)
-        for p in template_pages[: config.page_count]
-    ]
+    # Saved preset templates and pages aligned to them are already in the
+    # configured rotation coordinate system. Applying the configured angle
+    # again would rotate them twice while survey pages are rotated once.
+    alignment_references = _prepare_alignment_references(
+        template_pages,
+        config,
+        template_pages_preprocessed,
+    )
     if not alignment_references:
         print("페이지 정합 기준 이미지가 없습니다.")
         return False

@@ -36,13 +36,19 @@ from PyQt6.QtWidgets import (
 )
 
 from .models import Box, Field, TemplatePreset
-from .processor import generate_ui_templates, generate_ui_templates_multi, run_analysis
+from .processor import (
+    generate_ui_templates,
+    generate_ui_templates_multi,
+    remap_preset_to_detected_layout,
+    run_analysis,
+)
 from .progress import ProgressTiming, format_duration
 from .vision import (
     ImageAligner,
     apply_rotation,
     auto_detect_checkboxes,
     clear_all_cache,
+    estimate_deskew_angle,
     load_checkbox_cache,
     load_pdf_pages,
     save_checkbox_cache,
@@ -461,11 +467,13 @@ class _AnalysisWorker(QObject):
         file_paths: list[str],
         template_pages: list[np.ndarray],
         preset: TemplatePreset,
+        template_pages_preprocessed: bool = False,
     ):
         super().__init__()
         self.file_paths = file_paths
         self.template_pages = template_pages
         self.preset = preset
+        self.template_pages_preprocessed = template_pages_preprocessed
 
     @pyqtSlot()
     def run(self):
@@ -475,6 +483,7 @@ class _AnalysisWorker(QObject):
                 self.template_pages,
                 self.preset,
                 progress_cb=self.progress.emit,
+                template_pages_preprocessed=self.template_pages_preprocessed,
             )
             self.finished.emit(bool(success), "")
         except Exception as exc:
@@ -491,6 +500,8 @@ class MainWindow(QMainWindow):
 
         self.preset = TemplatePreset()
         self.pages = []
+        self._pages_are_canonical = False
+        self._analysis_reference_pages = []
         self.file_paths = []
 
         self.preset_dir = Path(os.getenv("LOCALAPPDATA")) / "CheckFinder" / "presets"
@@ -544,7 +555,7 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked, i=idx: self.change_rotation(i))
             self.rotation_actions.append(action)
 
-        self.reverse_number_action = page_menu.addAction("번호 역순: OFF")
+        self.reverse_number_action = page_menu.addAction("번호 역순: ON")
         self.reverse_number_action.setCheckable(True)
         self.reverse_number_action.toggled.connect(self.toggle_reverse_numbering)
 
@@ -606,17 +617,24 @@ class MainWindow(QMainWindow):
             self.file_menu_btn.setFixedHeight(group_btn.sizeHint().height())
             btn_layout.addWidget(self.file_menu_btn)
 
-        # 미세 회전 각도 조절
-        btn_layout.addWidget(QLabel("미세 회전:"))
+        # 자동 페이지 수평 보정 뒤 전체 페이지에 더할 수동 보정값
+        btn_layout.addWidget(QLabel("전체 미세 회전:"))
         self.fine_angle_spin = QDoubleSpinBox()
         self.fine_angle_spin.setRange(-10.0, 10.0)
-        self.fine_angle_spin.setSingleStep(0.5)
+        self.fine_angle_spin.setSingleStep(0.1)
         self.fine_angle_spin.setDecimals(1)
         self.fine_angle_spin.setValue(0.0)
         self.fine_angle_spin.setSuffix("°")
         self.fine_angle_spin.setFixedWidth(80)
         self.fine_angle_spin.valueChanged.connect(self.change_fine_angle)
         btn_layout.addWidget(self.fine_angle_spin)
+
+        self.auto_deskew_btn = QPushButton("자동 수평 맞춤")
+        self.auto_deskew_btn.setToolTip(
+            "설문지의 페이지 종류별 기울기를 한 번 계산해 저장합니다."
+        )
+        self.auto_deskew_btn.clicked.connect(self.auto_deskew_pages)
+        btn_layout.addWidget(self.auto_deskew_btn)
 
         btn_layout.addWidget(group_btn)
         btn_layout.addWidget(self.value_map_btn)
@@ -650,6 +668,9 @@ class MainWindow(QMainWindow):
         self.pending_boxes.clear()
         self.selected_boxes.clear()
         self.preset.fields.clear()
+        self.preset.page_fine_angles.clear()
+        self._pages_are_canonical = False
+        self._analysis_reference_pages = []
         self.is_a_view = False
 
     @staticmethod
@@ -825,6 +846,7 @@ class MainWindow(QMainWindow):
         return {
             "page_count": self.preset.page_count,
             "fine_angle": self.preset.fine_angle,
+            "page_fine_angles": list(self.preset.page_fine_angles),
             "rot_code": self.preset.rot_code,
             "reverse_numbering": self.preset.reverse_numbering,
             "template_dilate_pct": self.preset.template_dilate_pct,
@@ -866,14 +888,42 @@ class MainWindow(QMainWindow):
                 action.setChecked(idx == self.rot_idx)
                 action.blockSignals(False)
 
+    def _configured_template_page(self, page: np.ndarray, page_idx: int) -> np.ndarray:
+        """Return a page in the coordinate system used by boxes and aligners."""
+        if getattr(self, "_pages_are_canonical", False):
+            return page
+        return apply_rotation(
+            page,
+            self.preset.rot_code,
+            self.preset.fine_angle_for_page(page_idx),
+        )
+
+    def _reload_raw_template_pages(self, progress_cb=None) -> bool:
+        """Restore source pages before changing a transform baked into a preset."""
+        if not self.file_paths or self.preset.page_count <= 0:
+            return False
+        raw_pages = load_pdf_pages(
+            self.file_paths[0],
+            progress_cb=progress_cb,
+            page_indices=list(range(self.preset.page_count)),
+        )
+        if not raw_pages:
+            return False
+        self.pages = raw_pages
+        self._pages_are_canonical = False
+        self._analysis_reference_pages = []
+        if len(raw_pages) < self.preset.page_count:
+            self.preset.page_count = len(raw_pages)
+            self._filter_boxes_outside_page_count()
+        self._update_page_size()
+        return True
+
     def _update_page_size(self):
         if not self.pages:
             self.page_H = 0
             self.page_W = 0
             return
-        sample = apply_rotation(
-            self.pages[0], self.preset.rot_code, self.preset.fine_angle
-        )
+        sample = self._configured_template_page(self.pages[0], 0)
         self.page_H, self.page_W = sample.shape[:2]
 
         # 가로 길이(W)가 세로 길이(H)보다 크면(가로 모드) 2페이지 보기를 강제로 끕니다.
@@ -882,12 +932,50 @@ class MainWindow(QMainWindow):
 
         self._sync_view_toggle_text()
 
-    def _apply_loaded_preset(self, data: dict, preset_name: str = ""):
+    def _apply_loaded_preset(
+        self, data: dict, preset_name: str = "", progress_cb=None
+    ):
+        def report(value: int, message: str = ""):
+            if progress_cb:
+                progress_cb(value, message)
+
+        previous_preset = getattr(self, "preset", None)
+        previous_pages = list(getattr(self, "pages", []))
+        previous_pages_are_canonical = getattr(
+            self, "_pages_are_canonical", False
+        )
+        previous_analysis_reference_pages = list(
+            getattr(self, "_analysis_reference_pages", [])
+        )
+        previous_pending_boxes = list(getattr(self, "pending_boxes", []))
+        previous_selected_boxes = list(getattr(self, "selected_boxes", []))
+        previous_is_a_view = getattr(self, "is_a_view", False)
+        page_count = max(1, int(data.get("page_count", 1)))
+        fine_angle = float(data.get("fine_angle", 0.0))
+        rot_code = int(data.get("rot_code", -1))
+        raw_page_angles = data.get("page_fine_angles", [])
+        if not isinstance(raw_page_angles, list):
+            raw_page_angles = []
+        page_fine_angles = []
+        for value in raw_page_angles[:page_count]:
+            try:
+                page_fine_angles.append(float(value))
+            except (TypeError, ValueError):
+                page_fine_angles.append(0.0)
+        if (
+            not page_fine_angles
+            and previous_preset is not None
+            and previous_preset.rot_code == rot_code
+            and abs(previous_preset.fine_angle - fine_angle) < 0.001
+            and len(previous_preset.page_fine_angles) >= page_count
+        ):
+            page_fine_angles = list(previous_preset.page_fine_angles[:page_count])
         self.preset = TemplatePreset(
-            page_count=int(data.get("page_count", 1)),
-            fine_angle=float(data.get("fine_angle", 0.0)),
-            rot_code=int(data.get("rot_code", -1)),
-            reverse_numbering=bool(data.get("reverse_numbering", False)),
+            page_count=page_count,
+            fine_angle=fine_angle,
+            page_fine_angles=page_fine_angles,
+            rot_code=rot_code,
+            reverse_numbering=bool(data.get("reverse_numbering", True)),
             template_dilate_pct=float(data.get("template_dilate_pct", 0.3)),
             fields=[],
         )
@@ -895,42 +983,192 @@ class MainWindow(QMainWindow):
         self.pending_boxes = [Box.from_dict(b) for b in data.get("pending_boxes", [])]
         self.is_a_view = bool(data.get("is_a_view", False))
         self.selected_boxes.clear()
+        self._analysis_reference_pages = []
         self._sync_rotation_index()
         self._sync_fine_angle_spin()
         self._sync_reverse_numbering_state()
 
         saved_templates = self._load_template_images(preset_name) if preset_name else []
+        alignment_message = ""
 
         if self.file_paths:
-            raw_pages = load_pdf_pages(
-                self.file_paths[0],
-                page_indices=list(range(self.preset.page_count)),
-            )
+            existing_pages = getattr(self, "pages", [])
+            if (
+                existing_pages
+                and not getattr(self, "_pages_are_canonical", False)
+                and len(existing_pages) >= self.preset.page_count
+            ):
+                raw_pages = list(existing_pages[: self.preset.page_count])
+                report(20, "현재 PDF 페이지 준비 완료")
+            else:
+                raw_pages = load_pdf_pages(
+                    self.file_paths[0],
+                    progress_cb=self._wrap_progress(
+                        0, 20, "현재 PDF 페이지 준비 중...", report
+                    ),
+                    page_indices=list(range(self.preset.page_count)),
+                )
             if len(raw_pages) < self.preset.page_count:
                 self.preset.page_count = len(raw_pages)
+            self.pages = raw_pages
+            self._pages_are_canonical = False
+            self._filter_boxes_outside_page_count()
 
-            if saved_templates and len(saved_templates) >= self.preset.page_count:
-                # 저장된 템플릿 기준으로 새 PDF 페이지 정렬
+            if len(self.preset.page_fine_angles) < self.preset.page_count:
+                self._estimate_page_fine_angles(
+                    progress_cb=self._wrap_progress(
+                        20, 10, "자동 수평 맞춤 중...", report
+                    )
+                )
+            else:
+                report(30, "저장된 페이지 각도 적용")
+
+            current_templates = {}
+            if self.preset.page_count > 0:
+                template_progress = self._wrap_progress(
+                    30, 50, "현재 체크박스 템플릿 생성 중...", report
+                )
+                # Preset coordinates and the canvas both use the first PDF as
+                # their alignment reference. A median spanning several files
+                # can blur frames when scanners use slightly different content
+                # scales, so derive preset anchors from that same first PDF.
+                current_templates = generate_ui_templates(
+                    self.file_paths[0],
+                    self.preset.page_count,
+                    self.preset.rot_code,
+                    self.preset.fine_angle,
+                    progress_cb=template_progress,
+                    page_fine_angles=self.preset.page_fine_angles,
+                )
+
+            source_templates = {
+                page_idx: template
+                for page_idx, template in enumerate(saved_templates)
+                if page_idx < self.preset.page_count
+            }
+            report(82, "탐지된 체크박스 기준으로 프리셋 정렬 중...")
+            remap = remap_preset_to_detected_layout(
+                self.preset,
+                current_templates,
+                source_templates=source_templates,
+                auxiliary_boxes=self.pending_boxes,
+            )
+            if not getattr(remap, "compatible", True):
+                # A clearly different form must not be warped into the saved
+                # template. Restore the complete previous editing state so a
+                # failed preset choice cannot leave unusable coordinates behind.
+                self.preset = previous_preset or TemplatePreset()
+                self.pages = previous_pages
+                self._pages_are_canonical = previous_pages_are_canonical
+                self._analysis_reference_pages = previous_analysis_reference_pages
+                self.pending_boxes = previous_pending_boxes
+                self.selected_boxes = previous_selected_boxes
+                self.is_a_view = previous_is_a_view
+                self._sync_rotation_index()
+                self._sync_fine_angle_spin()
+                self._sync_reverse_numbering_state()
+                self._update_page_size()
+                self.update_canvas()
+                raise ValueError(
+                    "현재 PDF와 프리셋의 체크박스 양식이 일치하지 않습니다."
+                )
+            if remap.accepted:
+                inverse_transforms = {}
+                for i in range(self.preset.page_count):
+                    forward = remap.page_transforms.get(i)
+                    if forward is None:
+                        current_h, current_w = current_templates[i].shape[:2]
+                        saved_h, saved_w = source_templates[i].shape[:2]
+                        forward = np.float64(
+                            [
+                                [current_w / max(1, saved_w), 0.0, 0.0],
+                                [0.0, current_h / max(1, saved_h), 0.0],
+                            ]
+                        )
+                    inverse_transforms[i] = cv2.invertAffineTransform(
+                        np.asarray(forward, dtype=np.float64)
+                    )
+
+                canonical_pages = []
+                for i in range(self.preset.page_count):
+                    configured = apply_rotation(
+                        raw_pages[i],
+                        self.preset.rot_code,
+                        self.preset.fine_angle_for_page(i),
+                    )
+                    target_h, target_w = source_templates[i].shape[:2]
+                    border_value = (
+                        255 if configured.ndim == 2 else (255, 255, 255)
+                    )
+                    canonical_pages.append(
+                        cv2.warpAffine(
+                            configured,
+                            inverse_transforms[i],
+                            (target_w, target_h),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=border_value,
+                        )
+                    )
+                    report(
+                        82 + int((i + 1) / self.preset.page_count * 13),
+                        "체크박스 기준 프리셋 좌표 적용 중...",
+                    )
+                self.pages = canonical_pages
+                self._pages_are_canonical = True
+                self._analysis_reference_pages = list(
+                    saved_templates[: self.preset.page_count]
+                )
+                alignment_message = (
+                    "체크박스 기준 프리셋 정렬 완료 "
+                    f"({remap.matched_boxes}/{remap.expected_boxes})"
+                )
+                report(95, alignment_message)
+            elif (
+                raw_pages
+                and saved_templates
+                and len(saved_templates) >= self.preset.page_count
+            ):
+                # 탐지가 불완전하면 좌표를 덮어쓰지 않고 기존 정렬로 안전하게 복구합니다.
                 aligned = []
                 for i in range(self.preset.page_count):
                     aligner = ImageAligner(saved_templates[i])
                     img = apply_rotation(
-                        raw_pages[i], self.preset.rot_code, self.preset.fine_angle
+                        raw_pages[i],
+                        self.preset.rot_code,
+                        self.preset.fine_angle_for_page(i),
                     )
                     aligned.append(aligner.align(img))
+                    report(
+                        82 + int((i + 1) / self.preset.page_count * 13),
+                        "기존 템플릿 정렬로 복구 중...",
+                    )
                 self.pages = aligned
+                self._pages_are_canonical = True
+                self._analysis_reference_pages = list(
+                    saved_templates[: self.preset.page_count]
+                )
+                alignment_message = "체크박스 매칭 불완전: 기존 템플릿 정렬 사용"
             else:
                 self.pages = raw_pages
+                self._pages_are_canonical = False
+                self._analysis_reference_pages = []
+                alignment_message = "체크박스 매칭 불완전: 저장 좌표 유지"
 
-            self._filter_boxes_outside_page_count()
             self._update_page_size()
         elif saved_templates:
             # PDF 없이 프리셋만 로드한 경우: 저장된 템플릿을 표시
             self.pages = saved_templates[: self.preset.page_count]
+            self._pages_are_canonical = True
+            self._analysis_reference_pages = list(self.pages)
             self._update_page_size()
+            alignment_message = "저장된 프리셋 템플릿 표시"
 
         self.update_canvas()
         self._sync_view_toggle_text()
+        report(100, alignment_message or "프리셋 불러오기 완료")
+        if alignment_message and hasattr(self, "statusBar"):
+            self.statusBar().showMessage(alignment_message, 10000)
 
     def save_preset(self):
         if self.current_preset_name:
@@ -954,7 +1192,7 @@ class MainWindow(QMainWindow):
         if not self.pages:
             return
         for i, page in enumerate(self.pages):
-            img = apply_rotation(page, self.preset.rot_code, self.preset.fine_angle)
+            img = self._configured_template_page(page, i)
             success, buf = cv2.imencode(".png", img)
             if success:
                 tpl_path = self.preset_dir / f"{name}_tpl_p{i}.png"
@@ -998,8 +1236,27 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "오류", f"프리셋 불러오기 실패: {exc}")
             return
+
+        progress = None
+        progress_cb = None
+        if self.file_paths:
+            progress = self._show_progress_dialog(
+                "프리셋 불러오기", "현재 문서에 프리셋 맞추는 중..."
+            )
+            progress_cb = self._make_progress_cb(progress)
+        try:
+            self._apply_loaded_preset(
+                data,
+                preset_name=name,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "오류", f"프리셋 적용 실패: {exc}")
+            return
+        finally:
+            if progress is not None:
+                progress.close()
         self.current_preset_name = name
-        self._apply_loaded_preset(data, preset_name=name)
 
     def delete_preset(self):
         names = self._list_config_names()
@@ -1080,11 +1337,17 @@ class MainWindow(QMainWindow):
         # 첫 PDF로 기본 페이지 로드 (초기 표시용)
         self.pages = load_pdf_pages(
             self.file_paths[0],
-            progress_cb=self._wrap_progress(0, 40, "PDF 로딩 중...", progress_cb),
+            progress_cb=self._wrap_progress(0, 35, "PDF 로딩 중...", progress_cb),
             page_indices=list(range(page_count)),
         )
+        self._pages_are_canonical = False
 
         self._reset_state_for_new_pdf()
+        self._estimate_page_fine_angles(
+            progress_cb=self._wrap_progress(
+                35, 5, "자동 수평 맞춤 중...", progress_cb
+            )
+        )
         self._update_page_size()
         self.update_canvas()
         self._sync_view_toggle_text()
@@ -1100,6 +1363,7 @@ class MainWindow(QMainWindow):
                 progress_cb=self._wrap_progress(
                     40, 30, "템플릿 병합 중...", progress_cb
                 ),
+                page_fine_angles=self.preset.page_fine_angles,
             )
             # 병합 템플릿은 이미 회전·정합된 이미지입니다. self.pages까지 교체하면
             # 표시와 분석에서 회전이 다시 적용되므로 자동 탐지 입력으로만 사용합니다.
@@ -1112,6 +1376,57 @@ class MainWindow(QMainWindow):
         progress.close()
         QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
 
+    def _estimate_page_fine_angles(self, progress_cb=None) -> list[float]:
+        page_count = min(self.preset.page_count, len(self.pages))
+        previous = list(self.preset.page_fine_angles)
+        angles = [
+            previous[index] if index < len(previous) else 0.0
+            for index in range(page_count)
+        ]
+        if page_count <= 0:
+            self.preset.page_fine_angles = []
+            return []
+
+        for page_idx, page in enumerate(self.pages[:page_count]):
+            base = apply_rotation(
+                page, self.preset.rot_code, self.preset.fine_angle
+            )
+            estimated = estimate_deskew_angle(base)
+            if estimated is not None:
+                angles[page_idx] = float(estimated)
+            if progress_cb:
+                progress_cb(
+                    int((page_idx + 1) / page_count * 100),
+                    f"자동 수평 맞춤 중... ({page_idx + 1}/{page_count})",
+                )
+
+        self.preset.page_fine_angles = angles
+        return angles
+
+    def _page_angle_summary(self) -> str:
+        if not self.preset.page_fine_angles:
+            return "보정 없음"
+        return ", ".join(
+            f"{index + 1}쪽 {angle:+.1f}°"
+            for index, angle in enumerate(self.preset.page_fine_angles)
+        )
+
+    def auto_deskew_pages(self):
+        if not self.pages or not self.file_paths:
+            QMessageBox.information(self, "알림", "먼저 PDF를 불러와주세요.")
+            return
+
+        def estimate(progress_cb):
+            self._estimate_page_fine_angles(progress_cb)
+            self._update_page_size()
+
+        if self._redetect_checkboxes_with_progress(
+            "자동 수평 맞춤", before_detect=estimate
+        ):
+            self.statusBar().showMessage(
+                f"자동 수평 맞춤 완료: {self._page_angle_summary()}", 10000
+            )
+
     def _redetect_checkboxes_with_progress(
         self, title: str, before_detect=None
     ) -> bool:
@@ -1122,11 +1437,61 @@ class MainWindow(QMainWindow):
         progress = self._show_progress_dialog(title, "체크박스 재탐색 준비 중...")
         progress_cb = self._make_progress_cb(progress)
         try:
+            needs_raw_pages = getattr(self, "_pages_are_canonical", False)
+            preparation_steps = int(needs_raw_pages) + int(before_detect is not None)
+            preparation_end = 10 if preparation_steps else 0
+            completed_steps = 0
+
+            if needs_raw_pages:
+                step_start = int(
+                    preparation_end * completed_steps / preparation_steps
+                )
+                step_end = int(
+                    preparation_end * (completed_steps + 1) / preparation_steps
+                )
+                self._reload_raw_template_pages(
+                    self._wrap_progress(
+                        step_start,
+                        step_end - step_start,
+                        "원본 페이지 준비 중...",
+                        progress_cb,
+                    )
+                )
+                completed_steps += 1
+
             if before_detect is not None:
-                progress_cb(0, "캐시 삭제 중...")
-                before_detect()
-                progress_cb(0, "체크박스 재탐색 준비 중...")
-            self.auto_detect(progress_cb=progress_cb)
+                step_start = int(
+                    preparation_end * completed_steps / preparation_steps
+                )
+                step_end = int(
+                    preparation_end * (completed_steps + 1) / preparation_steps
+                )
+                before_detect(
+                    self._wrap_progress(
+                        step_start,
+                        step_end - step_start,
+                        "재탐색 준비 중...",
+                        progress_cb,
+                    )
+                )
+                detect_progress = self._wrap_progress(
+                    preparation_end,
+                    100 - preparation_end,
+                    "체크박스 재탐색 중...",
+                    progress_cb,
+                )
+            else:
+                detect_progress = (
+                    self._wrap_progress(
+                        preparation_end,
+                        100 - preparation_end,
+                        "체크박스 재탐색 중...",
+                        progress_cb,
+                    )
+                    if preparation_end
+                    else progress_cb
+                )
+            self.auto_detect(progress_cb=detect_progress)
             progress_cb(100, "체크박스 재탐색 완료")
             return True
         finally:
@@ -1144,8 +1509,13 @@ class MainWindow(QMainWindow):
             return
 
         if self.pages and self.file_paths:
+            def delete_cache(progress_cb, clear_cache_fn=clear_all_cache):
+                progress_cb(0, "캐시 삭제 중...")
+                clear_cache_fn()
+                progress_cb(100, "캐시 삭제 완료")
+
             self._redetect_checkboxes_with_progress(
-                "캐시 삭제 후 재탐색", before_detect=clear_all_cache
+                "캐시 삭제 후 재탐색", before_detect=delete_cache
             )
         else:
             clear_all_cache()
@@ -1170,13 +1540,21 @@ class MainWindow(QMainWindow):
         # 변경된 콤보박스 항목 순서에 맞게 OpenCV 회전 코드 매핑
         # 0: 원본 0°, 1: 좌측 90°, 2: 우측 90°, 3: 180°
         self.preset.rot_code = ROTATION_MAP.get(index, -1)
+        self.preset.page_fine_angles = [
+            0.0 for _ in range(min(self.preset.page_count, len(self.pages)))
+        ]
         self._sync_rotation_actions()
 
         if not self.pages:
             return
 
-        self._update_page_size()
-        self._redetect_checkboxes_with_progress("회전 적용")
+        def estimate(progress_cb):
+            self._estimate_page_fine_angles(progress_cb)
+            self._update_page_size()
+
+        self._redetect_checkboxes_with_progress(
+            "회전 적용", before_detect=estimate
+        )
 
     def toggle_view(self):
         if self.preset.page_count > 1:
@@ -1199,7 +1577,7 @@ class MainWindow(QMainWindow):
 
         drawn_pages = []
         for i, page in enumerate(self.pages):
-            img = apply_rotation(page, self.preset.rot_code, self.preset.fine_angle)
+            img = self._configured_template_page(page, i)
             canvas_img = img.copy()
 
             if canvas_img.shape[:2] != (self.page_H, self.page_W):
@@ -1383,6 +1761,7 @@ class MainWindow(QMainWindow):
             self.preset.page_count,
             self.preset.rot_code,
             self.preset.fine_angle,
+            self.preset.page_fine_angles,
         )
         if cached is not None:
             report(0, "캐시된 체크박스 불러오는 중...")
@@ -1417,6 +1796,7 @@ class MainWindow(QMainWindow):
                     self.preset.rot_code,
                     self.preset.fine_angle,
                     progress_cb=template_progress,
+                    page_fine_angles=self.preset.page_fine_angles,
                 )
             else:
                 templates = generate_ui_templates(
@@ -1425,6 +1805,7 @@ class MainWindow(QMainWindow):
                     self.preset.rot_code,
                     self.preset.fine_angle,
                     progress_cb=template_progress,
+                    page_fine_angles=self.preset.page_fine_angles,
                 )
 
         total_pages = len(self.pages)
@@ -1436,7 +1817,7 @@ class MainWindow(QMainWindow):
             if templates and i in templates:
                 img = templates[i]
             else:
-                img = apply_rotation(page, self.preset.rot_code, self.preset.fine_angle)
+                img = self._configured_template_page(page, i)
 
             detected = auto_detect_checkboxes(img)
             detected_cache[i] = detected
@@ -1466,10 +1847,24 @@ class MainWindow(QMainWindow):
             self.preset.rot_code,
             self.preset.fine_angle,
             detected_cache,
+            self.preset.page_fine_angles,
         )
 
         report(100, "체크박스 탐지 완료")
         self.update_canvas()
+
+    def _analysis_input_pages(self) -> tuple[list[np.ndarray], bool]:
+        """Return stable analysis references separately from display pages."""
+        saved_references = list(
+            getattr(self, "_analysis_reference_pages", [])
+        )
+        use_saved_references = (
+            len(saved_references) >= self.preset.page_count
+            and self.preset.page_count > 0
+        )
+        if use_saved_references:
+            return saved_references[: self.preset.page_count], True
+        return list(self.pages), bool(self._pages_are_canonical)
 
     def execute_analysis(self):
         if not self.file_paths or not self.preset.fields:
@@ -1493,10 +1888,12 @@ class MainWindow(QMainWindow):
         self.exec_btn.setEnabled(False)
 
         thread = QThread(self)
+        analysis_pages, pages_preprocessed = self._analysis_input_pages()
         worker = _AnalysisWorker(
             list(self.file_paths),
-            list(self.pages),
+            analysis_pages,
             copy.deepcopy(self.preset),
+            template_pages_preprocessed=pages_preprocessed,
         )
         worker.moveToThread(thread)
 

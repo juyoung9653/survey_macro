@@ -10,7 +10,7 @@ import numpy as np
 
 
 _PDF_CACHE_VERSION = 2
-_CHECKBOX_CACHE_VERSION = 5
+_CHECKBOX_CACHE_VERSION = 6
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):
@@ -274,6 +274,119 @@ def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndar
     return img
 
 
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    order = np.argsort(values)
+    ordered_values = np.asarray(values, dtype=np.float64)[order]
+    ordered_weights = np.asarray(weights, dtype=np.float64)[order]
+    midpoint = float(ordered_weights.sum()) / 2.0
+    index = int(np.searchsorted(np.cumsum(ordered_weights), midpoint))
+    return float(ordered_values[min(index, len(ordered_values) - 1)])
+
+
+def estimate_deskew_angle(
+    image: np.ndarray,
+    max_abs_angle: float = 3.0,
+    max_dimension: int = 1200,
+) -> float | None:
+    """Estimate one small document rotation that strengthens axis-aligned lines."""
+    if image.size == 0 or max_abs_angle <= 0:
+        return None
+
+    gray = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 3
+        else image
+    )
+    height, width = gray.shape[:2]
+    long_side = max(height, width)
+    if long_side < 64:
+        return None
+    if max_dimension > 0 and long_side > max_dimension:
+        scale = max_dimension / long_side
+        gray = cv2.resize(
+            gray,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    height, width = gray.shape[:2]
+    edges = cv2.Canny(gray, 80, 180)
+    min_dimension = min(height, width)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 1800,
+        threshold=max(35, round(min_dimension * 0.04)),
+        minLineLength=max(40, round(min_dimension * 0.08)),
+        maxLineGap=max(6, round(min_dimension * 0.01)),
+    )
+    if lines is None:
+        return None
+
+    horizontal_residuals: list[float] = []
+    horizontal_weights: list[float] = []
+    vertical_residuals: list[float] = []
+    vertical_weights: list[float] = []
+    axis_tolerance = max_abs_angle + 1.0
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx = int(x2) - int(x1)
+        dy = int(y2) - int(y1)
+        length = float(np.hypot(dx, dy))
+        if length <= 0:
+            continue
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        while angle >= 90.0:
+            angle -= 180.0
+        while angle < -90.0:
+            angle += 180.0
+
+        if abs(angle) <= axis_tolerance:
+            residual = angle
+            horizontal_residuals.append(residual)
+            horizontal_weights.append(length)
+        elif abs(abs(angle) - 90.0) <= axis_tolerance:
+            residual = angle - 90.0 if angle > 0 else angle + 90.0
+            vertical_residuals.append(residual)
+            vertical_weights.append(length)
+        else:
+            continue
+
+    def estimate_axis(
+        residuals: list[float], weights: list[float], min_total_length: float
+    ) -> float | None:
+        if len(residuals) < 6 or sum(weights) < min_total_length:
+            return None
+        center = _weighted_median(residuals, weights)
+        deviation = _weighted_median(
+            [abs(value - center) for value in residuals], weights
+        )
+        if abs(center) > max_abs_angle or deviation > 1.1:
+            return None
+        return center
+
+    # Survey forms contain many long row rules. Their angle stays measurable
+    # below one degree, whereas shorter vertical checkbox sides often quantize
+    # to exactly 0 degrees and can hide a real page skew. Use rows first and
+    # retain columns as a fallback for forms without enough horizontal rules.
+    center = estimate_axis(
+        horizontal_residuals, horizontal_weights, width * 1.5
+    )
+    if center is None:
+        center = estimate_axis(
+            vertical_residuals, vertical_weights, height * 1.5
+        )
+    if center is None:
+        return None
+
+    # Hough의 계단 양자화 편향을 여러 방향의 긴 선 중앙값으로 상쇄합니다.
+    # OpenCV 이미지 좌표계에서는 감지된 기울기와 같은 부호가 보정 방향입니다.
+    correction = round(center, 1)
+    correction = max(-max_abs_angle, min(max_abs_angle, correction))
+    if abs(correction) < 0.05:
+        return 0.0
+    return float(correction)
+
+
 def auto_detect_checkboxes(
     image: np.ndarray, min_w=24, max_w=600, min_h=24, max_h=200
 ) -> list[tuple[int, int, int, int]]:
@@ -396,6 +509,7 @@ def _checkbox_cache_key(
     rot_code: int,
     fine_angle: float,
     dpi: int = 300,
+    page_fine_angles: list[float] | None = None,
 ) -> str:
     parts = []
     for p in pdf_paths:
@@ -406,15 +520,25 @@ def _checkbox_cache_key(
             parts.append(p)
     unique_str = (
         f"v{_CHECKBOX_CACHE_VERSION}_{'|'.join(parts)}_"
-        f"{page_count}_{rot_code}_{fine_angle}_{dpi}"
+        f"{page_count}_{rot_code}_{fine_angle}_{page_fine_angles or []}_{dpi}"
     )
     return hashlib.md5(unique_str.encode("utf-8")).hexdigest()
 
 
 def load_checkbox_cache(
-    pdf_paths: list[str], page_count: int, rot_code: int, fine_angle: float
+    pdf_paths: list[str],
+    page_count: int,
+    rot_code: int,
+    fine_angle: float,
+    page_fine_angles: list[float] | None = None,
 ) -> dict[int, list[tuple[int, int, int, int]]] | None:
-    key = _checkbox_cache_key(pdf_paths, page_count, rot_code, fine_angle)
+    key = _checkbox_cache_key(
+        pdf_paths,
+        page_count,
+        rot_code,
+        fine_angle,
+        page_fine_angles=page_fine_angles,
+    )
     cache_dir = os.path.join(tempfile.gettempdir(), "pdf_checkbox_cache")
     cache_file = os.path.join(cache_dir, f"{key}.json")
     if not os.path.exists(cache_file):
@@ -453,8 +577,15 @@ def save_checkbox_cache(
     rot_code: int,
     fine_angle: float,
     boxes_by_page: dict[int, list[tuple[int, int, int, int]]],
+    page_fine_angles: list[float] | None = None,
 ) -> None:
-    key = _checkbox_cache_key(pdf_paths, page_count, rot_code, fine_angle)
+    key = _checkbox_cache_key(
+        pdf_paths,
+        page_count,
+        rot_code,
+        fine_angle,
+        page_fine_angles=page_fine_angles,
+    )
     cache_dir = os.path.join(tempfile.gettempdir(), "pdf_checkbox_cache")
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{key}.json")
