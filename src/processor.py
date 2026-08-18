@@ -31,6 +31,11 @@ _ANALYSIS_REUSED_SURVEY_WORK = 1.0
 _ANALYSIS_RENDERED_SURVEY_WORK = 3.0
 _ANALYSIS_PROGRESS_START = 2.0
 _ANALYSIS_PROGRESS_SPAN = 95.0
+_CANCEL_MARK_MIN_FILL_RATIO = 0.05
+_CANCEL_MARK_MIN_BBOX_DENSITY = 0.22
+_CANCEL_MARK_MIN_INK_RATIO = 2.5
+_RUNNER_UP_MIN_FILL_RATIO = 0.01
+_RUNNER_UP_MAX_BBOX_DENSITY = 0.20
 
 
 @dataclass
@@ -1517,6 +1522,73 @@ def enforce_single_choice(
     return [i == best_idx for i in range(len(check_results))]
 
 
+def _mark_bbox_density(mask: np.ndarray, box: Box) -> float:
+    image_h, image_w = mask.shape[:2]
+    x1 = max(0, box.x)
+    y1 = max(0, box.y)
+    x2 = min(image_w, box.x + box.w)
+    y2 = min(image_h, box.y + box.h)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    roi = mask[y1:y2, x1:x2]
+    points = cv2.findNonZero(roi)
+    if points is None:
+        return 0.0
+    _x, _y, width, height = cv2.boundingRect(points)
+    return cv2.countNonZero(roi) / max(1, width * height)
+
+
+def _cancellation_runner_up_index(
+    inks: list[int],
+    areas: list[int],
+    boxes: list[Box],
+    pure_ink_masks: dict[int, np.ndarray],
+) -> int | None:
+    """Return the intended runner-up when a dense correction obscures it."""
+    if not inks or not (len(inks) == len(areas) == len(boxes)):
+        return None
+
+    fill_ratios = [
+        ink / area if area > 0 else 0.0 for ink, area in zip(inks, areas)
+    ]
+    independent_marks = [
+        index
+        for index, fill_ratio in enumerate(fill_ratios)
+        if fill_ratio >= _RUNNER_UP_MIN_FILL_RATIO
+    ]
+    if len(independent_marks) != 2:
+        return None
+
+    top_idx, runner_up_idx = sorted(
+        independent_marks,
+        key=lambda index: inks[index],
+        reverse=True,
+    )
+    runner_up_ink = inks[runner_up_idx]
+    if (
+        fill_ratios[top_idx] < _CANCEL_MARK_MIN_FILL_RATIO
+        or runner_up_ink <= 0
+        or inks[top_idx] < runner_up_ink * _CANCEL_MARK_MIN_INK_RATIO
+    ):
+        return None
+
+    top_mask = pure_ink_masks.get(boxes[top_idx].page_idx)
+    runner_up_mask = pure_ink_masks.get(boxes[runner_up_idx].page_idx)
+    if top_mask is None or runner_up_mask is None:
+        return None
+    top_density = _mark_bbox_density(top_mask, boxes[top_idx])
+    runner_up_density = _mark_bbox_density(
+        runner_up_mask, boxes[runner_up_idx]
+    )
+    if (
+        top_density < _CANCEL_MARK_MIN_BBOX_DENSITY
+        or runner_up_density > _RUNNER_UP_MAX_BBOX_DENSITY
+    ):
+        return None
+    return runner_up_idx
+
+
 def _label_number(total: int, index: int, reverse: bool) -> int:
     if total > 1:
         return total - index + 1 if reverse else index
@@ -2781,7 +2853,23 @@ def process_survey_data(
                     index == best_idx for index in range(len(check_results))
                 ]
             else:
-                check_results = enforce_single_choice(check_results, inks, areas)
+                correction_idx = None
+                if not checkbox_mode:
+                    correction_idx = _cancellation_runner_up_index(
+                        inks,
+                        areas,
+                        valid_boxes,
+                        pure_ink_masks,
+                    )
+                if correction_idx is None:
+                    check_results = enforce_single_choice(
+                        check_results, inks, areas
+                    )
+                else:
+                    check_results = [
+                        index == correction_idx
+                        for index in range(len(check_results))
+                    ]
         checked_labels = []
         total_boxes = len(valid_boxes)
 
