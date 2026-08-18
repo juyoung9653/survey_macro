@@ -1070,7 +1070,7 @@ class MainWindow(QMainWindow):
                 self._update_page_size()
                 self.update_canvas()
                 raise ValueError(
-                    "현재 PDF와 프리셋의 체크박스 양식이 일치하지 않습니다."
+                    "현재 PDF와 일치하지 않는 프리셋이라 불러올 수 없습니다."
                 )
             if remap.accepted:
                 inverse_transforms = {}

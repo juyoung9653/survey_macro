@@ -1620,6 +1620,118 @@ def _config_checkbox_refs(
     ]
 
 
+def _layout_line_mask(image: np.ndarray) -> np.ndarray:
+    gray = image
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    _threshold, mask = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+    )
+    return mask
+
+
+def _box_frame_edge_scores(mask: np.ndarray, box: Box) -> tuple[float, ...]:
+    """Measure continuous dark-line support along the four box edges."""
+    image_h, image_w = mask.shape[:2]
+    x1 = max(0, min(image_w - 1, int(box.x)))
+    y1 = max(0, min(image_h - 1, int(box.y)))
+    x2 = max(0, min(image_w - 1, int(box.x + box.w - 1)))
+    y2 = max(0, min(image_h - 1, int(box.y + box.h - 1)))
+    if x2 <= x1 or y2 <= y1:
+        return (0.0, 0.0, 0.0, 0.0)
+
+    trim_x = max(2, round((x2 - x1 + 1) * 0.08))
+    trim_y = max(2, round((y2 - y1 + 1) * 0.08))
+    short_side = min(x2 - x1 + 1, y2 - y1 + 1)
+    band = max(2, min(12, round(short_side * 0.06)))
+
+    def horizontal_score(center_y: int) -> float:
+        start_x = x1 + trim_x
+        end_x = x2 - trim_x + 1
+        start_y = max(0, center_y - band)
+        end_y = min(image_h, center_y + band + 1)
+        if end_x <= start_x or end_y <= start_y:
+            return 0.0
+        rows = mask[start_y:end_y, start_x:end_x] > 0
+        return float(np.max(np.mean(rows, axis=1)))
+
+    def vertical_score(center_x: int) -> float:
+        start_y = y1 + trim_y
+        end_y = y2 - trim_y + 1
+        start_x = max(0, center_x - band)
+        end_x = min(image_w, center_x + band + 1)
+        if end_y <= start_y or end_x <= start_x:
+            return 0.0
+        columns = mask[start_y:end_y, start_x:end_x] > 0
+        return float(np.max(np.mean(columns, axis=0)))
+
+    return (
+        horizontal_score(y1),
+        horizontal_score(y2),
+        vertical_score(x1),
+        vertical_score(x2),
+    )
+
+
+def _framed_layout_matches_transform(
+    config: TemplatePreset,
+    page_idx: int,
+    source_template: np.ndarray,
+    target_template: np.ndarray,
+    matrix: np.ndarray,
+) -> bool:
+    """Reject local table-layout changes hidden by matching header checkboxes."""
+    source_mask = _layout_line_mask(source_template)
+    target_mask = _layout_line_mask(target_template)
+    source_edge_threshold = 0.55
+    target_edge_threshold = 0.45
+    framed_box_count = 0
+    expected = [0, 0]
+    supported = [0, 0]
+
+    for field in config.fields:
+        if field.is_comment:
+            continue
+        for box in field.boxes:
+            if box.page_idx != page_idx or _is_checkbox_like(
+                box, source_template.shape
+            ):
+                continue
+            source_scores = _box_frame_edge_scores(source_mask, box)
+            strong_edges = [
+                score >= source_edge_threshold for score in source_scores
+            ]
+            if sum(strong_edges) < 3:
+                continue
+
+            framed_box_count += 1
+            projected = copy.copy(box)
+            _transform_box_in_place(projected, matrix, target_template.shape)
+            target_scores = _box_frame_edge_scores(target_mask, projected)
+            for edge_idx, source_is_strong in enumerate(strong_edges):
+                if not source_is_strong:
+                    continue
+                orientation = 0 if edge_idx < 2 else 1
+                expected[orientation] += 1
+                if target_scores[edge_idx] >= target_edge_threshold:
+                    supported[orientation] += 1
+
+    if framed_box_count < 3:
+        return True
+
+    expected_total = sum(expected)
+    supported_total = sum(supported)
+    if expected_total <= 0 or supported_total / expected_total < 0.72:
+        return False
+    return all(
+        count <= 0 or supported[index] / count >= 0.6
+        for index, count in enumerate(expected)
+    )
+
+
 def _transform_box_in_place(
     box: Box,
     matrix: np.ndarray,
@@ -2100,6 +2212,15 @@ def remap_preset_to_detected_layout(
             templates[page_idx].shape,
         )
         if matrix is None:
+            continue
+        if not _framed_layout_matches_transform(
+            config,
+            page_idx,
+            source_templates[page_idx],
+            templates[page_idx],
+            matrix,
+        ):
+            compatible = False
             continue
 
         all_y = np.asarray(

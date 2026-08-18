@@ -1,6 +1,7 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 from PyQt6.QtWidgets import QMessageBox
 import numpy as np
@@ -12,6 +13,24 @@ from src.ui import MainWindow, ROTATION_MAP
 class RedetectionProgressTests(unittest.TestCase):
     def test_reverse_numbering_defaults_to_on(self):
         self.assertTrue(TemplatePreset().reverse_numbering)
+
+    def test_incompatible_preset_is_not_selected_and_reports_load_failure(self):
+        message = "현재 PDF와 일치하지 않는 프리셋이라 불러올 수 없습니다."
+        window = SimpleNamespace(
+            preset_dir=Path("presets"),
+            file_paths=[],
+            current_preset_name=None,
+            _apply_loaded_preset=Mock(side_effect=ValueError(message)),
+        )
+
+        with (
+            patch("builtins.open", mock_open(read_data="{}")),
+            patch("src.ui.QMessageBox.critical") as critical,
+        ):
+            MainWindow._load_preset_by_name(window, "different-form")
+
+        self.assertIsNone(window.current_preset_name)
+        self.assertIn(message, critical.call_args.args[2])
 
     def test_page_angles_are_serialized_with_preset(self):
         window = SimpleNamespace(
@@ -254,7 +273,9 @@ class RedetectionProgressTests(unittest.TestCase):
             ),
             patch("src.ui.ImageAligner") as aligner,
         ):
-            with self.assertRaisesRegex(ValueError, "양식이 일치하지 않습니다"):
+            with self.assertRaisesRegex(
+                ValueError, "일치하지 않는 프리셋이라 불러올 수 없습니다"
+            ):
                 MainWindow._apply_loaded_preset(
                     window, data, preset_name="different-form"
                 )
