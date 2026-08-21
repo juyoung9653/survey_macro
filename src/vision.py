@@ -138,6 +138,7 @@ class ImageAligner:
         ref_img: np.ndarray,
         refine_ecc: bool = True,
         ecc_max_dimension: int = 1200,
+        stable_mask: np.ndarray | None = None,
     ):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
@@ -158,8 +159,75 @@ class ImageAligner:
             self.ecc_ref_gray = self.ref_gray
             self.ecc_scale_x = 1.0
             self.ecc_scale_y = 1.0
+        self.stable_mask = self._prepare_stable_mask(stable_mask)
+        if self.stable_mask is not None and (
+            self.ecc_scale_x < 1.0 or self.ecc_scale_y < 1.0
+        ):
+            self.ecc_stable_mask = cv2.resize(
+                self.stable_mask,
+                (self.ecc_ref_gray.shape[1], self.ecc_ref_gray.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            self.ecc_stable_mask = self.stable_mask
         self.orb = cv2.ORB_create(2000)
-        self.kp1, self.des1 = self.orb.detectAndCompute(self.ref_gray, None)
+        self.kp1, self.des1 = self.orb.detectAndCompute(
+            self.ref_gray, self.stable_mask
+        )
+
+    def _prepare_stable_mask(
+        self, stable_mask: np.ndarray | None
+    ) -> np.ndarray | None:
+        if stable_mask is None or stable_mask.size == 0:
+            return None
+        if stable_mask.ndim == 3:
+            stable_mask = cv2.cvtColor(stable_mask, cv2.COLOR_BGR2GRAY)
+        if stable_mask.shape[:2] != (self.ref_h, self.ref_w):
+            stable_mask = cv2.resize(
+                stable_mask,
+                (self.ref_w, self.ref_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        stable_mask = np.where(stable_mask > 0, 255, 0).astype(np.uint8)
+        # ORB and ECC become unstable when almost the entire page is excluded.
+        if cv2.countNonZero(stable_mask) < self.ref_h * self.ref_w * 0.15:
+            return None
+        return stable_mask
+
+    def _is_plausible_affine(
+        self, matrix: np.ndarray, inliers: np.ndarray | None = None
+    ) -> bool:
+        """Reject catastrophic matches while retaining normal scanner distortion."""
+        if matrix.shape != (2, 3) or not np.isfinite(matrix).all():
+            return False
+        if inliers is not None:
+            flat_inliers = np.asarray(inliers).reshape(-1) > 0
+            if flat_inliers.size and (
+                int(np.count_nonzero(flat_inliers)) < 3
+                or float(np.mean(flat_inliers)) < 0.25
+            ):
+                return False
+
+        linear = np.asarray(matrix[:, :2], dtype=np.float64)
+        determinant = float(np.linalg.det(linear))
+        if determinant <= 0:
+            return False
+        singular_values = np.linalg.svd(linear, compute_uv=False)
+        if (
+            singular_values[-1] < 0.75
+            or singular_values[0] > 1.25
+            or singular_values[0] / singular_values[-1] > 1.22
+        ):
+            return False
+        rotation = float(np.degrees(np.arctan2(linear[1, 0], linear[0, 0])))
+        if abs(rotation) > 6.0:
+            return False
+        if (
+            abs(float(matrix[0, 2])) > self.ref_w * 0.12
+            or abs(float(matrix[1, 2])) > self.ref_h * 0.12
+        ):
+            return False
+        return True
 
     def _affine_to_ecc_scale(self, matrix: np.ndarray) -> np.ndarray:
         scaled = matrix.astype(np.float32, copy=True)
@@ -194,7 +262,7 @@ class ImageAligner:
             if working_img.ndim == 3
             else working_img
         )
-        kp2, des2 = self.orb.detectAndCompute(gray, None)
+        kp2, des2 = self.orb.detectAndCompute(gray, self.stable_mask)
         if des2 is None:
             return working_img
 
@@ -211,8 +279,10 @@ class ImageAligner:
         pts2 = np.float32([kp2[m.trainIdx].pt for m in top_matches]).reshape(-1, 1, 2)
 
         # affine transform: rotation + translation + scale, no perspective (no twisting)
-        M, _ = cv2.estimateAffine2D(pts2, pts1, ransacReprojThreshold=3.0)
-        if M is None:
+        M, inliers = cv2.estimateAffine2D(
+            pts2, pts1, ransacReprojThreshold=3.0
+        )
+        if M is None or not self._is_plausible_affine(M, inliers):
             return working_img
 
         # --- ECC 정밀 정합 (sub-pixel refinement) ---
@@ -236,19 +306,24 @@ class ImageAligner:
                 )
                 ecc_initial_full = cv2.invertAffineTransform(M).astype(np.float32)
                 ecc_initial = self._affine_to_ecc_scale(ecc_initial_full)
-                _, M_refined = cv2.findTransformECC(
+                correlation, M_refined = cv2.findTransformECC(
                     self.ecc_ref_gray,
                     ecc_gray,
                     ecc_initial,
                     cv2.MOTION_AFFINE,
                     criteria,
-                    None,
+                    self.ecc_stable_mask,
                     5,
                 )
-                if np.isfinite(M_refined).all():
-                    M = cv2.invertAffineTransform(
-                        self._affine_from_ecc_scale(M_refined)
-                    )
+                refined_full = cv2.invertAffineTransform(
+                    self._affine_from_ecc_scale(M_refined)
+                )
+                if (
+                    np.isfinite(correlation)
+                    and correlation > 0.20
+                    and self._is_plausible_affine(refined_full)
+                ):
+                    M = refined_full
             except Exception:
                 pass  # ECC 실패 시 ORB 결과 그대로 사용
 

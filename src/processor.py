@@ -36,6 +36,9 @@ _CANCEL_MARK_MIN_BBOX_DENSITY = 0.22
 _CANCEL_MARK_MIN_INK_RATIO = 2.5
 _RUNNER_UP_MIN_FILL_RATIO = 0.01
 _RUNNER_UP_MAX_BBOX_DENSITY = 0.20
+_CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS = 5
+_SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO = 0.45
+_SHARED_STROKE_MIN_SHAPE_SPREAD = 0.18
 
 
 @dataclass
@@ -46,6 +49,10 @@ class _CheckboxInkInfo:
     border_confidence: float
     mask_bounds: tuple[int, int, int, int]
     ink_mask: np.ndarray
+    mark_strength: float = 0.0
+    residual_pixels: int = 0
+    residual_energy: float = 0.0
+    stroke_span_ratio: float = 0.0
 
 
 @dataclass
@@ -63,6 +70,7 @@ class _CheckboxFieldAnalysis:
     reliable_direct: list[bool]
     direct_inks: list[int]
     direct_areas: list[int]
+    direct_strengths: list[float]
     direct_results: list[bool]
     halo_infos: list[_CheckboxHaloInfo]
 
@@ -352,8 +360,135 @@ def _median_uint8_inplace(stack: np.ndarray) -> np.ndarray:
     return (total // 2).astype(np.uint8)
 
 
+def _clean_response_regions(
+    stack: np.ndarray,
+    template: np.ndarray,
+    config: TemplatePreset,
+    page_idx: int,
+) -> np.ndarray:
+    """Use the brightest aligned samples inside response ROIs.
+
+    Printed form strokes occur in every sample and remain dark. Handwritten ink
+    occurs only in answered samples, so a high percentile keeps a clean local
+    reference even when the same option is selected by more than half of the
+    respondents. Checkbox frame pixels are restored from the median template to
+    avoid thinning their borders through tiny residual registration errors.
+    """
+    if stack.ndim != 3 or stack.shape[0] < 2:
+        return template
+
+    height, width = template.shape[:2]
+    percentile_index = int(np.ceil((stack.shape[0] - 1) * 0.90))
+    response_boxes = [
+        box
+        for field in config.fields
+        if not field.is_comment
+        for box in field.boxes
+        if box.page_idx == page_idx and box.w > 0 and box.h > 0
+    ]
+    for box in response_boxes:
+        checkbox_like = _is_checkbox_like(box, template.shape)
+        padding = max(4, round(min(box.w, box.h) * 0.7)) if checkbox_like else 0
+        x1 = max(0, box.x - padding)
+        y1 = max(0, box.y - padding)
+        x2 = min(width, box.x + box.w + padding)
+        y2 = min(height, box.y + box.h + padding)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        samples = stack[:, y1:y2, x1:x2]
+        bright_patch = np.partition(
+            samples, percentile_index, axis=0
+        )[percentile_index]
+        median_patch = template[y1:y2, x1:x2].copy()
+        output_patch = template[y1:y2, x1:x2]
+        if checkbox_like:
+            output_patch[:] = bright_patch
+
+        border_mask = np.zeros((y2 - y1, x2 - x1), np.uint8)
+        local_x1 = max(0, box.x - x1)
+        local_y1 = max(0, box.y - y1)
+        local_x2 = min(x2 - x1 - 1, box.x + box.w - x1 - 1)
+        local_y2 = min(y2 - y1 - 1, box.y + box.h - y1 - 1)
+        if local_x2 > local_x1 and local_y2 > local_y1:
+            short_side = min(box.w, box.h)
+            border_width = (
+                max(2, round(short_side * 0.18))
+                if checkbox_like
+                else max(8, round(short_side * 0.10))
+            )
+            cv2.rectangle(
+                border_mask,
+                (local_x1, local_y1),
+                (local_x2, local_y2),
+                255,
+                thickness=border_width,
+            )
+            if not checkbox_like:
+                # Some presets cover several similar grid layouts whose cell
+                # borders differ by more than a few pixels. Preserve long form
+                # rules wherever they actually occur instead of treating their
+                # registration residue as a handwritten response.
+                printed = (median_patch < 210).astype(np.uint8) * 255
+                vertical_length = max(9, round(printed.shape[0] * 0.30))
+                horizontal_length = max(9, round(printed.shape[1] * 0.30))
+                vertical_rules = cv2.morphologyEx(
+                    printed,
+                    cv2.MORPH_OPEN,
+                    np.ones((vertical_length, 1), np.uint8),
+                )
+                horizontal_rules = cv2.morphologyEx(
+                    printed,
+                    cv2.MORPH_OPEN,
+                    np.ones((1, horizontal_length), np.uint8),
+                )
+                printed_rules = cv2.bitwise_or(vertical_rules, horizontal_rules)
+                printed_rules = cv2.dilate(
+                    printed_rules, np.ones((5, 5), np.uint8), iterations=1
+                )
+                border_mask = cv2.bitwise_or(border_mask, printed_rules)
+            if checkbox_like:
+                output_patch[border_mask > 0] = median_patch[border_mask > 0]
+            else:
+                # Change only pen-like consensus strokes that are dark in the
+                # median but absent from the brightest samples. Replacing the
+                # whole cell makes small layout differences look like answers.
+                lift = bright_patch.astype(np.int16) - median_patch.astype(np.int16)
+                candidates = (lift >= 20).astype(np.uint8) * 255
+                candidates[border_mask > 0] = 0
+                candidates = cv2.morphologyEx(
+                    candidates,
+                    cv2.MORPH_CLOSE,
+                    np.ones((3, 3), np.uint8),
+                )
+                component_count, labels, stats, _ = (
+                    cv2.connectedComponentsWithStats(
+                        (candidates > 0).astype(np.uint8), connectivity=8
+                    )
+                )
+                pen_mask = np.zeros_like(candidates)
+                min_area = max(5, round(candidates.size * 0.0003))
+                min_span = max(6, round(short_side * 0.05))
+                for component_idx in range(1, component_count):
+                    component_area = int(stats[component_idx, cv2.CC_STAT_AREA])
+                    component_span = max(
+                        int(stats[component_idx, cv2.CC_STAT_WIDTH]),
+                        int(stats[component_idx, cv2.CC_STAT_HEIGHT]),
+                    )
+                    if component_area >= min_area and component_span >= min_span:
+                        pen_mask[labels == component_idx] = 255
+                pen_mask = cv2.dilate(
+                    pen_mask, np.ones((3, 3), np.uint8), iterations=1
+                )
+                pen_mask[border_mask > 0] = 0
+                output_patch[pen_mask > 0] = bright_patch[pen_mask > 0]
+
+    return template
+
+
 def generate_dynamic_templates(
     pages_by_local_idx: dict[int, list],
+    config: TemplatePreset | None = None,
 ) -> dict[int, np.ndarray]:
     templates = {}
     for local_p, pages in pages_by_local_idx.items():
@@ -379,7 +514,10 @@ def generate_dynamic_templates(
 
         stack = np.stack(filtered, axis=0)
         del images, filtered
-        templates[local_p] = _median_uint8_inplace(stack)
+        template = _median_uint8_inplace(stack)
+        if config is not None:
+            template = _clean_response_regions(stack, template, config, local_p)
+        templates[local_p] = template
         del stack
 
     return templates
@@ -659,11 +797,48 @@ def _best_shift_by_correlation(
     return score, overlap, dx, dy
 
 
+def _build_stable_region_mask(
+    image_shape: tuple[int, ...],
+    config: TemplatePreset,
+    page_idx: int,
+) -> np.ndarray | None:
+    """Keep printed form regions while excluding every user response region."""
+    height, width = image_shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+
+    mask = np.full((height, width), 255, np.uint8)
+    excluded_any = False
+    for field in config.fields:
+        for box in field.boxes:
+            if box.page_idx != page_idx or box.w <= 0 or box.h <= 0:
+                continue
+            if _is_checkbox_like(box, image_shape):
+                padding = max(12, round(min(box.w, box.h) * 0.9))
+            else:
+                padding = max(8, round(min(box.w, box.h) * 0.08))
+            x1 = max(0, box.x - padding)
+            y1 = max(0, box.y - padding)
+            x2 = min(width, box.x + box.w + padding)
+            y2 = min(height, box.y + box.h + padding)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            mask[y1:y2, x1:x2] = 0
+            excluded_any = True
+
+    if not excluded_any:
+        return None
+    if cv2.countNonZero(mask) < height * width * 0.15:
+        return None
+    return mask
+
+
 def _align_template_mask_by_coverage(
     template_mask: np.ndarray,
     target_mask: np.ndarray,
     max_angle: float = 0.6,
     max_shift: int = 8,
+    alignment_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """템플릿 선이 대상의 어두운 픽셀을 가장 많이 덮도록 미세 정합합니다.
 
@@ -676,13 +851,29 @@ def _align_template_mask_by_coverage(
             template_mask, (w, h), interpolation=cv2.INTER_NEAREST
         )
 
-    template_pixels = cv2.countNonZero(template_mask)
-    target_pixels = cv2.countNonZero(target_mask)
+    search_template_mask = template_mask
+    search_target_mask = target_mask
+    if alignment_mask is not None and alignment_mask.size > 0:
+        if alignment_mask.ndim == 3:
+            alignment_mask = cv2.cvtColor(alignment_mask, cv2.COLOR_BGR2GRAY)
+        if alignment_mask.shape[:2] != (h, w):
+            alignment_mask = cv2.resize(
+                alignment_mask, (w, h), interpolation=cv2.INTER_NEAREST
+            )
+        alignment_mask = np.where(alignment_mask > 0, 255, 0).astype(np.uint8)
+        if cv2.countNonZero(alignment_mask) >= h * w * 0.15:
+            search_template_mask = cv2.bitwise_and(
+                template_mask, alignment_mask
+            )
+            search_target_mask = cv2.bitwise_and(target_mask, alignment_mask)
+
+    template_pixels = cv2.countNonZero(search_template_mask)
+    target_pixels = cv2.countNonZero(search_target_mask)
     if template_pixels < 32 or target_pixels < 32:
         return template_mask
 
     identity_overlap = cv2.countNonZero(
-        cv2.bitwise_and(template_mask, target_mask)
+        cv2.bitwise_and(search_template_mask, search_target_mask)
     )
     identity_score = float(identity_overlap)
     # 1~2px 확장은 뒤에서 적용되므로 97% 이상 맞으면 추가 탐색의 이득이 없습니다.
@@ -695,10 +886,10 @@ def _align_template_mask_by_coverage(
     search_h = max(1, round(h * search_scale))
     # INTER_AREA로 축소한 뒤 낮은 임계값으로 다시 이진화해 가는 선의 소실을 줄입니다.
     small_template = cv2.resize(
-        template_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
+        search_template_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
     )
     small_target = cv2.resize(
-        target_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
+        search_target_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
     )
     _, small_template = cv2.threshold(
         small_template, 32, 255, cv2.THRESH_BINARY
@@ -757,7 +948,7 @@ def _align_template_mask_by_coverage(
     best_transform = (0.0, 0, 0)
     full_center = (w / 2.0, h / 2.0)
     full_padded_target = cv2.copyMakeBorder(
-        target_mask,
+        search_target_mask,
         max_shift,
         max_shift,
         max_shift,
@@ -769,7 +960,7 @@ def _align_template_mask_by_coverage(
     for angle in sorted(fine_angles):
         matrix = cv2.getRotationMatrix2D(full_center, angle, 1.0)
         rotated = cv2.warpAffine(
-            template_mask,
+            search_template_mask,
             matrix,
             (w, h),
             flags=cv2.INTER_NEAREST,
@@ -810,6 +1001,7 @@ def extract_pure_ink_mask(
     template_gray: np.ndarray,
     template_dilate_pct: float = 0.3,
     prepared_template_mask: np.ndarray | None = None,
+    alignment_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """템플릿을 대상에 미세 정합해 제거하고 순수 사용자 잉크만 추출합니다."""
     if target_gray.ndim == 3:
@@ -827,7 +1019,11 @@ def extract_pure_ink_mask(
         template_mask = prepared_template_mask
 
     # 2. 템플릿 마스크만 미세 회전·이동하여 대상의 인쇄선을 최대한 덮음
-    template_mask = _align_template_mask_by_coverage(template_mask, target_mask)
+    template_mask = _align_template_mask_by_coverage(
+        template_mask,
+        target_mask,
+        alignment_mask=alignment_mask,
+    )
 
     # 3. 남은 미세 정합 오차만큼 템플릿 마스크 확장
     dilate_px = max(0, round(template_dilate_pct * 5))
@@ -1006,9 +1202,80 @@ def _refine_checkbox_box(
     return refined, confidence
 
 
+def _filter_checkbox_mark_components(
+    binary_mask: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Keep pen-like components and reject compact scanner dust."""
+    filtered = np.zeros_like(binary_mask, dtype=np.uint8)
+    if binary_mask.size == 0:
+        return filtered, 0.0
+
+    binary = (binary_mask > 0).astype(np.uint8)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    height, width = binary.shape[:2]
+    short_side = max(1, min(height, width))
+    min_component_area = max(2, round(binary.size * 0.008))
+    min_component_span = max(3, round(short_side * 0.25))
+    dense_component_area = max(5, round(binary.size * 0.04))
+    max_span_ratio = 0.0
+    for component_idx in range(1, component_count):
+        component_area = int(stats[component_idx, cv2.CC_STAT_AREA])
+        component_width = int(stats[component_idx, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[component_idx, cv2.CC_STAT_HEIGHT])
+        component_span = max(component_width, component_height)
+        if component_area < min_component_area or (
+            component_span < min_component_span
+            and component_area < dense_component_area
+        ):
+            continue
+        filtered[labels == component_idx] = 255
+        max_span_ratio = max(
+            max_span_ratio,
+            component_width / max(1, width),
+            component_height / max(1, height),
+        )
+    return filtered, max_span_ratio
+
+
+def _checkbox_difference_features(
+    target_interior: np.ndarray,
+    template_interior: np.ndarray,
+) -> tuple[np.ndarray, int, float, float]:
+    """Measure locally normalized grayscale ink added after form printing."""
+    common_h = min(target_interior.shape[0], template_interior.shape[0])
+    common_w = min(target_interior.shape[1], template_interior.shape[1])
+    if common_h <= 0 or common_w <= 0:
+        return np.zeros((0, 0), np.uint8), 0, 0.0, 0.0
+
+    target = target_interior[:common_h, :common_w].astype(np.float32)
+    template = template_interior[:common_h, :common_w].astype(np.float32)
+    target_paper = float(np.percentile(target, 90))
+    template_paper = float(np.percentile(template, 90))
+    target += template_paper - target_paper
+    np.clip(target, 0.0, 255.0, out=target)
+
+    residual = template - target
+    baseline = float(np.median(residual))
+    deviation = float(np.median(np.abs(residual - baseline)))
+    noise_sigma = 1.4826 * deviation
+    threshold = max(10.0, baseline + noise_sigma * 4.0)
+    candidate = (residual >= threshold).astype(np.uint8) * 255
+    filtered, span_ratio = _filter_checkbox_mark_components(candidate)
+    residual_pixels = cv2.countNonZero(filtered)
+    if residual_pixels <= 0:
+        return filtered, 0, 0.0, span_ratio
+
+    excess = np.maximum(residual - threshold, 0.0)
+    residual_energy = float(np.sum(excess[filtered > 0]))
+    return filtered, residual_pixels, residual_energy, span_ratio
+
+
 def extract_checkbox_ink_info(
     target_gray: np.ndarray,
     box: Box,
+    template_gray: np.ndarray | None = None,
 ) -> _CheckboxInkInfo:
     """체크박스 테두리를 피한 내부의 실제 어두운 연결 성분을 측정합니다.
 
@@ -1041,24 +1308,66 @@ def extract_checkbox_ink_info(
     interior = target_gray[y1:y2, x1:x2]
     paper_level = float(np.percentile(interior, 90))
     ink_threshold = int(np.clip(paper_level - 18.0, 170.0, 225.0))
-    raw_mask = (interior < ink_threshold).astype(np.uint8)
+    raw_mask = (interior < ink_threshold).astype(np.uint8) * 255
+    component_mask, raw_span_ratio = _filter_checkbox_mark_components(raw_mask)
 
-    component_mask = np.zeros_like(raw_mask)
-    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        raw_mask, connectivity=8
+    residual_pixels = 0
+    residual_energy = 0.0
+    residual_span_ratio = 0.0
+    if template_gray is not None and template_gray.size > 0:
+        if template_gray.ndim == 3:
+            template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
+        if template_gray.shape[:2] != target_gray.shape[:2]:
+            template_gray = cv2.resize(
+                template_gray,
+                (target_gray.shape[1], target_gray.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+        template_box, _ = _refine_checkbox_box(template_gray, box)
+        template_short_side = min(template_box.w, template_box.h)
+        template_border_width = max(1, round(template_short_side * 0.1))
+        template_margin = max(
+            template_border_width + 1, round(template_short_side * 0.2)
+        )
+        tx1 = max(0, template_box.x + template_margin)
+        ty1 = max(0, template_box.y + template_margin)
+        tx2 = min(
+            template_gray.shape[1], template_box.x + template_box.w - template_margin
+        )
+        ty2 = min(
+            template_gray.shape[0], template_box.y + template_box.h - template_margin
+        )
+        if tx2 > tx1 and ty2 > ty1:
+            difference_mask, residual_pixels, residual_energy, residual_span_ratio = (
+                _checkbox_difference_features(
+                    interior,
+                    template_gray[ty1:ty2, tx1:tx2],
+                )
+            )
+            if difference_mask.shape == component_mask.shape:
+                component_mask = cv2.bitwise_or(component_mask, difference_mask)
+
+    ink_pixels = cv2.countNonZero(component_mask)
+    area = int(raw_mask.size)
+    raw_fill = ink_pixels / max(1, area)
+    residual_fill = residual_pixels / max(1, area)
+    residual_energy_ratio = residual_energy / max(1.0, area * 255.0)
+    mark_strength = max(
+        raw_fill,
+        residual_fill + residual_energy_ratio * 0.75,
     )
-    min_component_area = max(2, round(raw_mask.size * 0.01))
-    for component_idx in range(1, component_count):
-        if stats[component_idx, cv2.CC_STAT_AREA] >= min_component_area:
-            component_mask[labels == component_idx] = 255
 
     return _CheckboxInkInfo(
-        cv2.countNonZero(component_mask),
-        int(raw_mask.size),
+        ink_pixels,
+        area,
         refined,
         confidence,
         (x1, y1, x2, y2),
         component_mask,
+        mark_strength,
+        residual_pixels,
+        residual_energy,
+        max(raw_span_ratio, residual_span_ratio),
     )
 
 
@@ -1233,6 +1542,30 @@ def extract_checkbox_halo_ink_info(
     return info.ink_pixels, info.area
 
 
+def _checkbox_mark_shape_spread(
+    direct_info: _CheckboxInkInfo,
+    halo_info: _CheckboxHaloInfo,
+) -> float:
+    """Return the minor/major spread ratio of a checkbox's local mark."""
+    point_sets = []
+    for info in (direct_info, halo_info):
+        ys, xs = np.nonzero(info.ink_mask)
+        if xs.size <= 0:
+            continue
+        point_sets.append(
+            np.column_stack(
+                (xs + info.mask_bounds[0], ys + info.mask_bounds[1])
+            )
+        )
+    if not point_sets:
+        return 0.0
+    points = np.unique(np.vstack(point_sets), axis=0).astype(np.float32)
+    if len(points) < 3:
+        return 0.0
+    eigenvalues = np.linalg.eigvalsh(np.cov(points, rowvar=False))
+    return float(eigenvalues[0] / max(1e-6, eigenvalues[-1]))
+
+
 def _resolve_checkbox_halo_ownership(
     pure_ink_masks: dict[int, np.ndarray],
     survey_gray_pages: dict[int, np.ndarray],
@@ -1240,12 +1573,12 @@ def _resolve_checkbox_halo_ownership(
 ) -> None:
     """Assign one connected pen stroke to its closest supported checkbox.
 
-    A long check drawn in one box can graze the border of a nearby blank box.
-    Both local halo windows then see the same connected stroke.  Resolve that
-    ambiguity page-wide: prefer a box with clear interior ink, otherwise keep
-    the box containing the larger share of the external stroke.  Only nearby
-    boxes compete, so unrelated marks connected through form lines cannot
-    suppress one another across the page.
+    A long check drawn in one box can pass through a nearby blank box.  Both
+    local windows then see the same connected stroke.  Resolve that ambiguity
+    page-wide: prefer the box with stronger local evidence, but retain another
+    box when it has both comparable support and a bent, two-dimensional local
+    mark of its own.  Only nearby boxes compete, so unrelated marks connected
+    through form lines cannot suppress one another across the page.
     """
     by_page: dict[
         int, list[tuple[_CheckboxInkInfo, bool, _CheckboxHaloInfo]]
@@ -1413,6 +1746,7 @@ def _resolve_checkbox_halo_ownership(
                     winner_box.w,
                     winner_box.h,
                 )
+                winner_component_support = counts_by_candidate[winner_idx]
                 for loser_idx in cluster:
                     loser_box = page_candidates[loser_idx][0].box
                     loser_key = (
@@ -1422,11 +1756,64 @@ def _resolve_checkbox_halo_ownership(
                         loser_box.h,
                     )
                     if loser_key != winner_key:
+                        _direct_info, direct_is_checked, _halo_info = (
+                            page_candidates[loser_idx]
+                        )
+                        has_own_mark_shape = (
+                            direct_is_checked
+                            and counts_by_candidate[loser_idx]
+                            >= max(
+                                12,
+                                round(
+                                    winner_component_support
+                                    * _SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO
+                                ),
+                            )
+                            and _checkbox_mark_shape_spread(
+                                _direct_info, _halo_info
+                            )
+                            >= _SHARED_STROKE_MIN_SHAPE_SPREAD
+                        )
+                        if has_own_mark_shape:
+                            continue
                         labels_to_remove.setdefault(loser_idx, set()).add(
                             component_label
                         )
 
         for candidate_idx, component_labels in labels_to_remove.items():
+            direct_info = page_candidates[candidate_idx][0]
+            direct_x1, direct_y1, direct_x2, direct_y2 = direct_info.mask_bounds
+            direct_label_roi = labels[
+                direct_y1:direct_y2, direct_x1:direct_x2
+            ]
+            if direct_label_roi.shape == direct_info.ink_mask.shape:
+                direct_remove = np.isin(
+                    direct_label_roi, list(component_labels)
+                )
+                old_direct_ink = direct_info.ink_pixels
+                direct_info.ink_mask[direct_remove] = 0
+                direct_info.ink_pixels = cv2.countNonZero(
+                    direct_info.ink_mask
+                )
+                if old_direct_ink > 0:
+                    remaining_ratio = direct_info.ink_pixels / old_direct_ink
+                    direct_info.mark_strength *= remaining_ratio
+                    direct_info.residual_pixels = min(
+                        direct_info.ink_pixels,
+                        round(direct_info.residual_pixels * remaining_ratio),
+                    )
+                    direct_info.residual_energy *= remaining_ratio
+                if direct_info.ink_pixels <= 0:
+                    direct_info.stroke_span_ratio = 0.0
+                else:
+                    points = cv2.findNonZero(direct_info.ink_mask)
+                    if points is not None:
+                        _x, _y, width, height = cv2.boundingRect(points)
+                        direct_info.stroke_span_ratio = max(
+                            width / max(1, direct_info.ink_mask.shape[1]),
+                            height / max(1, direct_info.ink_mask.shape[0]),
+                        )
+
             halo_info = page_candidates[candidate_idx][2]
             x1, y1, x2, y2 = halo_info.mask_bounds
             label_roi = labels[y1:y2, x1:x2]
@@ -1469,11 +1856,43 @@ def evaluate_marks(
 
 
 def evaluate_checkbox_marks(
-    inks: list[int], areas: list[int], strict: bool = False
+    inks: list[int],
+    areas: list[int],
+    strict: bool = False,
+    strengths: list[float] | None = None,
 ) -> list[bool]:
     """인쇄선이 제외된 체크박스 내부 점수를 평가합니다."""
     if not inks:
         return []
+
+    if strengths is not None and len(strengths) == len(inks):
+        normalized = [max(0.0, float(value)) for value in strengths]
+        if strict:
+            # Multiple responses must not be suppressed merely because another
+            # option contains a much darker check.
+            threshold = 0.025
+        elif len(normalized) > 2:
+            ordered = sorted(normalized)
+            blank_pool = ordered[: max(1, len(ordered) // 2)]
+            blank_level = float(np.median(blank_pool)) if blank_pool else 0.0
+            threshold = max(0.025, blank_level + 0.012)
+        else:
+            threshold = 0.025
+        minimum_evidence = [
+            max(
+                _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS,
+                round(area * 0.025),
+            )
+            if area > 0
+            else _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS
+            for area in areas
+        ]
+        return [
+            strength >= threshold and ink >= required
+            for strength, ink, required in zip(
+                normalized, inks, minimum_evidence
+            )
+        ]
 
     max_ink = max(inks)
     # 복수응답은 후보를 사후에 하나로 줄이지 않으므로 오히려 더 엄격해야 합니다.
@@ -1587,6 +2006,63 @@ def _cancellation_runner_up_index(
     ):
         return None
     return runner_up_idx
+
+
+def _local_mark_bbox_density(mask: np.ndarray) -> float:
+    if mask.size == 0:
+        return 0.0
+    points = cv2.findNonZero(mask)
+    if points is None:
+        return 0.0
+    _x, _y, width, height = cv2.boundingRect(points)
+    return cv2.countNonZero(mask) / max(1, width * height)
+
+
+def _checkbox_cancellation_runner_up_index(
+    checkbox_infos: list[_CheckboxInkInfo],
+    halo_infos: list[_CheckboxHaloInfo],
+    check_results: list[bool],
+) -> int | None:
+    """Recognize a dense crossed-out small box followed by one normal check."""
+    if not (
+        len(checkbox_infos) == len(halo_infos) == len(check_results)
+    ):
+        return None
+    candidates = [
+        index for index, is_checked in enumerate(check_results) if is_checked
+    ]
+    if len(candidates) != 2:
+        return None
+
+    combined_inks = [
+        checkbox_infos[index].ink_pixels + halo_infos[index].ink_pixels
+        for index in candidates
+    ]
+    ordered = sorted(
+        zip(candidates, combined_inks), key=lambda item: item[1], reverse=True
+    )
+    (top_idx, top_ink), (runner_idx, runner_ink) = ordered
+    if runner_ink <= 0 or top_ink < runner_ink * _CANCEL_MARK_MIN_INK_RATIO:
+        return None
+
+    top_info = checkbox_infos[top_idx]
+    runner_info = checkbox_infos[runner_idx]
+    top_fill = top_info.ink_pixels / max(1, top_info.area)
+    runner_fill = runner_info.ink_pixels / max(1, runner_info.area)
+    top_density = _local_mark_bbox_density(top_info.ink_mask)
+    runner_has_stroke = (
+        runner_info.stroke_span_ratio >= 0.35
+        or halo_infos[runner_idx].ink_pixels >= 12
+    )
+    if (
+        top_fill < 0.18
+        or top_density < 0.28
+        or runner_fill > 0.22
+        or runner_info.mark_strength < 0.025
+        or not runner_has_stroke
+    ):
+        return None
+    return runner_idx
 
 
 def _label_number(total: int, index: int, reverse: bool) -> int:
@@ -2645,6 +3121,10 @@ def process_survey_data(
     }
 
     pure_ink_masks = {}
+    stable_region_masks = {
+        local_p: _build_stable_region_mask(gray_img.shape, config, local_p)
+        for local_p, gray_img in survey_gray_pages.items()
+    }
     for local_p, gray_img in survey_gray_pages.items():
         if local_p in dynamic_templates:
             pure_ink_masks[local_p] = extract_pure_ink_mask(
@@ -2652,6 +3132,7 @@ def process_survey_data(
                 dynamic_templates[local_p],
                 config.template_dilate_pct,
                 template_masks.get(local_p) if template_masks else None,
+                stable_region_masks.get(local_p),
             )
 
     # 반복 응답이 중앙값 템플릿에 섞여 지워진 경우에도 검토 PDF에서 보이도록,
@@ -2675,18 +3156,26 @@ def process_survey_data(
             continue
 
         checkbox_infos = [
-            extract_checkbox_ink_info(survey_gray_pages[box.page_idx], box)
+            extract_checkbox_ink_info(
+                survey_gray_pages[box.page_idx],
+                box,
+                dynamic_templates.get(box.page_idx),
+            )
             for box in scoring_boxes
         ]
         direct_inks = [info.ink_pixels for info in checkbox_infos]
         direct_areas = [info.area for info in checkbox_infos]
+        direct_strengths = [info.mark_strength for info in checkbox_infos]
         reliable_direct = [
             trust_checkbox_layout
             or info.border_confidence >= _CHECKBOX_MIN_BORDER_CONFIDENCE
             for info in checkbox_infos
         ]
         direct_results = evaluate_checkbox_marks(
-            direct_inks, direct_areas, strict=field.allow_duplicates
+            direct_inks,
+            direct_areas,
+            strict=field.allow_duplicates,
+            strengths=direct_strengths,
         )
         direct_results = [
             is_checked and is_reliable
@@ -2719,6 +3208,7 @@ def process_survey_data(
             reliable_direct,
             direct_inks,
             direct_areas,
+            direct_strengths,
             direct_results,
             halo_infos,
         )
@@ -2727,6 +3217,26 @@ def process_survey_data(
     _resolve_checkbox_halo_ownership(
         pure_ink_masks, survey_gray_pages, ownership_candidates
     )
+    for plan_idx, checkbox_analysis in checkbox_analyses.items():
+        field = plans[plan_idx][0]
+        checkbox_analysis.direct_inks = [
+            info.ink_pixels for info in checkbox_analysis.checkbox_infos
+        ]
+        checkbox_analysis.direct_strengths = [
+            info.mark_strength for info in checkbox_analysis.checkbox_infos
+        ]
+        refreshed_results = evaluate_checkbox_marks(
+            checkbox_analysis.direct_inks,
+            checkbox_analysis.direct_areas,
+            strict=field.allow_duplicates,
+            strengths=checkbox_analysis.direct_strengths,
+        )
+        checkbox_analysis.direct_results = [
+            is_checked and is_reliable
+            for is_checked, is_reliable in zip(
+                refreshed_results, checkbox_analysis.reliable_direct
+            )
+        ]
 
     for plan_idx, (field, scoring_boxes, working_boxes, is_contiguous) in enumerate(
         plans
@@ -2740,6 +3250,7 @@ def process_survey_data(
         direct_inks: list[int] = []
         direct_areas: list[int] = []
         direct_results: list[bool] = []
+        direct_strengths: list[float] = []
         halo_inks: list[int] = []
         halo_areas: list[int] = []
         reliable_direct: list[bool] = []
@@ -2749,6 +3260,7 @@ def process_survey_data(
             reliable_direct = checkbox_analysis.reliable_direct
             direct_inks = checkbox_analysis.direct_inks
             direct_areas = checkbox_analysis.direct_areas
+            direct_strengths = checkbox_analysis.direct_strengths
             direct_results = checkbox_analysis.direct_results
             halo_infos = checkbox_analysis.halo_infos
             halo_inks = [info.ink_pixels for info in halo_infos]
@@ -2838,20 +3350,34 @@ def process_survey_data(
 
         if not field.allow_duplicates:
             if checkbox_mode and sum(check_results) > 1:
-                checked_indices = [
-                    index for index, is_checked in enumerate(check_results) if is_checked
-                ]
-                best_idx = max(
-                    checked_indices,
-                    key=lambda index: (
-                        direct_inks[index] * 3 + halo_inks[index],
-                        direct_inks[index] / max(1, direct_areas[index]),
-                        halo_inks[index] / max(1, halo_areas[index]),
-                    ),
+                correction_idx = _checkbox_cancellation_runner_up_index(
+                    checkbox_infos,
+                    halo_infos,
+                    check_results,
                 )
-                check_results = [
-                    index == best_idx for index in range(len(check_results))
-                ]
+                if correction_idx is not None:
+                    check_results = [
+                        index == correction_idx
+                        for index in range(len(check_results))
+                    ]
+                else:
+                    checked_indices = [
+                        index
+                        for index, is_checked in enumerate(check_results)
+                        if is_checked
+                    ]
+                    best_idx = max(
+                        checked_indices,
+                        key=lambda index: (
+                            direct_strengths[index],
+                            direct_inks[index] * 3 + halo_inks[index],
+                            direct_inks[index] / max(1, direct_areas[index]),
+                            halo_inks[index] / max(1, halo_areas[index]),
+                        ),
+                    )
+                    check_results = [
+                        index == best_idx for index in range(len(check_results))
+                    ]
             else:
                 correction_idx = None
                 if not checkbox_mode:
@@ -3019,6 +3545,19 @@ def _estimate_template_memory_bytes(
     return peak_bytes + (max(pixels, default=0) * 4) + 64 * _MIB
 
 
+def _build_page_aligners(
+    alignment_references: list[np.ndarray],
+    config: TemplatePreset,
+) -> list[ImageAligner]:
+    return [
+        ImageAligner(
+            reference,
+            stable_mask=_build_stable_region_mask(reference.shape, config, page_idx),
+        )
+        for page_idx, reference in enumerate(alignment_references)
+    ]
+
+
 # ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
 def _collect_template_samples(
     fpath: str,
@@ -3038,7 +3577,7 @@ def _collect_template_samples(
         return _file_key(fpath), {}
 
     page_count = config.page_count
-    aligners = [ImageAligner(reference) for reference in alignment_references]
+    aligners = _build_page_aligners(alignment_references, config)
     if not aligners:
         doc.close()
         raise RuntimeError("페이지 정합 기준 이미지가 없습니다.")
@@ -3157,7 +3696,7 @@ def _analyze_single_file(
         out_orig = fitz.open()
         out_ink = fitz.open()
         survey_count = _survey_count(len(doc), config.page_count)
-        aligners = [ImageAligner(reference) for reference in alignment_references]
+        aligners = _build_page_aligners(alignment_references, config)
         if not aligners:
             raise RuntimeError("페이지 정합 기준 이미지가 없습니다.")
         f_template = file_template or reference_templates
@@ -3479,7 +4018,9 @@ def run_analysis(
                         f"{file_label}: 동적 템플릿 생성 중 · "
                         f"파일 {index + 1}/{num_files}"
                     )
-                    file_template = generate_dynamic_templates(sample_pages)
+                    file_template = generate_dynamic_templates(
+                        sample_pages, config=config
+                    )
             except ResourceUnavailableError:
                 raise
             except Exception as e:

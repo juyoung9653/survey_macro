@@ -9,6 +9,7 @@ from src.processor import (
     _CheckboxHaloInfo,
     _CheckboxInkInfo,
     _align_template_mask_by_coverage,
+    _build_stable_region_mask,
     _checkbox_layout_is_trustworthy,
     _extract_checkbox_halo_info,
     _refine_checkbox_box,
@@ -141,6 +142,26 @@ class TemplateAlignmentTests(unittest.TestCase):
         find_ecc.assert_not_called()
         self.assertTrue(np.array_equal(aligned, reference))
 
+    def test_image_aligner_rejects_catastrophic_affine_matches(self):
+        aligner = ImageAligner(_make_form(), refine_ecc=False)
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        mirrored = np.array(
+            [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        oversized = np.array(
+            [[1.6, 0.0, 0.0], [0.0, 1.6, 0.0]], dtype=np.float32
+        )
+        far_away = np.array(
+            [[1.0, 0.0, 100.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+
+        self.assertTrue(aligner._is_plausible_affine(identity))
+        self.assertFalse(aligner._is_plausible_affine(mirrored))
+        self.assertFalse(aligner._is_plausible_affine(oversized))
+        self.assertFalse(aligner._is_plausible_affine(far_away))
+
     def test_image_aligner_scales_large_ecc_inputs_and_restores_translation(self):
         reference = cv2.resize(_make_form(), (1000, 2000), interpolation=cv2.INTER_LINEAR)
         target_to_ref = np.array(
@@ -247,6 +268,38 @@ class TemplateAlignmentTests(unittest.TestCase):
         )
         self.assertEqual(empty_halo, 0)
         self.assertGreater(marked_halo, 5)
+
+    def test_checkbox_direct_scoring_rejects_compact_four_pixel_dust(self):
+        box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        template = np.full((170, 250), 255, np.uint8)
+        cv2.rectangle(template, (70, 60), (94, 84), 80, 2)
+        dusty = template.copy()
+        dusty[70:72, 80:82] = 20
+        checked = template.copy()
+        cv2.line(checked, (76, 72), (81, 77), 25, 2)
+        cv2.line(checked, (81, 77), (89, 66), 25, 2)
+
+        dust_info = extract_checkbox_ink_info(dusty, box, template)
+        check_info = extract_checkbox_ink_info(checked, box, template)
+
+        self.assertEqual(dust_info.ink_pixels, 0)
+        self.assertEqual(dust_info.mark_strength, 0.0)
+        self.assertGreater(check_info.ink_pixels, 5)
+        self.assertGreater(check_info.mark_strength, 0.025)
+
+    def test_alignment_stable_mask_excludes_response_boxes_and_halo(self):
+        box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q", boxes=[box])],
+        )
+
+        mask = _build_stable_region_mask((170, 250), config, 0)
+
+        self.assertIsNotNone(mask)
+        assert mask is not None
+        self.assertEqual(int(mask[72, 82]), 0)
+        self.assertEqual(int(mask[35, 35]), 255)
 
     def test_refined_checkbox_is_reused_for_halo_scoring(self):
         expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
@@ -916,6 +969,95 @@ class TemplateAlignmentTests(unittest.TestCase):
 
         self.assertEqual(row["Q"], "actual")
 
+    def test_direct_stroke_crossing_a_blank_box_is_owned_by_the_actual_box(self):
+        upper_box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        lower_box = Box(page_idx=0, x=70, y=110, w=24, h=24)
+        template = np.full((180, 180), 255, np.uint8)
+        for box in (upper_box, lower_box):
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cv2.line(page, (75, 123), (81, 130), 30, 3)
+        cv2.line(page, (81, 130), (89, 72), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            reverse_numbering=False,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[upper_box, lower_box],
+                    value_map=["crossed-blank", "actual"],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+            trust_checkbox_layout=True,
+        )
+
+        self.assertEqual(row["Q"], "actual")
+
+    def test_connected_checks_with_substantial_local_marks_keep_both_boxes(self):
+        upper_box = Box(page_idx=0, x=70, y=60, w=24, h=24)
+        lower_box = Box(page_idx=0, x=70, y=110, w=24, h=24)
+        template = np.full((180, 180), 255, np.uint8)
+        for box in (upper_box, lower_box):
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cv2.line(page, (62, 62), (80, 78), 30, 3)
+        cv2.line(page, (80, 78), (100, 53), 30, 3)
+        cv2.line(page, (100, 53), (100, 103), 30, 3)
+        cv2.line(page, (62, 112), (80, 128), 30, 3)
+        cv2.line(page, (80, 128), (100, 103), 30, 3)
+        config = TemplatePreset(
+            page_count=1,
+            reverse_numbering=False,
+            template_dilate_pct=0.0,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[upper_box, lower_box],
+                    value_map=["upper", "lower"],
+                    allow_duplicates=True,
+                )
+            ],
+        )
+
+        row, _, _, _, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+            trust_checkbox_layout=True,
+        )
+
+        self.assertEqual(row["Q"], "upper,lower")
+
     def test_halo_stroke_can_be_owned_by_a_direct_only_neighbor(self):
         upper_box = Box(page_idx=0, x=70, y=60, w=24, h=24)
         lower_box = Box(page_idx=0, x=70, y=110, w=24, h=24)
@@ -1183,6 +1325,28 @@ class TemplateAlignmentTests(unittest.TestCase):
                 [3, 30],
                 [14 * 14, 14 * 14],
                 strict=True,
+            ),
+            [False, True],
+        )
+
+    def test_multi_response_strength_does_not_depend_on_strongest_mark(self):
+        self.assertEqual(
+            evaluate_checkbox_marks(
+                [8, 40],
+                [14 * 14, 14 * 14],
+                strict=True,
+                strengths=[0.04, 0.20],
+            ),
+            [True, True],
+        )
+
+    def test_multi_response_strength_rejects_four_pixel_residual(self):
+        self.assertEqual(
+            evaluate_checkbox_marks(
+                [4, 64],
+                [12 * 12, 12 * 12],
+                strict=True,
+                strengths=[0.02972, 0.44444],
             ),
             [False, True],
         )

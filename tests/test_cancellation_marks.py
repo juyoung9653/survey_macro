@@ -136,6 +136,67 @@ class CancellationMarkTests(unittest.TestCase):
             [False, False, True, False, False],
         )
 
+    def test_process_survey_uses_runner_up_for_small_checkbox_correction(self):
+        template = np.full((220, 400), 255, np.uint8)
+        boxes = [Box(0, x, 90, 24, 24) for x in (50, 120, 190)]
+        for box in boxes:
+            cv2.rectangle(
+                template,
+                (box.x, box.y),
+                (box.x + box.w, box.y + box.h),
+                80,
+                2,
+            )
+
+        page = template.copy()
+        cancelled = boxes[0]
+        for offset in (2, 8, 14):
+            cv2.line(
+                page,
+                (cancelled.x + 2, cancelled.y + offset),
+                (cancelled.x + cancelled.w - 2, cancelled.y + cancelled.h - offset),
+                20,
+                3,
+            )
+        intended = boxes[1]
+        cv2.line(
+            page,
+            (intended.x + 4, intended.y + 13),
+            (intended.x + 10, intended.y + 19),
+            20,
+            3,
+        )
+        cv2.line(
+            page,
+            (intended.x + 10, intended.y + 19),
+            (intended.x + 21, intended.y + 4),
+            20,
+            3,
+        )
+        config = TemplatePreset(
+            page_count=1,
+            reverse_numbering=False,
+            template_dilate_pct=0.0,
+            fields=[Field(name="Q", boxes=boxes)],
+        )
+
+        row, _, _, annotations, _, _ = process_survey_data(
+            {
+                "fname": "sample",
+                "row_title": "sample_1p",
+                "gray_pages": {0: page},
+            },
+            config,
+            {0: template},
+            trust_checkbox_layout=True,
+        )
+
+        self.assertEqual(row["Q"], "2")
+        self.assertEqual(
+            [annotation[-1] for annotation in annotations[0]],
+            [False, True, False],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

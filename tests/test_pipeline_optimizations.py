@@ -16,9 +16,12 @@ from src.processor import (
     _load_ui_template_cache,
     _median_uint8_inplace,
     _save_ui_template_cache,
+    extract_ink_info_from_mask,
+    extract_pure_ink_mask,
+    generate_dynamic_templates,
     run_analysis,
 )
-from src.models import TemplatePreset
+from src.models import Box, Field, TemplatePreset
 from src.vision import load_pdf_pages
 
 
@@ -49,6 +52,99 @@ class PipelineOptimizationTests(unittest.TestCase):
                 actual = _median_uint8_inplace(stack.copy())
 
                 self.assertTrue(np.array_equal(actual, expected))
+
+    def test_response_aware_template_does_not_absorb_majority_mark(self):
+        blank = np.full((160, 240), 255, np.uint8)
+        box = Box(page_idx=0, x=30, y=60, w=160, h=40)
+        cv2.rectangle(blank, (30, 60), (190, 100), 0, 2)
+        marked = blank.copy()
+        cv2.line(marked, (80, 90), (120, 70), 0, 5)
+        samples = [marked.copy() for _ in range(16)] + [
+            blank.copy() for _ in range(15)
+        ]
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q", boxes=[box])],
+        )
+
+        ordinary = generate_dynamic_templates({0: [item.copy() for item in samples]})[0]
+        cleaned = generate_dynamic_templates(
+            {0: [item.copy() for item in samples]}, config=config
+        )[0]
+        ordinary_ink = extract_pure_ink_mask(marked, ordinary, 0.0)
+        cleaned_ink = extract_pure_ink_mask(marked, cleaned, 0.0)
+        ordinary_score, _ = extract_ink_info_from_mask(ordinary_ink, box)
+        cleaned_score, _ = extract_ink_info_from_mask(cleaned_ink, box)
+
+        self.assertEqual(ordinary_score, 0)
+        self.assertGreater(cleaned_score, 50)
+
+    def test_response_aware_template_leaves_comment_regions_on_median(self):
+        blank = np.full((160, 240), 255, np.uint8)
+        box = Box(page_idx=0, x=30, y=60, w=160, h=40)
+        cv2.rectangle(blank, (30, 60), (190, 100), 0, 2)
+        marked = blank.copy()
+        cv2.line(marked, (80, 90), (120, 70), 0, 5)
+        samples = [marked.copy() for _ in range(16)] + [
+            blank.copy() for _ in range(15)
+        ]
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="comment", boxes=[box], is_comment=True)],
+        )
+
+        ordinary = generate_dynamic_templates({0: [item.copy() for item in samples]})[0]
+        cleaned = generate_dynamic_templates(
+            {0: [item.copy() for item in samples]}, config=config
+        )[0]
+
+        self.assertTrue(np.array_equal(cleaned, ordinary))
+
+    def test_response_aware_template_preserves_large_response_box_borders(self):
+        box = Box(page_idx=0, x=30, y=60, w=160, h=40)
+        samples = []
+        for index in range(31):
+            page = np.full((160, 240), 255, np.uint8)
+            shift = (index % 5) - 2
+            cv2.rectangle(page, (30 + shift, 60), (190 + shift, 100), 0, 2)
+            if index < 16:
+                cv2.line(page, (80 + shift, 90), (120 + shift, 70), 0, 5)
+            samples.append(page)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q", boxes=[box])],
+        )
+
+        cleaned = generate_dynamic_templates(
+            {0: [item.copy() for item in samples]}, config=config
+        )[0]
+        blank_ink = extract_pure_ink_mask(samples[19], cleaned, 0.0)
+        blank_score, _ = extract_ink_info_from_mask(blank_ink, box)
+
+        self.assertEqual(blank_score, 0)
+
+    def test_response_aware_template_preserves_internal_printed_grid_rules(self):
+        box = Box(page_idx=0, x=30, y=50, w=170, h=70)
+        samples = []
+        for index in range(31):
+            page = np.full((170, 240), 255, np.uint8)
+            shift = (index % 5) - 2
+            cv2.line(page, (95 + shift, 50), (95 + shift, 120), 0, 2)
+            if index < 16:
+                cv2.line(page, (140, 100), (175, 70), 0, 5)
+            samples.append(page)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q", boxes=[box])],
+        )
+
+        cleaned = generate_dynamic_templates(
+            {0: [item.copy() for item in samples]}, config=config
+        )[0]
+        blank_ink = extract_pure_ink_mask(samples[19], cleaned, 0.0)
+        blank_score, _ = extract_ink_info_from_mask(blank_ink, box)
+
+        self.assertEqual(blank_score, 0)
 
     def test_selected_pdf_pages_preserve_order_and_duplicates(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -130,7 +226,7 @@ class PipelineOptimizationTests(unittest.TestCase):
             events.append(("collect", fpath))
             return _file_key(fpath), sample_sets[fpath]
 
-        def build_template(samples):
+        def build_template(samples, **_kwargs):
             path = sample_names[id(samples)]
             events.append(("template", path))
             shade = 200 - file_paths.index(path) * 20
