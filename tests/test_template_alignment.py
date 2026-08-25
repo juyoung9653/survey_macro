@@ -9,6 +9,7 @@ from src.processor import (
     _CheckboxHaloInfo,
     _CheckboxInkInfo,
     _align_template_mask_by_coverage,
+    _best_shift_by_correlation,
     _build_stable_region_mask,
     _checkbox_layout_is_trustworthy,
     _extract_checkbox_halo_info,
@@ -44,6 +45,35 @@ def _overlap(first: np.ndarray, second: np.ndarray) -> int:
 
 
 class TemplateAlignmentTests(unittest.TestCase):
+    def test_correlation_shift_handles_sparse_and_empty_masks(self):
+        template = np.zeros((50, 60), np.uint8)
+        template[10:20, 15:30] = 255
+        target = np.zeros_like(template)
+        target[13:23, 11:26] = 255
+        max_shift = 6
+        padded_target = cv2.copyMakeBorder(
+            target,
+            max_shift,
+            max_shift,
+            max_shift,
+            max_shift,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+
+        result = _best_shift_by_correlation(
+            template,
+            padded_target,
+            max_shift,
+            cv2.countNonZero(template),
+        )
+        empty_result = _best_shift_by_correlation(
+            np.zeros_like(template), padded_target, max_shift, 0
+        )
+
+        self.assertEqual(result, (150.0, 150, -4, 3))
+        self.assertEqual(empty_result, (float("-inf"), 0, 0, 0))
+
     def test_identity_alignment_is_unchanged(self):
         template = _dark_mask(_make_form())
 
@@ -84,7 +114,7 @@ class TemplateAlignmentTests(unittest.TestCase):
             return 600.0, 600, 1, 0
 
         with patch(
-            "src.processor._best_shift_by_correlation",
+            "src.mark_analysis._best_shift_by_correlation",
             side_effect=fake_best_shift,
         ):
             _align_template_mask_by_coverage(template, target)
@@ -110,7 +140,7 @@ class TemplateAlignmentTests(unittest.TestCase):
             return 600.0, 600, 1, 0
 
         with patch(
-            "src.processor._best_shift_by_correlation",
+            "src.mark_analysis._best_shift_by_correlation",
             side_effect=fake_best_shift,
         ):
             _align_template_mask_by_coverage(template, target)
@@ -444,7 +474,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         pure_ink = _dark_mask(page)
 
         with patch(
-            "src.processor._refine_checkbox_box",
+            "src.mark_analysis._refine_checkbox_box",
             wraps=_refine_checkbox_box,
         ) as refine:
             direct_info = extract_checkbox_ink_info(page, expected)
