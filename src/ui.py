@@ -1964,7 +1964,11 @@ class MainWindow(QMainWindow):
         if success:
             elapsed = self._analysis_elapsed_text or "00:00"
             QMessageBox.information(
-                self, "완료", f"분석이 완료되었습니다.\n\n총 소요 시간: {elapsed}"
+                self,
+                "완료",
+                "분석이 완료되었습니다.\n\n"
+                "결과는 실행 파일 옆 '결과' 폴더에 저장되었습니다.\n\n"
+                f"총 소요 시간: {elapsed}",
             )
         elif error_message:
             elapsed_suffix = (

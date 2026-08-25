@@ -76,6 +76,7 @@ class AnalysisProgressTests(unittest.TestCase):
                             (float(value), message)
                         ),
                         resource_controller=_ResourceControllerStub(),
+                        output_base_dir=temp_dir,
                     )
             finally:
                 os.chdir(previous_cwd)

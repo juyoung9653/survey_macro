@@ -23,6 +23,17 @@ class ResourceStatus:
     external_cpu_fraction: float
     available_memory_bytes: int
     reserve_memory_bytes: int
+    safety_memory_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class ParallelResourcePlan:
+    worker_count: int
+    opencv_threads: int
+    total_cpu_threads: int
+    external_cpu_fraction: float
+    available_memory_bytes: int
+    reserve_memory_bytes: int
 
 
 class ResourceUnavailableError(RuntimeError):
@@ -165,9 +176,10 @@ class AdaptiveResourceController:
 
     def __init__(
         self,
-        reserve_fraction: float = 0.25,
-        resume_fraction: float = 0.32,
-        safety_fraction: float = 0.02,
+        cpu_reserve_fraction: float = 0.05,
+        memory_reserve_fraction: float = 0.05,
+        memory_resume_fraction: float = 0.10,
+        memory_safety_fraction: float = 0.0,
         max_wait_seconds: float = 120.0,
         poll_interval: float = 0.5,
         cpu_count: int | None = None,
@@ -175,25 +187,35 @@ class AdaptiveResourceController:
         external_cpu_provider: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
     ):
-        if not 0.0 < reserve_fraction < 1.0:
-            raise ValueError("reserve_fraction must be between 0 and 1")
-        if not reserve_fraction < resume_fraction < 1.0:
-            raise ValueError("resume_fraction must exceed reserve_fraction")
+        if not 0.0 < cpu_reserve_fraction < 1.0:
+            raise ValueError("cpu_reserve_fraction must be between 0 and 1")
+        if not 0.0 < memory_reserve_fraction < 1.0:
+            raise ValueError("memory_reserve_fraction must be between 0 and 1")
+        if not memory_reserve_fraction < memory_resume_fraction < 1.0:
+            raise ValueError(
+                "memory_resume_fraction must exceed memory_reserve_fraction"
+            )
 
-        self.reserve_fraction = reserve_fraction
-        self.resume_fraction = resume_fraction
-        self.safety_fraction = max(0.0, safety_fraction)
+        self.cpu_reserve_fraction = cpu_reserve_fraction
+        self.memory_reserve_fraction = memory_reserve_fraction
+        self.memory_resume_fraction = memory_resume_fraction
+        self.memory_safety_fraction = max(0.0, memory_safety_fraction)
         self.max_wait_seconds = max(0.0, max_wait_seconds)
         self.poll_interval = max(0.05, poll_interval)
         self.cpu_count = max(1, cpu_count or os.cpu_count() or 1)
         self.max_opencv_threads = max(
-            1, math.floor(self.cpu_count * (1.0 - reserve_fraction))
+            1,
+            min(
+                self.cpu_count,
+                math.ceil(self.cpu_count * (1.0 - cpu_reserve_fraction)),
+            ),
         )
         self._memory_provider = memory_provider or get_memory_snapshot
         self._external_cpu_provider = external_cpu_provider or ExternalCpuSampler()
         self._sleep = sleep_fn
         self._previous_opencv_threads: int | None = None
         self._current_opencv_threads: int | None = None
+        self._thread_credit = 0.0
 
     def __enter__(self):
         self.start()
@@ -206,6 +228,7 @@ class AdaptiveResourceController:
         if self._previous_opencv_threads is not None:
             return
         self._previous_opencv_threads = max(1, cv2.getNumThreads())
+        self._thread_credit = 0.0
         self._external_cpu_provider()  # prime delta-based samplers
         self._set_opencv_threads(self.max_opencv_threads)
 
@@ -233,18 +256,25 @@ class AdaptiveResourceController:
         while True:
             memory = self._memory_provider()
             external_cpu = min(1.0, max(0.0, self._external_cpu_provider()))
-            reserve_bytes = math.ceil(memory.total_bytes * self.reserve_fraction)
-            safety_bytes = math.ceil(memory.total_bytes * self.safety_fraction)
+            reserve_bytes = math.ceil(
+                memory.total_bytes * self.memory_reserve_fraction
+            )
+            safety_bytes = math.ceil(
+                memory.total_bytes * self.memory_safety_fraction
+            )
+            # The predicted allocation is added before work starts so the
+            # configured reserve remains after that work has claimed memory.
             start_threshold = reserve_bytes + safety_bytes + required_memory_bytes
             resume_threshold = max(
                 start_threshold,
-                math.ceil(memory.total_bytes * self.resume_fraction),
+                math.ceil(memory.total_bytes * self.memory_resume_fraction),
             )
             memory_threshold = resume_threshold if memory_paused else start_threshold
 
             minimum_thread_fraction = 1.0 / self.cpu_count
             cpu_pause_threshold = max(
-                0.0, 1.0 - self.reserve_fraction - minimum_thread_fraction
+                0.0,
+                1.0 - self.cpu_reserve_fraction - minimum_thread_fraction,
             )
             cpu_resume_threshold = max(0.0, cpu_pause_threshold - 0.05)
             current_cpu_threshold = (
@@ -256,20 +286,20 @@ class AdaptiveResourceController:
             if not memory_blocked and not cpu_blocked:
                 available_for_app = max(
                     minimum_thread_fraction,
-                    1.0 - self.reserve_fraction - external_cpu,
+                    1.0 - self.cpu_reserve_fraction - external_cpu,
                 )
-                desired_threads = math.floor(
-                    self.cpu_count * available_for_app + 1e-9
+                target_threads = min(
+                    float(self.max_opencv_threads),
+                    self.cpu_count * available_for_app,
                 )
-                desired_threads = min(
-                    self.max_opencv_threads, max(1, desired_threads)
-                )
+                desired_threads = self._budgeted_thread_count(target_threads)
                 self._set_opencv_threads(desired_threads)
                 return ResourceStatus(
                     desired_threads,
                     external_cpu,
                     memory.available_bytes,
                     reserve_bytes,
+                    safety_bytes,
                 )
 
             memory_paused = memory_paused or memory_blocked
@@ -284,6 +314,73 @@ class AdaptiveResourceController:
             if status_cb:
                 status_cb(f"{stage}: 시스템 여유 확보 중...")
             self._sleep(self.poll_interval)
+
+    def parallel_checkpoint(
+        self,
+        required_memory_per_worker_bytes: int,
+        pending_tasks: int,
+        stage: str = "분석",
+        status_cb: Callable[[str], None] | None = None,
+    ) -> ParallelResourcePlan:
+        """Allocate work slots and OpenCV threads from current CPU/RAM headroom.
+
+        The plan is recalculated only at safe batch boundaries. Callers must let
+        the current batch finish before requesting another plan because OpenCV's
+        thread limit is process-global.
+        """
+        pending_tasks = max(1, int(pending_tasks))
+        required_memory_per_worker_bytes = max(
+            0, int(required_memory_per_worker_bytes)
+        )
+        status = self.checkpoint(
+            required_memory_per_worker_bytes,
+            stage=stage,
+            status_cb=status_cb,
+        )
+        total_cpu_threads = max(1, status.opencv_threads)
+        if required_memory_per_worker_bytes == 0:
+            memory_slots = pending_tasks
+        else:
+            memory_headroom = max(
+                0,
+                status.available_memory_bytes
+                - status.reserve_memory_bytes
+                - status.safety_memory_bytes,
+            )
+            memory_slots = max(
+                1, memory_headroom // required_memory_per_worker_bytes
+            )
+
+        worker_count = max(
+            1,
+            min(pending_tasks, total_cpu_threads, memory_slots),
+        )
+        opencv_threads = max(1, total_cpu_threads // worker_count)
+        self._set_opencv_threads(opencv_threads)
+        return ParallelResourcePlan(
+            worker_count=worker_count,
+            opencv_threads=opencv_threads,
+            total_cpu_threads=total_cpu_threads,
+            external_cpu_fraction=status.external_cpu_fraction,
+            available_memory_bytes=status.available_memory_bytes,
+            reserve_memory_bytes=status.reserve_memory_bytes,
+        )
+
+    def _budgeted_thread_count(self, target_threads: float) -> int:
+        """Approximate fractional CPU capacity across work checkpoints."""
+        target_threads = max(
+            1.0, min(float(self.max_opencv_threads), float(target_threads))
+        )
+        base_threads = max(1, math.floor(target_threads + 1e-9))
+        fractional = max(0.0, target_threads - base_threads)
+        self._thread_credit += fractional
+        if (
+            self._thread_credit >= 1.0 - 1e-9
+            and base_threads < self.max_opencv_threads
+        ):
+            self._thread_credit -= 1.0
+            return base_threads + 1
+        return base_threads
 
     def _set_opencv_threads(self, thread_count: int) -> None:
         thread_count = max(1, int(thread_count))

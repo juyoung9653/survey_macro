@@ -1,7 +1,10 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -9,12 +12,14 @@ import fitz
 import numpy as np
 
 from src.processor import (
+    _analyze_single_file,
     _build_file_labels,
     _build_file_templates,
     _decode_sampled_survey,
     _file_key,
     _load_ui_template_cache,
     _median_uint8_inplace,
+    _sampled_survey_is_available,
     _save_ui_template_cache,
     extract_ink_info_from_mask,
     extract_pure_ink_mask,
@@ -187,6 +192,105 @@ class PipelineOptimizationTests(unittest.TestCase):
             _decode_sampled_survey(samples, survey_idx=2, expected_pages=1)
         )
 
+    def test_sample_availability_requires_every_expected_page(self):
+        samples = {0: [b"first", b"second"], 1: [b"first"]}
+
+        self.assertTrue(_sampled_survey_is_available(samples, 0, 2))
+        self.assertFalse(_sampled_survey_is_available(samples, 1, 2))
+        self.assertFalse(_sampled_survey_is_available(samples, 0, 0))
+
+    def test_file_analysis_uses_dynamic_plan_and_preserves_survey_order(self):
+        class ParallelControllerStub:
+            cpu_count = 8
+
+            def __init__(self):
+                self.pending_tasks = []
+                self.checkpoints = []
+
+            def parallel_checkpoint(
+                self,
+                _required_memory,
+                pending_tasks,
+                stage="",
+                status_cb=None,
+            ):
+                self.pending_tasks.append(pending_tasks)
+                return SimpleNamespace(worker_count=pending_tasks)
+
+            def checkpoint(
+                self, required_memory_bytes=0, stage="", status_cb=None
+            ):
+                self.checkpoints.append((required_memory_bytes, stage))
+
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def process_survey(survey_data, *_args, **_kwargs):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with active_lock:
+                active -= 1
+            title = survey_data["row_title"]
+            return (
+                {"파일명": "sample", "페이지": title, "Q": title},
+                {},
+                {},
+                {},
+                {},
+                {},
+            )
+
+        encoded_page = cv2.imencode(
+            ".png", np.full((30, 20), 255, np.uint8)
+        )[1].tobytes()
+        sample_pages = {0: [encoded_page] * 4}
+        config = TemplatePreset(page_count=1)
+        controller = ParallelControllerStub()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "sample.pdf"
+            document = fitz.open()
+            for _ in range(4):
+                document.new_page(width=20, height=30)
+            document.save(pdf_path)
+            document.close()
+
+            template = {0: np.full((30, 20), 255, np.uint8)}
+            with (
+                patch("src.processor._build_page_aligners", return_value=[object()]),
+                patch("src.processor._remap_checkbox_layout", return_value=config),
+                patch(
+                    "src.processor._checkbox_layout_is_trustworthy",
+                    return_value=True,
+                ),
+                patch("src.processor._prepare_field_plans", return_value=[]),
+                patch("src.processor.process_survey_data", side_effect=process_survey),
+            ):
+                _, rows, comments = _analyze_single_file(
+                    str(pdf_path),
+                    "sample",
+                    config,
+                    template,
+                    template,
+                    [template[0]],
+                    Path(temp_dir),
+                    sample_pages=sample_pages,
+                    resource_controller=controller,
+                )
+
+        self.assertGreater(max_active, 1)
+        self.assertEqual(controller.pending_tasks, [4])
+        self.assertEqual(controller.checkpoints, [])
+        self.assertEqual(
+            [row["페이지"] for row in rows],
+            ["sample_1p", "sample_2p", "sample_3p", "sample_4p"],
+        )
+        self.assertEqual(comments, [])
+
     def test_batch_templates_keep_their_existing_alignment(self):
         first_path = "first.pdf"
         second_path = "second.pdf"
@@ -237,7 +341,7 @@ class PipelineOptimizationTests(unittest.TestCase):
             events.append(("analyze", fpath))
             return file_label, [{"파일명": file_label, "페이지": "1p"}], []
 
-        def export_rows(results, _config):
+        def export_rows(results, _config, _out_path):
             exported_rows.extend(results)
             return True
 
@@ -270,6 +374,7 @@ class PipelineOptimizationTests(unittest.TestCase):
                         [template_page],
                         config,
                         resource_controller=resource_controller,
+                        output_base_dir=temp_dir,
                     )
             finally:
                 os.chdir(previous_cwd)
@@ -324,7 +429,7 @@ class PipelineOptimizationTests(unittest.TestCase):
             events.append(("analyze", fpath, sample_pages is None))
             return file_label, [{"파일명": file_label, "페이지": "1p"}], []
 
-        def export_rows(results, _config):
+        def export_rows(results, _config, _out_path):
             exported_rows.extend(results)
             return True
 
@@ -354,6 +459,7 @@ class PipelineOptimizationTests(unittest.TestCase):
                         [np.full((8, 8), 255, np.uint8)],
                         TemplatePreset(page_count=1),
                         resource_controller=resource_controller,
+                        output_base_dir=temp_dir,
                     )
             finally:
                 os.chdir(previous_cwd)

@@ -65,6 +65,59 @@ class TemplateAlignmentTests(unittest.TestCase):
 
         self.assertGreater(_overlap(aligned, target_mask), _overlap(template, target_mask))
 
+    def test_coverage_alignment_verifies_only_confident_fine_angle_at_full_size(self):
+        template = np.zeros((1000, 700), np.uint8)
+        target = np.zeros_like(template)
+        cv2.rectangle(template, (40, 40), (300, 300), 255, -1)
+        cv2.rectangle(target, (380, 500), (640, 760), 255, -1)
+        calls = []
+
+        def fake_best_shift(mask, _target, _max_shift, _reference_pixels):
+            calls.append(max(mask.shape[:2]))
+            call_index = len(calls)
+            if call_index <= 13:
+                score = 200.0 if call_index == 7 else 100.0
+                return score, int(score), 0, 0
+            if call_index <= 16:
+                score = (300.0, 500.0, 350.0)[call_index - 14]
+                return score, int(score), 0, 0
+            return 600.0, 600, 1, 0
+
+        with patch(
+            "src.processor._best_shift_by_correlation",
+            side_effect=fake_best_shift,
+        ):
+            _align_template_mask_by_coverage(template, target)
+
+        self.assertEqual(len(calls), 17)
+        self.assertEqual(sum(size == 1000 for size in calls), 1)
+
+    def test_coverage_alignment_falls_back_when_fine_angles_are_ambiguous(self):
+        template = np.zeros((1000, 700), np.uint8)
+        target = np.zeros_like(template)
+        cv2.rectangle(template, (40, 40), (300, 300), 255, -1)
+        cv2.rectangle(target, (380, 500), (640, 760), 255, -1)
+        calls = []
+
+        def fake_best_shift(mask, _target, _max_shift, _reference_pixels):
+            calls.append(max(mask.shape[:2]))
+            call_index = len(calls)
+            if call_index <= 13:
+                score = 200.0 if call_index == 7 else 100.0
+                return score, int(score), 0, 0
+            if call_index <= 16:
+                return 400.0, 400, 0, 0
+            return 600.0, 600, 1, 0
+
+        with patch(
+            "src.processor._best_shift_by_correlation",
+            side_effect=fake_best_shift,
+        ):
+            _align_template_mask_by_coverage(template, target)
+
+        self.assertEqual(len(calls), 19)
+        self.assertEqual(sum(size == 1000 for size in calls), 3)
+
     def test_image_aligner_uses_one_coordinate_system_for_resized_pages(self):
         reference = _make_form()
         target = cv2.resize(reference, (750, 1050), interpolation=cv2.INTER_LINEAR)
@@ -85,6 +138,7 @@ class TemplateAlignmentTests(unittest.TestCase):
 
         estimate_affine.assert_called_once()
         find_ecc.assert_called_once()
+        self.assertEqual(find_ecc.call_args.args[4][1:], (50, 1e-5))
         self.assertTrue(np.array_equal(aligned, expected))
 
     def test_image_aligner_inverts_ecc_warp_and_fills_white_border(self):

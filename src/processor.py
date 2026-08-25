@@ -2,8 +2,11 @@ import copy
 import gc
 import hashlib
 import os
+import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -39,6 +42,44 @@ _RUNNER_UP_MAX_BBOX_DENSITY = 0.20
 _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS = 5
 _SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO = 0.45
 _SHARED_STROKE_MIN_SHAPE_SPREAD = 0.18
+
+
+@dataclass(frozen=True)
+class _AnalysisOutputPaths:
+    result_folder: Path
+    review_folder: Path
+    comment_path: Path
+    excel_path: Path
+
+
+def _runtime_directory() -> Path:
+    """Return the source launcher or packaged executable directory."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _prepare_analysis_output_paths(
+    base_directory: str | Path | None = None,
+    now: datetime | None = None,
+) -> _AnalysisOutputPaths:
+    base_path = (
+        Path(base_directory).resolve()
+        if base_directory is not None
+        else _runtime_directory()
+    )
+    result_folder = base_path / "결과"
+    timestamp = (now or datetime.now()).strftime("%Y.%m.%d.%H.%M")
+    run_stem = f"설문결과_{timestamp}"
+    review_folder = result_folder / f"{run_stem}_검토용"
+    result_folder.mkdir(parents=True, exist_ok=True)
+    review_folder.mkdir(parents=True, exist_ok=True)
+    return _AnalysisOutputPaths(
+        result_folder=result_folder,
+        review_folder=review_folder,
+        comment_path=result_folder / f"{run_stem}_의견.pdf",
+        excel_path=result_folder / f"{run_stem}.xlsx",
+    )
 
 
 @dataclass
@@ -797,6 +838,31 @@ def _best_shift_by_correlation(
     return score, overlap, dx, dy
 
 
+def _correlation_choice_is_ambiguous(
+    best_score: float,
+    runner_up_score: float,
+    reference_pixels: int,
+) -> bool:
+    margin = max(4, round(reference_pixels * 0.0002))
+    return best_score - runner_up_score < margin
+
+
+def _scaled_shift_is_consistent(
+    full_shift: tuple[int, int],
+    small_shift: tuple[int, int],
+    search_scale: float,
+) -> bool:
+    tolerance = max(2, int(np.ceil(0.75 / search_scale)))
+    predicted_full = (
+        round(small_shift[0] / search_scale),
+        round(small_shift[1] / search_scale),
+    )
+    return (
+        abs(full_shift[0] - predicted_full[0]) <= tolerance
+        and abs(full_shift[1] - predicted_full[1]) <= tolerance
+    )
+
+
 def _build_stable_region_mask(
     image_shape: tuple[int, ...],
     config: TemplatePreset,
@@ -957,7 +1023,80 @@ def _align_template_mask_by_coverage(
         value=0,
     )
 
+    # Resolve the three half-step angles on an intermediate-size mask: 900px is
+    # sufficient for the 0.1-degree coarse sweep but can quantize away a
+    # 0.05-degree difference.  Only the strongest candidate is then verified at
+    # full resolution; ambiguous candidates retain the exhaustive path.
+    fine_search_scale = min(0.75, 2000.0 / max(h, w))
+    if fine_search_scale > search_scale:
+        fine_search_w = max(1, round(w * fine_search_scale))
+        fine_search_h = max(1, round(h * fine_search_scale))
+        fine_template = cv2.resize(
+            search_template_mask,
+            (fine_search_w, fine_search_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        fine_target = cv2.resize(
+            search_target_mask,
+            (fine_search_w, fine_search_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        _, fine_template = cv2.threshold(
+            fine_template, 32, 255, cv2.THRESH_BINARY
+        )
+        _, fine_target = cv2.threshold(fine_target, 32, 255, cv2.THRESH_BINARY)
+    else:
+        fine_search_scale = search_scale
+        fine_search_w, fine_search_h = search_w, search_h
+        fine_template, fine_target = small_template, small_target
+
+    fine_template_pixels = cv2.countNonZero(fine_template)
+    fine_shift = max(0, int(np.ceil(max_shift * fine_search_scale)))
+    fine_padded_target = cv2.copyMakeBorder(
+        fine_target,
+        fine_shift,
+        fine_shift,
+        fine_shift,
+        fine_shift,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
+    fine_center = (fine_search_w / 2.0, fine_search_h / 2.0)
+    fine_results: list[
+        tuple[tuple[float, int, float], float, int, int]
+    ] = []
     for angle in sorted(fine_angles):
+        matrix = cv2.getRotationMatrix2D(fine_center, angle, 1.0)
+        rotated = cv2.warpAffine(
+            fine_template,
+            matrix,
+            (fine_search_w, fine_search_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        score, overlap, dx, dy = _best_shift_by_correlation(
+            rotated, fine_padded_target, fine_shift, fine_template_pixels
+        )
+        motion = abs(angle) + abs(dx) + abs(dy)
+        fine_results.append(((score, overlap, -motion), angle, dx, dy))
+
+    ranked_fine = sorted(
+        fine_results,
+        key=lambda result: result[0],
+        reverse=True,
+    )
+    best_fine = ranked_fine[0]
+    needs_full_sweep = (
+        len(ranked_fine) > 1
+        and _correlation_choice_is_ambiguous(
+            best_fine[0][0], ranked_fine[1][0][0], fine_template_pixels
+        )
+    )
+
+    full_results: dict[float, tuple[tuple[float, int, float], float, int, int]] = {}
+
+    def evaluate_full(angle: float):
         matrix = cv2.getRotationMatrix2D(full_center, angle, 1.0)
         rotated = cv2.warpAffine(
             search_template_mask,
@@ -971,10 +1110,30 @@ def _align_template_mask_by_coverage(
             rotated, full_padded_target, max_shift, template_pixels
         )
         motion = abs(angle) + abs(dx) + abs(dy)
-        key = (score, overlap, -motion)
-        if key > best_key:
-            best_key = key
-            best_transform = (angle, dx, dy)
+        result = ((score, overlap, -motion), angle, dx, dy)
+        full_results[angle] = result
+        return result
+
+    if not needs_full_sweep:
+        verified = evaluate_full(best_fine[1])
+        if not _scaled_shift_is_consistent(
+            (verified[2], verified[3]),
+            (best_fine[2], best_fine[3]),
+            fine_search_scale,
+        ):
+            needs_full_sweep = True
+
+    if needs_full_sweep:
+        for angle in sorted(fine_angles):
+            if angle not in full_results:
+                evaluate_full(angle)
+
+    if full_results:
+        for angle in sorted(fine_angles):
+            result = full_results.get(angle)
+            if result is not None and result[0] > best_key:
+                best_key = result[0]
+                best_transform = (result[1], result[2], result[3])
 
     best_angle, best_dx, best_dy = best_transform
     min_overlap_gain = max(32, round(template_pixels * 0.001))
@@ -3643,6 +3802,20 @@ def _decode_sampled_survey(
     return decoded
 
 
+def _sampled_survey_is_available(
+    sample_pages: dict[int, list[bytes]] | None,
+    survey_idx: int,
+    expected_pages: int,
+) -> bool:
+    if not sample_pages or expected_pages <= 0:
+        return False
+    for local_p in range(expected_pages):
+        samples = sample_pages.get(local_p, [])
+        if survey_idx >= len(samples) or not samples[survey_idx]:
+            return False
+    return True
+
+
 def _build_file_templates(
     file_paths: list[str],
     sample_results: dict[str, dict[int, list[bytes]]],
@@ -3723,48 +3896,26 @@ def _analyze_single_file(
         comment_pages: list[bytes] = []
         survey_memory_bytes = _estimate_survey_memory_bytes(alignment_references)
 
-        for survey_idx in range(survey_count):
-            if resource_controller is not None:
-                resource_controller.checkpoint(
-                    survey_memory_bytes,
-                    stage=f"{file_label} 설문 분석",
-                    status_cb=resource_status_cb,
-                )
-            expected_pages = min(
-                page_count, max(0, len(doc) - survey_idx * page_count)
-            )
-            survey_gray_pages = _decode_sampled_survey(
-                sample_pages, survey_idx, expected_pages
-            )
-            if survey_gray_pages is None:
-                survey_gray_pages = _render_survey_pages(
-                    doc,
-                    survey_idx,
-                    page_count,
-                    aligners,
-                    rot_code,
-                    fine_angle,
-                    dpi,
-                    config.page_fine_angles,
-                )
-
+        def analyze_survey(
+            survey_idx: int,
+            survey_gray_pages: dict[int, np.ndarray],
+        ):
             survey_data = {
                 "fname": file_label,
                 "row_title": f"{file_label}_{survey_idx + 1}p",
                 "gray_pages": survey_gray_pages,
             }
-
-            row_data, debug_base, ink_base, debug_ann, ink_ann, cp = (
-                process_survey_data(
-                    survey_data,
-                    analysis_config,
-                    f_template,
-                    template_masks,
-                    field_plans,
-                    trust_checkbox_layout=trust_checkbox_layout,
-                )
+            return process_survey_data(
+                survey_data,
+                analysis_config,
+                f_template,
+                template_masks,
+                field_plans,
+                trust_checkbox_layout=trust_checkbox_layout,
             )
 
+        def consume_survey_result(result, completed_surveys: int) -> None:
+            row_data, debug_base, ink_base, debug_ann, ink_ann, cp = result
             field_values = [
                 v for k, v in row_data.items() if k not in ("파일명", "페이지")
             ]
@@ -3785,7 +3936,116 @@ def _analyze_single_file(
                     comment_pages.append(image_bytes)
 
             if progress_cb:
-                progress_cb(survey_idx + 1, survey_count)
+                progress_cb(completed_surveys, survey_count)
+
+        supports_parallel_plans = (
+            resource_controller is not None
+            and callable(
+                getattr(resource_controller, "parallel_checkpoint", None)
+            )
+        )
+        executor = None
+        if supports_parallel_plans and survey_count > 1:
+            executor = ThreadPoolExecutor(
+                max_workers=max(
+                    1,
+                    min(
+                        survey_count,
+                        int(getattr(resource_controller, "cpu_count", 1)),
+                    ),
+                )
+            )
+
+        survey_idx = 0
+        try:
+            while survey_idx < survey_count:
+                expected_pages = min(
+                    page_count, max(0, len(doc) - survey_idx * page_count)
+                )
+                cached_count = 0
+                if executor is not None:
+                    for candidate_idx in range(survey_idx, survey_count):
+                        candidate_pages = min(
+                            page_count,
+                            max(0, len(doc) - candidate_idx * page_count),
+                        )
+                        if not _sampled_survey_is_available(
+                            sample_pages, candidate_idx, candidate_pages
+                        ):
+                            break
+                        cached_count += 1
+
+                if cached_count > 0:
+                    plan = resource_controller.parallel_checkpoint(
+                        survey_memory_bytes,
+                        pending_tasks=cached_count,
+                        stage=f"{file_label} 설문 분석",
+                        status_cb=resource_status_cb,
+                    )
+                    batch_size = min(cached_count, plan.worker_count)
+                else:
+                    if resource_controller is not None:
+                        resource_controller.checkpoint(
+                            survey_memory_bytes,
+                            stage=f"{file_label} 설문 분석",
+                            status_cb=resource_status_cb,
+                        )
+                    batch_size = 1
+
+                futures = []
+                if executor is not None and batch_size > 1:
+                    for batch_idx in range(
+                        survey_idx, survey_idx + batch_size
+                    ):
+                        batch_expected_pages = min(
+                            page_count,
+                            max(0, len(doc) - batch_idx * page_count),
+                        )
+                        survey_gray_pages = _decode_sampled_survey(
+                            sample_pages, batch_idx, batch_expected_pages
+                        )
+                        if survey_gray_pages is None:
+                            break
+                        futures.append(
+                            executor.submit(
+                                analyze_survey, batch_idx, survey_gray_pages
+                            )
+                        )
+
+                if futures:
+                    for offset, future in enumerate(futures, start=1):
+                        consume_survey_result(
+                            future.result(), survey_idx + offset
+                        )
+                    survey_idx += len(futures)
+                    # Completed Future objects retain their full image results.
+                    # Release the batch before the next RAM budget checkpoint.
+                    futures.clear()
+                    del future, survey_gray_pages
+                    continue
+
+                survey_gray_pages = _decode_sampled_survey(
+                    sample_pages, survey_idx, expected_pages
+                )
+                if survey_gray_pages is None:
+                    survey_gray_pages = _render_survey_pages(
+                        doc,
+                        survey_idx,
+                        page_count,
+                        aligners,
+                        rot_code,
+                        fine_angle,
+                        dpi,
+                        config.page_fine_angles,
+                    )
+                consume_survey_result(
+                    analyze_survey(survey_idx, survey_gray_pages),
+                    survey_idx + 1,
+                )
+                survey_idx += 1
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         if len(out_orig) > 0:
             out_orig.save(review_folder / f"{file_label}_원본포함.pdf")
@@ -3825,10 +4085,8 @@ def run_analysis(
     progress_cb=None,
     resource_controller: AdaptiveResourceController | None = None,
     template_pages_preprocessed: bool = False,
+    output_base_dir: str | Path | None = None,
 ) -> bool:
-    review_folder = Path("검토용")
-    review_folder.mkdir(exist_ok=True)
-
     def report_progress(value: float, message: str = ""):
         if progress_cb:
             progress_cb(max(0, min(100, value)), message)
@@ -3838,6 +4096,8 @@ def run_analysis(
     num_files = len(file_paths)
     if num_files == 0:
         return False
+    output_paths = _prepare_analysis_output_paths(output_base_dir)
+    review_folder = output_paths.review_folder
     file_labels = _build_file_labels(file_paths)
     survey_counts = _file_survey_counts(file_paths, config.page_count)
     sample_counts = [
@@ -3891,7 +4151,7 @@ def run_analysis(
     all_results: list[dict] = []
     analysis_failures: list[str] = []
     completed = 0
-    comment_path = Path("의견.pdf")
+    comment_path = output_paths.comment_path
     try:
         comment_doc = fitz.open()
     except Exception:
@@ -4082,6 +4342,6 @@ def run_analysis(
 
     # ── 엑셀 저장 ──
     report_progress(98, "엑셀 저장 중...")
-    success = export_to_excel(all_results, config)
+    success = export_to_excel(all_results, config, str(output_paths.excel_path))
     report_progress(100, "완료")
     return success and not analysis_failures

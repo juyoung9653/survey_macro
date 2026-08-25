@@ -293,7 +293,10 @@ class ImageAligner:
                 criteria = (
                     cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
                     50,
-                    1e-6,
+                    # Scanner pages have already been initialized by ORB.  An
+                    # epsilon below this keeps iterating on sub-pixel noise
+                    # without meaningfully improving the alignment.
+                    1e-5,
                 )
                 ecc_gray = (
                     cv2.resize(
