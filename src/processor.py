@@ -4,6 +4,8 @@ import hashlib
 import os
 import sys
 import tempfile
+import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +36,7 @@ _ANALYSIS_REUSED_SURVEY_WORK = 1.0
 _ANALYSIS_RENDERED_SURVEY_WORK = 3.0
 _ANALYSIS_PROGRESS_START = 2.0
 _ANALYSIS_PROGRESS_SPAN = 95.0
+_ANALYSIS_PLAN_EPOCH_WINDOWS = 4
 _CANCEL_MARK_MIN_FILL_RATIO = 0.05
 _CANCEL_MARK_MIN_BBOX_DENSITY = 0.22
 _CANCEL_MARK_MIN_INK_RATIO = 2.5
@@ -42,6 +45,8 @@ _RUNNER_UP_MAX_BBOX_DENSITY = 0.20
 _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS = 5
 _SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO = 0.45
 _SHARED_STROKE_MIN_SHAPE_SPREAD = 0.18
+
+_SamplePage = bytes | np.ndarray
 
 
 @dataclass(frozen=True)
@@ -243,21 +248,56 @@ def _encode_jpeg(img: np.ndarray, quality: int = 85) -> bytes | None:
     return buf.tobytes() if success else None
 
 
+@dataclass(frozen=True)
+class _EncodedPageImage:
+    width: int
+    height: int
+    image_bytes: bytes | None
+
+
+def _encode_page_image(
+    img: np.ndarray, quality: int = 85
+) -> _EncodedPageImage:
+    height, width = img.shape[:2]
+    return _EncodedPageImage(
+        width=width,
+        height=height,
+        image_bytes=_encode_jpeg(img, quality),
+    )
+
+
+def _build_encoded_vector_page(
+    target_doc, encoded: _EncodedPageImage, annotations: list
+) -> None:
+    page = target_doc.new_page(width=encoded.width, height=encoded.height)
+    if encoded.image_bytes:
+        page.insert_image(page.rect, stream=encoded.image_bytes)
+    if not annotations:
+        return
+
+    shape = page.new_shape()
+    for bx, by, bw, bh, label, is_ticked in annotations:
+        color = (0, 1, 0) if is_ticked else (1, 0, 0)
+        shape.draw_rect(fitz.Rect(bx, by, bx + bw, by + bh))
+        shape.finish(color=color, width=2)
+        shape.insert_text(
+            fitz.Point(bx, max(0, by - 5)),
+            label,
+            fontsize=8,
+            color=color,
+        )
+    shape.commit()
+
 
 def _build_vector_page(
     target_doc, base_img: np.ndarray, annotations: list, img_quality: int = 85
 ) -> None:
     """벡터 PDF 페이지 생성: 배경 이미지(JPEG) + 벡터 사각형/텍스트 오버레이."""
-    h, w = base_img.shape[:2]
-    page = target_doc.new_page(width=w, height=h)
-    image_bytes = _encode_jpeg(base_img, img_quality)
-    if image_bytes:
-        page.insert_image(page.rect, stream=image_bytes)
-    for bx, by, bw, bh, label, is_ticked in annotations:
-        color = (0, 1, 0) if is_ticked else (1, 0, 0)
-        rect = fitz.Rect(bx, by, bx + bw, by + bh)
-        page.draw_rect(rect, color=color, width=2)
-        page.insert_text(fitz.Point(bx, max(0, by - 5)), label, fontsize=8, color=color)
+    _build_encoded_vector_page(
+        target_doc,
+        _encode_page_image(base_img, img_quality),
+        annotations,
+    )
 
 
 def _insert_encoded_img_into_pdf(target_doc, image_bytes: bytes) -> None:
@@ -1361,6 +1401,73 @@ def _refine_checkbox_box(
     return refined, confidence
 
 
+def _checkbox_box_key(box: Box) -> tuple[int, int, int, int, int]:
+    return (box.page_idx, box.x, box.y, box.w, box.h)
+
+
+def _prepare_checkbox_template_interiors(
+    field_plans: list[tuple[Field, list[Box], list[Box], bool]],
+    dynamic_templates: dict[int, np.ndarray],
+    page_shapes: dict[int, tuple[int, ...]],
+) -> dict[tuple[int, int, int, int, int], np.ndarray]:
+    prepared: dict[tuple[int, int, int, int, int], np.ndarray] = {}
+    gray_templates: dict[int, np.ndarray] = {}
+    for field, scoring_boxes, _working_boxes, _is_contiguous in field_plans:
+        if (
+            field.is_comment
+            or not scoring_boxes
+            or not all(
+                box.page_idx in page_shapes
+                and _is_checkbox_like(box, page_shapes[box.page_idx])
+                for box in scoring_boxes
+            )
+        ):
+            continue
+        for box in scoring_boxes:
+            key = _checkbox_box_key(box)
+            if key in prepared or box.page_idx not in dynamic_templates:
+                continue
+
+            template_gray = gray_templates.get(box.page_idx)
+            if template_gray is None:
+                template = dynamic_templates[box.page_idx]
+                template_gray = (
+                    cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                    if template.ndim == 3
+                    else template
+                )
+                target_shape = page_shapes.get(box.page_idx)
+                if (
+                    target_shape is not None
+                    and template_gray.shape[:2] != target_shape[:2]
+                ):
+                    template_gray = cv2.resize(
+                        template_gray,
+                        (target_shape[1], target_shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                gray_templates[box.page_idx] = template_gray
+
+            template_box, _ = _refine_checkbox_box(template_gray, box)
+            short_side = min(template_box.w, template_box.h)
+            border_width = max(1, round(short_side * 0.1))
+            margin = max(border_width + 1, round(short_side * 0.2))
+            x1 = max(0, template_box.x + margin)
+            y1 = max(0, template_box.y + margin)
+            x2 = min(
+                template_gray.shape[1], template_box.x + template_box.w - margin
+            )
+            y2 = min(
+                template_gray.shape[0], template_box.y + template_box.h - margin
+            )
+            prepared[key] = (
+                template_gray[y1:y2, x1:x2]
+                if x2 > x1 and y2 > y1
+                else template_gray[0:0, 0:0]
+            )
+    return prepared
+
+
 def _filter_checkbox_mark_components(
     binary_mask: np.ndarray,
 ) -> tuple[np.ndarray, float]:
@@ -1435,6 +1542,7 @@ def extract_checkbox_ink_info(
     target_gray: np.ndarray,
     box: Box,
     template_gray: np.ndarray | None = None,
+    template_interior: np.ndarray | None = None,
 ) -> _CheckboxInkInfo:
     """체크박스 테두리를 피한 내부의 실제 어두운 연결 성분을 측정합니다.
 
@@ -1473,7 +1581,12 @@ def extract_checkbox_ink_info(
     residual_pixels = 0
     residual_energy = 0.0
     residual_span_ratio = 0.0
-    if template_gray is not None and template_gray.size > 0:
+    reference_interior = template_interior
+    if (
+        reference_interior is None
+        and template_gray is not None
+        and template_gray.size > 0
+    ):
         if template_gray.ndim == 3:
             template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
         if template_gray.shape[:2] != target_gray.shape[:2]:
@@ -1497,14 +1610,17 @@ def extract_checkbox_ink_info(
             template_gray.shape[0], template_box.y + template_box.h - template_margin
         )
         if tx2 > tx1 and ty2 > ty1:
-            difference_mask, residual_pixels, residual_energy, residual_span_ratio = (
-                _checkbox_difference_features(
-                    interior,
-                    template_gray[ty1:ty2, tx1:tx2],
-                )
+            reference_interior = template_gray[ty1:ty2, tx1:tx2]
+
+    if reference_interior is not None and reference_interior.size > 0:
+        difference_mask, residual_pixels, residual_energy, residual_span_ratio = (
+            _checkbox_difference_features(
+                interior,
+                reference_interior,
             )
-            if difference_mask.shape == component_mask.shape:
-                component_mask = cv2.bitwise_or(component_mask, difference_mask)
+        )
+        if difference_mask.shape == component_mask.shape:
+            component_mask = cv2.bitwise_or(component_mask, difference_mask)
 
     ink_pixels = cv2.countNonZero(component_mask)
     area = int(raw_mask.size)
@@ -3253,6 +3369,11 @@ def process_survey_data(
     template_masks: dict[int, np.ndarray] | None = None,
     field_plans: list[tuple[Field, list[Box], list[Box], bool]] | None = None,
     trust_checkbox_layout: bool = False,
+    checkbox_template_interiors: dict[
+        tuple[int, int, int, int, int], np.ndarray
+    ]
+    | None = None,
+    prepared_stable_region_masks: dict[int, np.ndarray | None] | None = None,
 ) -> tuple[dict, dict, dict, dict, dict, dict]:
     fname = survey_data.get("fname", "")
     survey_label = survey_data["row_title"]
@@ -3280,10 +3401,12 @@ def process_survey_data(
     }
 
     pure_ink_masks = {}
-    stable_region_masks = {
-        local_p: _build_stable_region_mask(gray_img.shape, config, local_p)
-        for local_p, gray_img in survey_gray_pages.items()
-    }
+    stable_region_masks = prepared_stable_region_masks
+    if stable_region_masks is None:
+        stable_region_masks = {
+            local_p: _build_stable_region_mask(gray_img.shape, config, local_p)
+            for local_p, gray_img in survey_gray_pages.items()
+        }
     for local_p, gray_img in survey_gray_pages.items():
         if local_p in dynamic_templates:
             pure_ink_masks[local_p] = extract_pure_ink_mask(
@@ -3314,14 +3437,25 @@ def process_survey_data(
         if not checkbox_mode:
             continue
 
-        checkbox_infos = [
-            extract_checkbox_ink_info(
-                survey_gray_pages[box.page_idx],
-                box,
-                dynamic_templates.get(box.page_idx),
+        checkbox_infos = []
+        for box in scoring_boxes:
+            box_key = _checkbox_box_key(box)
+            has_prepared_interior = (
+                checkbox_template_interiors is not None
+                and box_key in checkbox_template_interiors
             )
-            for box in scoring_boxes
-        ]
+            checkbox_infos.append(
+                extract_checkbox_ink_info(
+                    survey_gray_pages[box.page_idx],
+                    box,
+                    None
+                    if has_prepared_interior
+                    else dynamic_templates.get(box.page_idx),
+                    checkbox_template_interiors[box_key]
+                    if has_prepared_interior
+                    else None,
+                )
+            )
         direct_inks = [info.ink_pixels for info in checkbox_infos]
         direct_areas = [info.area for info in checkbox_infos]
         direct_strengths = [info.mark_strength for info in checkbox_infos]
@@ -3616,6 +3750,12 @@ def process_survey_data(
 
 # ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
 # ── 페이지 렌더링 + 정합 헬퍼 (inner pool에서 호출) ──
+def _render_pdf_page(doc, global_p: int, dpi: int) -> np.ndarray:
+    page = doc[global_p]
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+
+
 def _render_aligned_page(
     doc,
     global_p: int,
@@ -3626,9 +3766,7 @@ def _render_aligned_page(
     dpi: int,
     page_fine_angles: list[float] | None = None,
 ) -> tuple[int, np.ndarray]:
-    page = doc[global_p]
-    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
-    page_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+    page_img = _render_pdf_page(doc, global_p, dpi)
     orig = apply_rotation(
         page_img,
         rot_code,
@@ -3690,7 +3828,7 @@ def _estimate_survey_memory_bytes(
 
 
 def _estimate_template_memory_bytes(
-    sample_pages: dict[int, list[bytes]],
+    sample_pages: dict[int, list[_SamplePage]],
     alignment_references: list[np.ndarray],
 ) -> int:
     pixels = _reference_page_pixels(alignment_references)
@@ -3699,9 +3837,36 @@ def _estimate_template_memory_bytes(
         page_pixels = (
             pixels[local_p] if local_p < len(pixels) else max(pixels, default=0)
         )
-        # PNG 디코딩 배열과 중앙값 partition 스택이 동시에 존재합니다.
-        peak_bytes = max(peak_bytes, page_pixels * max(1, len(samples)) * 2)
+        sample_count = max(1, len(samples))
+        samples_are_raw = bool(samples) and isinstance(samples[0], np.ndarray)
+        # Raw samples only need the partition stack. PNG samples additionally
+        # need decoded arrays while that stack is being created.
+        multiplier = 1 if samples_are_raw else 2
+        peak_bytes = max(peak_bytes, page_pixels * sample_count * multiplier)
     return peak_bytes + (max(pixels, default=0) * 4) + 64 * _MIB
+
+
+def _estimate_raw_sample_pipeline_peak_bytes(
+    alignment_references: list[np.ndarray],
+    sample_count: int,
+    worker_count: int,
+) -> int:
+    pixels = _reference_page_pixels(alignment_references)
+    raw_cache_bytes = sum(pixels) * max(0, sample_count)
+    largest_page_bytes = max(pixels, default=0)
+    template_peak = (
+        raw_cache_bytes
+        + largest_page_bytes * max(1, sample_count)
+        + largest_page_bytes * 4
+        + 64 * _MIB
+    )
+    collection_peak = (
+        raw_cache_bytes
+        + _estimate_render_memory_bytes(alignment_references)
+        * max(1, worker_count)
+        + largest_page_bytes * 2
+    )
+    return max(template_peak, collection_peak)
 
 
 def _build_page_aligners(
@@ -3727,7 +3892,7 @@ def _collect_template_samples(
     resource_controller: AdaptiveResourceController | None = None,
     resource_status_cb=None,
     progress_cb=None,
-) -> tuple[str, dict[int, list[bytes]]]:
+) -> tuple[str, dict[int, list[_SamplePage]]]:
     fname = Path(fpath).stem
     try:
         doc = fitz.open(fpath)
@@ -3736,40 +3901,175 @@ def _collect_template_samples(
         return _file_key(fpath), {}
 
     page_count = config.page_count
-    aligners = _build_page_aligners(alignment_references, config)
-    if not aligners:
+    if not alignment_references:
         doc.close()
         raise RuntimeError("페이지 정합 기준 이미지가 없습니다.")
 
-    f_pages: dict[int, list[bytes]] = {i: [] for i in range(page_count)}
+    f_pages: dict[int, list[_SamplePage]] = {i: [] for i in range(page_count)}
     survey_count = _survey_count(len(doc), page_count)
     limit = min(survey_count, sample_limit)
 
+    jobs = [
+        (survey_idx, local_p, survey_idx * page_count + local_p)
+        for survey_idx in range(limit)
+        for local_p in range(page_count)
+        if survey_idx * page_count + local_p < len(doc)
+    ]
+    supports_parallel_plans = (
+        resource_controller is not None
+        and callable(getattr(resource_controller, "parallel_checkpoint", None))
+        and len(jobs) > 1
+    )
+
     try:
-        for survey_idx in range(limit):
-            if resource_controller is not None:
-                resource_controller.checkpoint(
-                    _estimate_render_memory_bytes(alignment_references),
-                    stage=f"{fname} 템플릿 표본 처리",
-                    status_cb=resource_status_cb,
+        if not supports_parallel_plans:
+            aligners = _build_page_aligners(alignment_references, config)
+            for survey_idx in range(limit):
+                if resource_controller is not None:
+                    resource_controller.checkpoint(
+                        _estimate_render_memory_bytes(alignment_references),
+                        stage=f"{fname} 템플릿 표본 처리",
+                        status_cb=resource_status_cb,
+                    )
+                pages = _render_survey_pages(
+                    doc,
+                    survey_idx,
+                    page_count,
+                    aligners,
+                    config.rot_code,
+                    config.fine_angle,
+                    dpi,
+                    config.page_fine_angles,
                 )
-            pages = _render_survey_pages(
-                doc,
-                survey_idx,
-                page_count,
-                aligners,
-                config.rot_code,
-                config.fine_angle,
-                dpi,
-                config.page_fine_angles,
-            )
-            for local_p, aligned in pages.items():
-                if len(f_pages[local_p]) >= sample_limit:
-                    continue
+                for local_p, aligned in pages.items():
+                    success, encoded = cv2.imencode(".png", aligned)
+                    f_pages[local_p].append(
+                        encoded.tobytes() if success else b""
+                    )
+                if progress_cb:
+                    progress_cb(survey_idx + 1, limit)
+        else:
+            worker_state = threading.local()
+            retain_raw_samples: bool | None = None
+
+            def align_and_encode(
+                local_p: int, page_img: np.ndarray
+            ) -> tuple[int, _SamplePage]:
+                worker_aligners = getattr(worker_state, "aligners", None)
+                if worker_aligners is None:
+                    worker_aligners = _build_page_aligners(
+                        alignment_references, config
+                    )
+                    worker_state.aligners = worker_aligners
+                rotated = apply_rotation(
+                    page_img,
+                    config.rot_code,
+                    config.fine_angle_for_page(local_p),
+                )
+                aligner = (
+                    worker_aligners[local_p]
+                    if local_p < len(worker_aligners)
+                    else worker_aligners[-1]
+                )
+                aligned = aligner.align(rotated)
+                if retain_raw_samples:
+                    return local_p, aligned
                 success, encoded = cv2.imencode(".png", aligned)
-                f_pages[local_p].append(encoded.tobytes() if success else b"")
-            if progress_cb:
-                progress_cb(survey_idx + 1, limit)
+                return local_p, encoded.tobytes() if success else b""
+
+            max_workers = max(
+                1,
+                min(
+                    len(jobs),
+                    int(getattr(resource_controller, "cpu_count", 1)),
+                ),
+            )
+            render_memory = _estimate_render_memory_bytes(
+                alignment_references
+            )
+            coordinator_memory = max(
+                _reference_page_pixels(alignment_references), default=0
+            ) * 2
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            job_idx = 0
+            try:
+                while job_idx < len(jobs):
+                    plan = resource_controller.parallel_checkpoint(
+                        render_memory,
+                        pending_tasks=len(jobs) - job_idx,
+                        stage=f"{fname} 템플릿 표본 처리",
+                        status_cb=resource_status_cb,
+                        coordinator_threads=1,
+                        coordinator_memory_bytes=coordinator_memory,
+                    )
+                    if retain_raw_samples is None:
+                        available_headroom = max(
+                            0,
+                            int(getattr(plan, "available_memory_bytes", 0))
+                            - int(getattr(plan, "reserve_memory_bytes", 0))
+                            - int(getattr(plan, "safety_memory_bytes", 0)),
+                        )
+                        raw_pipeline_peak = (
+                            _estimate_raw_sample_pipeline_peak_bytes(
+                                alignment_references,
+                                limit,
+                                plan.worker_count,
+                            )
+                        )
+                        retain_raw_samples = (
+                            raw_pipeline_peak <= available_headroom
+                        )
+                    window_size = min(
+                        len(jobs) - job_idx, plan.worker_count
+                    )
+                    epoch_end = min(
+                        len(jobs),
+                        job_idx
+                        + window_size * _ANALYSIS_PLAN_EPOCH_WINDOWS,
+                    )
+                    next_submit = job_idx
+                    pending = deque()
+
+                    def submit_job(job):
+                        _survey_idx, local_p, global_p = job
+                        page_img = _render_pdf_page(doc, global_p, dpi)
+                        return executor.submit(
+                            align_and_encode, local_p, page_img
+                        )
+
+                    while (
+                        next_submit < epoch_end
+                        and len(pending) < window_size
+                    ):
+                        pending.append(
+                            (jobs[next_submit], submit_job(jobs[next_submit]))
+                        )
+                        next_submit += 1
+
+                    while pending:
+                        job, future = pending.popleft()
+                        local_p, encoded = future.result()
+                        if next_submit < epoch_end:
+                            pending.append(
+                                (
+                                    jobs[next_submit],
+                                    submit_job(jobs[next_submit]),
+                                )
+                            )
+                            next_submit += 1
+                        f_pages[local_p].append(encoded)
+                        job_idx += 1
+                        survey_idx, job_local_p, _global_p = job
+                        is_last_survey_page = (
+                            job_local_p == page_count - 1
+                            or job_idx == len(jobs)
+                            or jobs[job_idx][0] != survey_idx
+                        )
+                        if is_last_survey_page and progress_cb:
+                            progress_cb(survey_idx + 1, limit)
+
+            finally:
+                executor.shutdown(wait=True)
     finally:
         doc.close()
 
@@ -3777,7 +4077,7 @@ def _collect_template_samples(
 
 
 def _decode_sampled_survey(
-    sample_pages: dict[int, list[bytes]] | None,
+    sample_pages: dict[int, list[_SamplePage]] | None,
     survey_idx: int,
     expected_pages: int,
 ) -> dict[int, np.ndarray] | None:
@@ -3791,11 +4091,14 @@ def _decode_sampled_survey(
         if survey_idx >= len(samples):
             return None
         data = samples[survey_idx]
-        if not data:
-            return None
-        image = cv2.imdecode(
-            np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE
-        )
+        if isinstance(data, np.ndarray):
+            image = data
+        else:
+            if not data:
+                return None
+            image = cv2.imdecode(
+                np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE
+            )
         if image is None:
             return None
         decoded[local_p] = image
@@ -3803,7 +4106,7 @@ def _decode_sampled_survey(
 
 
 def _sampled_survey_is_available(
-    sample_pages: dict[int, list[bytes]] | None,
+    sample_pages: dict[int, list[_SamplePage]] | None,
     survey_idx: int,
     expected_pages: int,
 ) -> bool:
@@ -3811,14 +4114,20 @@ def _sampled_survey_is_available(
         return False
     for local_p in range(expected_pages):
         samples = sample_pages.get(local_p, [])
-        if survey_idx >= len(samples) or not samples[survey_idx]:
+        if survey_idx >= len(samples):
+            return False
+        sample = samples[survey_idx]
+        if isinstance(sample, np.ndarray):
+            if sample.size == 0:
+                return False
+        elif not sample:
             return False
     return True
 
 
 def _build_file_templates(
     file_paths: list[str],
-    sample_results: dict[str, dict[int, list[bytes]]],
+    sample_results: dict[str, dict[int, list[_SamplePage]]],
 ) -> tuple[
     dict[int, np.ndarray] | None,
     dict[str, dict[int, np.ndarray]],
@@ -3853,7 +4162,7 @@ def _analyze_single_file(
     alignment_references: list[np.ndarray],
     review_folder: Path,
     dpi: int = 300,
-    sample_pages: dict[int, list[bytes]] | None = None,
+    sample_pages: dict[int, list[_SamplePage]] | None = None,
     resource_controller: AdaptiveResourceController | None = None,
     resource_status_cb=None,
     progress_cb=None,
@@ -3888,6 +4197,19 @@ def _analyze_single_file(
             analysis_config, f_template
         )
         field_plans = _prepare_field_plans(analysis_config)
+        page_shapes = {
+            page_idx: reference.shape
+            for page_idx, reference in enumerate(alignment_references)
+        }
+        checkbox_template_interiors = _prepare_checkbox_template_interiors(
+            field_plans, f_template, page_shapes
+        )
+        stable_region_masks = {
+            page_idx: _build_stable_region_mask(
+                reference.shape, analysis_config, page_idx
+            )
+            for page_idx, reference in enumerate(alignment_references)
+        }
 
         page_count = config.page_count
         rot_code = config.rot_code
@@ -3905,13 +4227,44 @@ def _analyze_single_file(
                 "row_title": f"{file_label}_{survey_idx + 1}p",
                 "gray_pages": survey_gray_pages,
             }
-            return process_survey_data(
+            (
+                row_data,
+                debug_base,
+                ink_base,
+                debug_ann,
+                ink_ann,
+                comment_images,
+            ) = process_survey_data(
                 survey_data,
                 analysis_config,
                 f_template,
                 template_masks,
                 field_plans,
                 trust_checkbox_layout=trust_checkbox_layout,
+                checkbox_template_interiors=checkbox_template_interiors,
+                prepared_stable_region_masks=stable_region_masks,
+            )
+            encoded_debug = {
+                local_p: _encode_page_image(image)
+                for local_p, image in debug_base.items()
+            }
+            encoded_ink = {
+                local_p: _encode_page_image(image)
+                for local_p, image in ink_base.items()
+            }
+            encoded_comments = {
+                local_p: encoded_debug[local_p].image_bytes
+                for local_p in comment_images
+                if local_p in encoded_debug
+                and encoded_debug[local_p].image_bytes is not None
+            }
+            return (
+                row_data,
+                encoded_debug,
+                encoded_ink,
+                debug_ann,
+                ink_ann,
+                encoded_comments,
             )
 
         def consume_survey_result(result, completed_surveys: int) -> None:
@@ -3923,17 +4276,15 @@ def _analyze_single_file(
                 file_results.append(row_data)
 
             for local_p in sorted(debug_base):
-                _build_vector_page(
+                _build_encoded_vector_page(
                     out_orig, debug_base[local_p], debug_ann.get(local_p, [])
                 )
             for local_p in sorted(ink_base):
-                _build_vector_page(
+                _build_encoded_vector_page(
                     out_ink, ink_base[local_p], ink_ann.get(local_p, [])
                 )
             for local_p in sorted(cp):
-                image_bytes = _encode_jpeg(cp[local_p])
-                if image_bytes:
-                    comment_pages.append(image_bytes)
+                comment_pages.append(cp[local_p])
 
             if progress_cb:
                 progress_cb(completed_surveys, survey_count)
@@ -3954,6 +4305,22 @@ def _analyze_single_file(
                         int(getattr(resource_controller, "cpu_count", 1)),
                     ),
                 )
+            )
+
+        def submit_cached_survey(candidate_idx: int):
+            if executor is None:
+                return None
+            candidate_pages = min(
+                page_count,
+                max(0, len(doc) - candidate_idx * page_count),
+            )
+            candidate_images = _decode_sampled_survey(
+                sample_pages, candidate_idx, candidate_pages
+            )
+            if candidate_images is None:
+                return None
+            return executor.submit(
+                analyze_survey, candidate_idx, candidate_images
             )
 
         survey_idx = 0
@@ -3981,8 +4348,13 @@ def _analyze_single_file(
                         pending_tasks=cached_count,
                         stage=f"{file_label} 설문 분석",
                         status_cb=resource_status_cb,
+                        coordinator_threads=1,
                     )
-                    batch_size = min(cached_count, plan.worker_count)
+                    window_size = min(cached_count, plan.worker_count)
+                    epoch_size = min(
+                        cached_count,
+                        window_size * _ANALYSIS_PLAN_EPOCH_WINDOWS,
+                    )
                 else:
                     if resource_controller is not None:
                         resource_controller.checkpoint(
@@ -3990,38 +4362,49 @@ def _analyze_single_file(
                             stage=f"{file_label} 설문 분석",
                             status_cb=resource_status_cb,
                         )
-                    batch_size = 1
+                    window_size = 0
+                    epoch_size = 0
 
-                futures = []
-                if executor is not None and batch_size > 1:
-                    for batch_idx in range(
-                        survey_idx, survey_idx + batch_size
+                pending = deque()
+                if executor is not None and window_size > 0:
+                    epoch_end = survey_idx + epoch_size
+                    next_submit = survey_idx
+                    while (
+                        next_submit < epoch_end
+                        and len(pending) < window_size
                     ):
-                        batch_expected_pages = min(
-                            page_count,
-                            max(0, len(doc) - batch_idx * page_count),
-                        )
-                        survey_gray_pages = _decode_sampled_survey(
-                            sample_pages, batch_idx, batch_expected_pages
-                        )
-                        if survey_gray_pages is None:
+                        future = submit_cached_survey(next_submit)
+                        if future is None:
+                            epoch_end = next_submit
                             break
-                        futures.append(
-                            executor.submit(
-                                analyze_survey, batch_idx, survey_gray_pages
-                            )
-                        )
+                        pending.append((next_submit, future))
+                        next_submit += 1
 
-                if futures:
-                    for offset, future in enumerate(futures, start=1):
-                        consume_survey_result(
-                            future.result(), survey_idx + offset
-                        )
-                    survey_idx += len(futures)
-                    # Completed Future objects retain their full image results.
-                    # Release the batch before the next RAM budget checkpoint.
-                    futures.clear()
-                    del future, survey_gray_pages
+                if pending:
+                    overlap_output = (
+                        int(getattr(plan, "total_cpu_threads", 2)) > 1
+                    )
+                    while pending:
+                        completed_idx, future = pending.popleft()
+                        result = future.result()
+                        if overlap_output and next_submit < epoch_end:
+                            next_future = submit_cached_survey(next_submit)
+                            if next_future is None:
+                                epoch_end = next_submit
+                            else:
+                                pending.append((next_submit, next_future))
+                                next_submit += 1
+
+                        consume_survey_result(result, completed_idx + 1)
+                        survey_idx = completed_idx + 1
+
+                        if not overlap_output and next_submit < epoch_end:
+                            next_future = submit_cached_survey(next_submit)
+                            if next_future is None:
+                                epoch_end = next_submit
+                            else:
+                                pending.append((next_submit, next_future))
+                                next_submit += 1
                     continue
 
                 survey_gray_pages = _decode_sampled_survey(
@@ -4175,7 +4558,7 @@ def run_analysis(
     def analyze_file(
         index: int,
         file_template: dict[int, np.ndarray],
-        sample_pages: dict[int, list[bytes]] | None,
+        sample_pages: dict[int, list[_SamplePage]] | None,
     ) -> None:
         nonlocal completed
         fpath = file_paths[index]
@@ -4240,7 +4623,7 @@ def run_analysis(
             report_work(
                 f"{file_label}: 템플릿 표본 준비 중 · 파일 {index + 1}/{num_files}"
             )
-            sample_pages: dict[int, list[bytes]] = {}
+            sample_pages: dict[int, list[_SamplePage]] = {}
             file_template: dict[int, np.ndarray] = {}
             expected_samples = sample_counts[index]
             samples_done = 0

@@ -228,6 +228,52 @@ class AdaptiveResourceControllerTests(unittest.TestCase):
         self.assertEqual(plan.worker_count, 2)
         self.assertEqual(plan.opencv_threads, 1)
 
+    def test_parallel_plan_reserves_cpu_for_pipeline_coordinator(self):
+        controller = AdaptiveResourceController(
+            cpu_count=8,
+            memory_provider=lambda: MemorySnapshot(1000, 1000),
+            external_cpu_provider=lambda: 0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        with (
+            patch("src.resources.cv2.getNumThreads", return_value=4),
+            patch("src.resources.cv2.setNumThreads"),
+        ):
+            controller.start()
+            plan = controller.parallel_checkpoint(
+                required_memory_per_worker_bytes=0,
+                pending_tasks=20,
+                coordinator_threads=1,
+            )
+            controller.close()
+
+        self.assertEqual(plan.total_cpu_threads, 7)
+        self.assertEqual(plan.worker_count, 6)
+        self.assertEqual(plan.opencv_threads, 1)
+
+    def test_parallel_plan_reserves_memory_for_pipeline_coordinator(self):
+        controller = AdaptiveResourceController(
+            cpu_count=8,
+            memory_provider=lambda: MemorySnapshot(1000, 550),
+            external_cpu_provider=lambda: 0.0,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        with (
+            patch("src.resources.cv2.getNumThreads", return_value=4),
+            patch("src.resources.cv2.setNumThreads"),
+        ):
+            controller.start()
+            plan = controller.parallel_checkpoint(
+                required_memory_per_worker_bytes=100,
+                pending_tasks=20,
+                coordinator_memory_bytes=100,
+            )
+            controller.close()
+
+        self.assertEqual(plan.worker_count, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,13 +15,18 @@ from src.processor import (
     _analyze_single_file,
     _build_file_labels,
     _build_file_templates,
+    _build_vector_page,
+    _collect_template_samples,
     _decode_sampled_survey,
+    _encode_jpeg,
     _file_key,
     _load_ui_template_cache,
     _median_uint8_inplace,
+    _prepare_checkbox_template_interiors,
     _sampled_survey_is_available,
     _save_ui_template_cache,
     extract_ink_info_from_mask,
+    extract_checkbox_ink_info,
     extract_pure_ink_mask,
     generate_dynamic_templates,
     run_analysis,
@@ -47,6 +52,123 @@ class _ResourceControllerStub:
 
 
 class PipelineOptimizationTests(unittest.TestCase):
+    def test_prepared_checkbox_template_interior_matches_per_survey_refinement(self):
+        template = np.full((180, 240), 255, np.uint8)
+        box = Box(page_idx=0, x=70, y=60, w=28, h=28)
+        cv2.rectangle(template, (70, 60), (98, 88), 0, 2)
+        target = template.copy()
+        cv2.line(target, (76, 77), (83, 84), 0, 3)
+        cv2.line(target, (83, 84), (94, 68), 0, 3)
+        field = Field(name="Q", boxes=[box])
+        plans = [(field, [box], [box], True)]
+
+        prepared = _prepare_checkbox_template_interiors(
+            plans, {0: template}, {0: target.shape}
+        )
+        expected = extract_checkbox_ink_info(target, box, template)
+        actual = extract_checkbox_ink_info(
+            target, box, template_interior=next(iter(prepared.values()))
+        )
+
+        self.assertEqual(actual.ink_pixels, expected.ink_pixels)
+        self.assertEqual(actual.area, expected.area)
+        self.assertEqual(actual.mark_strength, expected.mark_strength)
+        self.assertEqual(actual.residual_pixels, expected.residual_pixels)
+        self.assertEqual(actual.mask_bounds, expected.mask_bounds)
+        self.assertTrue(np.array_equal(actual.ink_mask, expected.ink_mask))
+
+    def test_batched_vector_annotations_render_like_individual_page_calls(self):
+        base_img = np.full((180, 240), 235, np.uint8)
+        cv2.circle(base_img, (120, 90), 25, 80, 3)
+        annotations = [
+            (20, 35, 45, 28, "A", False),
+            (120, 105, 55, 32, "B", True),
+        ]
+
+        expected_doc = fitz.open()
+        expected_page = expected_doc.new_page(width=240, height=180)
+        image_bytes = _encode_jpeg(base_img)
+        assert image_bytes is not None
+        expected_page.insert_image(expected_page.rect, stream=image_bytes)
+        for bx, by, bw, bh, label, is_ticked in annotations:
+            color = (0, 1, 0) if is_ticked else (1, 0, 0)
+            expected_page.draw_rect(
+                fitz.Rect(bx, by, bx + bw, by + bh), color=color, width=2
+            )
+            expected_page.insert_text(
+                fitz.Point(bx, max(0, by - 5)),
+                label,
+                fontsize=8,
+                color=color,
+            )
+
+        actual_doc = fitz.open()
+        _build_vector_page(actual_doc, base_img, annotations)
+        expected_pixmap = expected_doc[0].get_pixmap(dpi=144, alpha=False)
+        actual_pixmap = actual_doc[0].get_pixmap(dpi=144, alpha=False)
+        try:
+            self.assertEqual(
+                (actual_pixmap.width, actual_pixmap.height),
+                (expected_pixmap.width, expected_pixmap.height),
+            )
+            self.assertEqual(actual_pixmap.samples, expected_pixmap.samples)
+        finally:
+            actual_doc.close()
+            expected_doc.close()
+
+    def test_analysis_reuses_debug_jpeg_for_comment_output(self):
+        page_image = np.full((30, 20), 245, np.uint8)
+        ink_image = np.full((30, 20), 255, np.uint8)
+        encoded_page = cv2.imencode(".png", page_image)[1].tobytes()
+        config = TemplatePreset(page_count=1)
+
+        def process_survey(survey_data, *_args, **_kwargs):
+            title = survey_data["row_title"]
+            return (
+                {"파일명": "sample", "페이지": title, "Q": "checked"},
+                {0: page_image},
+                {0: ink_image},
+                {0: []},
+                {0: []},
+                {0: page_image},
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "sample.pdf"
+            document = fitz.open()
+            document.new_page(width=20, height=30)
+            document.save(pdf_path)
+            document.close()
+            template = {0: np.full((30, 20), 255, np.uint8)}
+
+            with (
+                patch("src.processor._build_page_aligners", return_value=[object()]),
+                patch("src.processor._remap_checkbox_layout", return_value=config),
+                patch(
+                    "src.processor._checkbox_layout_is_trustworthy",
+                    return_value=True,
+                ),
+                patch("src.processor._prepare_field_plans", return_value=[]),
+                patch("src.processor.process_survey_data", side_effect=process_survey),
+                patch(
+                    "src.processor._encode_jpeg", wraps=_encode_jpeg
+                ) as encode_jpeg,
+            ):
+                _, rows, comments = _analyze_single_file(
+                    str(pdf_path),
+                    "sample",
+                    config,
+                    template,
+                    template,
+                    [template[0]],
+                    Path(temp_dir),
+                    sample_pages={0: [encoded_page]},
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(encode_jpeg.call_count, 2)
+
     def test_uint8_median_matches_numpy(self):
         rng = np.random.default_rng(17)
         for count in (1, 2, 3, 4, 15, 31):
@@ -192,6 +314,140 @@ class PipelineOptimizationTests(unittest.TestCase):
             _decode_sampled_survey(samples, survey_idx=2, expected_pages=1)
         )
 
+    def test_raw_phase_one_sample_can_be_reused_without_decode(self):
+        sample = np.full((30, 20), 125, np.uint8)
+        samples = {0: [sample]}
+
+        decoded = _decode_sampled_survey(
+            samples, survey_idx=0, expected_pages=1
+        )
+
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertIs(decoded[0], sample)
+        self.assertTrue(_sampled_survey_is_available(samples, 0, 1))
+
+    def test_phase_one_uses_dynamic_page_pipeline_and_preserves_order(self):
+        class ParallelControllerStub:
+            cpu_count = 4
+
+            def __init__(self):
+                self.pending_tasks = []
+
+            def parallel_checkpoint(
+                self,
+                _required_memory,
+                pending_tasks,
+                stage="",
+                status_cb=None,
+                coordinator_threads=0,
+                coordinator_memory_bytes=0,
+            ):
+                self.pending_tasks.append(pending_tasks)
+                return SimpleNamespace(worker_count=2, total_cpu_threads=3)
+
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        class FakeAligner:
+            def align(self, image):
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.02)
+                with active_lock:
+                    active -= 1
+                return image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "samples.pdf"
+            document = fitz.open()
+            for shade in (0.2, 0.4, 0.6, 0.8):
+                page = document.new_page(width=20, height=30)
+                page.draw_rect(
+                    page.rect, fill=(shade, shade, shade), color=None
+                )
+            document.save(pdf_path)
+            document.close()
+
+            controller = ParallelControllerStub()
+            progress = []
+            with patch(
+                "src.processor._build_page_aligners",
+                side_effect=lambda *_args: [FakeAligner()],
+            ) as build_aligners:
+                _, samples = _collect_template_samples(
+                    str(pdf_path),
+                    TemplatePreset(page_count=1),
+                    [np.full((30, 20), 255, np.uint8)],
+                    dpi=72,
+                    resource_controller=controller,
+                    progress_cb=lambda done, total: progress.append(
+                        (done, total)
+                    ),
+                )
+
+        decoded_means = [
+            float(
+                cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+                .mean()
+            )
+            for data in samples[0]
+        ]
+        self.assertGreater(max_active, 1)
+        self.assertGreaterEqual(build_aligners.call_count, 2)
+        self.assertEqual(controller.pending_tasks, [4])
+        self.assertEqual(progress, [(1, 4), (2, 4), (3, 4), (4, 4)])
+        self.assertEqual(decoded_means, sorted(decoded_means))
+        self.assertTrue(all(isinstance(data, bytes) for data in samples[0]))
+
+    def test_phase_one_retains_raw_samples_when_memory_headroom_allows(self):
+        class HighMemoryController:
+            cpu_count = 4
+
+            def parallel_checkpoint(self, *_args, pending_tasks, **_kwargs):
+                return SimpleNamespace(
+                    worker_count=min(2, pending_tasks),
+                    total_cpu_threads=3,
+                    available_memory_bytes=2**40,
+                    reserve_memory_bytes=0,
+                    safety_memory_bytes=0,
+                )
+
+        class IdentityAligner:
+            def align(self, image):
+                return image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "raw-samples.pdf"
+            document = fitz.open()
+            for shade in (0.3, 0.7):
+                page = document.new_page(width=20, height=30)
+                page.draw_rect(
+                    page.rect, fill=(shade, shade, shade), color=None
+                )
+            document.save(pdf_path)
+            document.close()
+
+            with patch(
+                "src.processor._build_page_aligners",
+                return_value=[IdentityAligner()],
+            ):
+                _, samples = _collect_template_samples(
+                    str(pdf_path),
+                    TemplatePreset(page_count=1),
+                    [np.full((30, 20), 255, np.uint8)],
+                    dpi=72,
+                    resource_controller=HighMemoryController(),
+                )
+
+        self.assertEqual(len(samples[0]), 2)
+        self.assertTrue(
+            all(isinstance(sample, np.ndarray) for sample in samples[0])
+        )
+
     def test_sample_availability_requires_every_expected_page(self):
         samples = {0: [b"first", b"second"], 1: [b"first"]}
 
@@ -213,9 +469,13 @@ class PipelineOptimizationTests(unittest.TestCase):
                 pending_tasks,
                 stage="",
                 status_cb=None,
+                coordinator_threads=0,
             ):
                 self.pending_tasks.append(pending_tasks)
-                return SimpleNamespace(worker_count=pending_tasks)
+                return SimpleNamespace(
+                    worker_count=min(2, pending_tasks),
+                    total_cpu_threads=3,
+                )
 
             def checkpoint(
                 self, required_memory_bytes=0, stage="", status_cb=None
@@ -225,9 +485,14 @@ class PipelineOptimizationTests(unittest.TestCase):
         active = 0
         max_active = 0
         active_lock = threading.Lock()
+        third_started = threading.Event()
+        analysis_overlapped_output = False
+        page_image = np.full((30, 20), 255, np.uint8)
 
         def process_survey(survey_data, *_args, **_kwargs):
             nonlocal active, max_active
+            if survey_data["row_title"] == "sample_3p":
+                third_started.set()
             with active_lock:
                 active += 1
                 max_active = max(max_active, active)
@@ -237,12 +502,17 @@ class PipelineOptimizationTests(unittest.TestCase):
             title = survey_data["row_title"]
             return (
                 {"파일명": "sample", "페이지": title, "Q": title},
+                {0: page_image},
                 {},
-                {},
-                {},
+                {0: []},
                 {},
                 {},
             )
+
+        def build_page(*_args, **_kwargs):
+            nonlocal analysis_overlapped_output
+            if not analysis_overlapped_output:
+                analysis_overlapped_output = third_started.wait(0.5)
 
         encoded_page = cv2.imencode(
             ".png", np.full((30, 20), 255, np.uint8)
@@ -269,6 +539,10 @@ class PipelineOptimizationTests(unittest.TestCase):
                 ),
                 patch("src.processor._prepare_field_plans", return_value=[]),
                 patch("src.processor.process_survey_data", side_effect=process_survey),
+                patch(
+                    "src.processor._build_encoded_vector_page",
+                    side_effect=build_page,
+                ),
             ):
                 _, rows, comments = _analyze_single_file(
                     str(pdf_path),
@@ -283,6 +557,7 @@ class PipelineOptimizationTests(unittest.TestCase):
                 )
 
         self.assertGreater(max_active, 1)
+        self.assertTrue(analysis_overlapped_output)
         self.assertEqual(controller.pending_tasks, [4])
         self.assertEqual(controller.checkpoints, [])
         self.assertEqual(

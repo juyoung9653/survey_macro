@@ -34,6 +34,7 @@ class ParallelResourcePlan:
     external_cpu_fraction: float
     available_memory_bytes: int
     reserve_memory_bytes: int
+    safety_memory_bytes: int = 0
 
 
 class ResourceUnavailableError(RuntimeError):
@@ -321,23 +322,29 @@ class AdaptiveResourceController:
         pending_tasks: int,
         stage: str = "분석",
         status_cb: Callable[[str], None] | None = None,
+        coordinator_threads: int = 0,
+        coordinator_memory_bytes: int = 0,
     ) -> ParallelResourcePlan:
         """Allocate work slots and OpenCV threads from current CPU/RAM headroom.
 
         The plan is recalculated only at safe batch boundaries. Callers must let
         the current batch finish before requesting another plan because OpenCV's
-        thread limit is process-global.
+        thread limit is process-global. Pipeline callers can reserve CPU and RAM
+        for their serial coordinator while worker tasks remain active.
         """
         pending_tasks = max(1, int(pending_tasks))
+        coordinator_threads = max(0, int(coordinator_threads))
+        coordinator_memory_bytes = max(0, int(coordinator_memory_bytes))
         required_memory_per_worker_bytes = max(
             0, int(required_memory_per_worker_bytes)
         )
         status = self.checkpoint(
-            required_memory_per_worker_bytes,
+            required_memory_per_worker_bytes + coordinator_memory_bytes,
             stage=stage,
             status_cb=status_cb,
         )
         total_cpu_threads = max(1, status.opencv_threads)
+        worker_cpu_threads = max(1, total_cpu_threads - coordinator_threads)
         if required_memory_per_worker_bytes == 0:
             memory_slots = pending_tasks
         else:
@@ -345,7 +352,8 @@ class AdaptiveResourceController:
                 0,
                 status.available_memory_bytes
                 - status.reserve_memory_bytes
-                - status.safety_memory_bytes,
+                - status.safety_memory_bytes
+                - coordinator_memory_bytes,
             )
             memory_slots = max(
                 1, memory_headroom // required_memory_per_worker_bytes
@@ -353,9 +361,9 @@ class AdaptiveResourceController:
 
         worker_count = max(
             1,
-            min(pending_tasks, total_cpu_threads, memory_slots),
+            min(pending_tasks, worker_cpu_threads, memory_slots),
         )
-        opencv_threads = max(1, total_cpu_threads // worker_count)
+        opencv_threads = max(1, worker_cpu_threads // worker_count)
         self._set_opencv_threads(opencv_threads)
         return ParallelResourcePlan(
             worker_count=worker_count,
@@ -364,6 +372,7 @@ class AdaptiveResourceController:
             external_cpu_fraction=status.external_cpu_fraction,
             available_memory_bytes=status.available_memory_bytes,
             reserve_memory_bytes=status.reserve_memory_bytes,
+            safety_memory_bytes=status.safety_memory_bytes,
         )
 
     def _budgeted_thread_count(self, target_threads: float) -> int:
