@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import cv2
 import numpy as np
@@ -240,6 +240,87 @@ class TemplateAlignmentTests(unittest.TestCase):
         self.assertEqual(ecc_reference.shape, ecc_target.shape)
         self.assertAlmostEqual(ecc_initial[0, 2], ref_to_target[0, 2] * 0.6)
         self.assertAlmostEqual(ecc_initial[1, 2], ref_to_target[1, 2] * 0.6)
+
+    def test_image_aligner_reuses_previous_affine_before_orb(self):
+        reference = _make_form()
+        aligner = ImageAligner(reference, adaptive_cascade=True)
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+
+        with (
+            patch.object(
+                aligner,
+                "_estimate_affine_with_orb",
+                return_value=identity.copy(),
+            ) as estimate_orb,
+            patch.object(
+                aligner,
+                "_quick_alignment_score",
+                return_value=0.95,
+            ) as quick_score,
+            patch.object(
+                aligner,
+                "_refine_affine_with_ecc",
+                return_value=(identity.copy(), 0.95),
+            ) as refine_ecc,
+        ):
+            aligner.align(reference)
+            aligned = aligner.align(reference)
+
+        self.assertEqual(estimate_orb.call_count, 1)
+        self.assertEqual(estimate_orb.call_args.kwargs, {"scaled": False})
+        quick_score.assert_called_once()
+        self.assertEqual(refine_ecc.call_count, 2)
+        self.assertEqual(
+            refine_ecc.call_args.kwargs["max_iterations"],
+            ImageAligner._ADAPTIVE_WARM_ECC_ITERATIONS,
+        )
+        self.assertEqual(aligner.last_alignment_stage, "warm_ecc")
+        self.assertTrue(np.array_equal(aligned, reference))
+
+    def test_image_aligner_escalates_scaled_failure_to_existing_full_path(self):
+        reference = _make_form()
+        aligner = ImageAligner(reference, adaptive_cascade=True)
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        aligner._last_affine = identity.copy()
+        aligner._last_ecc_correlation = 0.90
+
+        with (
+            patch.object(
+                aligner,
+                "_quick_alignment_score",
+                return_value=0.10,
+            ),
+            patch.object(
+                aligner,
+                "_estimate_affine_with_orb",
+                side_effect=[identity.copy(), identity.copy()],
+            ) as estimate_orb,
+            patch.object(
+                aligner,
+                "_refine_affine_with_ecc",
+                side_effect=[(None, 0.30), (identity.copy(), 0.95)],
+            ) as refine_ecc,
+        ):
+            aligned = aligner.align(reference)
+
+        self.assertEqual(
+            estimate_orb.call_args_list,
+            [call(reference, scaled=True), call(reference, scaled=False)],
+        )
+        self.assertEqual(
+            refine_ecc.call_args_list[0].kwargs["max_iterations"],
+            ImageAligner._ADAPTIVE_SCALED_ECC_ITERATIONS,
+        )
+        self.assertNotIn(
+            "max_iterations",
+            refine_ecc.call_args_list[1].kwargs,
+        )
+        self.assertEqual(aligner.last_alignment_stage, "full_orb")
+        self.assertTrue(np.array_equal(aligned, reference))
 
     def test_ink_is_preserved_and_checkbox_detection_still_works(self):
         form = _make_form()

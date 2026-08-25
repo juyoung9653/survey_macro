@@ -133,18 +133,30 @@ def load_pdf_pages(
 
 
 class ImageAligner:
+    _ADAPTIVE_QUICK_MAX_DIMENSION = 480
+    _ADAPTIVE_QUICK_MIN_CORRELATION = 0.50
+    _ADAPTIVE_ECC_MIN_CORRELATION = 0.60
+    _ADAPTIVE_WARM_ECC_ITERATIONS = 12
+    _ADAPTIVE_SCALED_ECC_ITERATIONS = 15
+
     def __init__(
         self,
         ref_img: np.ndarray,
         refine_ecc: bool = True,
         ecc_max_dimension: int = 1200,
         stable_mask: np.ndarray | None = None,
+        adaptive_cascade: bool = True,
     ):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
         )
         self.ref_h, self.ref_w = self.ref_gray.shape[:2]
         self.refine_ecc = refine_ecc
+        self.adaptive_cascade = bool(adaptive_cascade and refine_ecc)
+        self._last_affine: np.ndarray | None = None
+        self._last_ecc_correlation: float | None = None
+        self.last_alignment_stage = "full_orb"
+        self.last_quick_score: float | None = None
         long_side = max(self.ref_h, self.ref_w)
         if refine_ecc and ecc_max_dimension > 0 and long_side > ecc_max_dimension:
             scale = ecc_max_dimension / long_side
@@ -174,6 +186,42 @@ class ImageAligner:
         self.kp1, self.des1 = self.orb.detectAndCompute(
             self.ref_gray, self.stable_mask
         )
+        self._scaled_orb = None
+        self._scaled_kp1 = None
+        self._scaled_des1 = None
+
+        quick_scale = min(
+            1.0,
+            self._ADAPTIVE_QUICK_MAX_DIMENSION / max(1, long_side),
+        )
+        quick_w = max(1, round(self.ref_w * quick_scale))
+        quick_h = max(1, round(self.ref_h * quick_scale))
+        self.quick_scale_x = quick_w / self.ref_w
+        self.quick_scale_y = quick_h / self.ref_h
+        if quick_w != self.ref_w or quick_h != self.ref_h:
+            self.quick_ref_gray = cv2.resize(
+                self.ref_gray,
+                (quick_w, quick_h),
+                interpolation=cv2.INTER_AREA,
+            )
+            self.quick_stable_mask = (
+                cv2.resize(
+                    self.stable_mask,
+                    (quick_w, quick_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                if self.stable_mask is not None
+                else None
+            )
+        else:
+            self.quick_ref_gray = self.ref_gray
+            self.quick_stable_mask = self.stable_mask
+        self._quick_valid_source = np.full(
+            self.quick_ref_gray.shape,
+            255,
+            dtype=np.uint8,
+        )
+        self._quick_full_mask = self._quick_valid_source.copy()
 
     def _prepare_stable_mask(
         self, stable_mask: np.ndarray | None
@@ -230,25 +278,253 @@ class ImageAligner:
         return True
 
     def _affine_to_ecc_scale(self, matrix: np.ndarray) -> np.ndarray:
+        return self._affine_to_scale(
+            matrix,
+            self.ecc_scale_x,
+            self.ecc_scale_y,
+        )
+
+    @staticmethod
+    def _affine_to_scale(
+        matrix: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+    ) -> np.ndarray:
         scaled = matrix.astype(np.float32, copy=True)
-        scaled[0, 1] *= self.ecc_scale_x / self.ecc_scale_y
-        scaled[1, 0] *= self.ecc_scale_y / self.ecc_scale_x
-        scaled[0, 2] *= self.ecc_scale_x
-        scaled[1, 2] *= self.ecc_scale_y
+        scaled[0, 1] *= scale_x / scale_y
+        scaled[1, 0] *= scale_y / scale_x
+        scaled[0, 2] *= scale_x
+        scaled[1, 2] *= scale_y
         return scaled
 
     def _affine_from_ecc_scale(self, matrix: np.ndarray) -> np.ndarray:
+        return self._affine_from_scale(
+            matrix,
+            self.ecc_scale_x,
+            self.ecc_scale_y,
+        )
+
+    @staticmethod
+    def _affine_from_scale(
+        matrix: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+    ) -> np.ndarray:
         full_size = matrix.astype(np.float32, copy=True)
-        full_size[0, 1] *= self.ecc_scale_y / self.ecc_scale_x
-        full_size[1, 0] *= self.ecc_scale_x / self.ecc_scale_y
-        full_size[0, 2] /= self.ecc_scale_x
-        full_size[1, 2] /= self.ecc_scale_y
+        full_size[0, 1] *= scale_y / scale_x
+        full_size[1, 0] *= scale_x / scale_y
+        full_size[0, 2] /= scale_x
+        full_size[1, 2] /= scale_y
         return full_size
 
     def _resize_to_ref(self, img: np.ndarray) -> np.ndarray:
         if img.shape[:2] == (self.ref_h, self.ref_w):
             return img
         return cv2.resize(img, (self.ref_w, self.ref_h), interpolation=cv2.INTER_AREA)
+
+    def _ecc_target(self, gray: np.ndarray) -> np.ndarray:
+        if self.ecc_scale_x >= 1.0 and self.ecc_scale_y >= 1.0:
+            return gray
+        return cv2.resize(
+            gray,
+            (self.ecc_ref_gray.shape[1], self.ecc_ref_gray.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    def _estimate_affine_with_orb(
+        self,
+        gray: np.ndarray,
+        *,
+        scaled: bool,
+    ) -> np.ndarray | None:
+        if scaled:
+            if self.ecc_scale_x >= 1.0 and self.ecc_scale_y >= 1.0:
+                return None
+            if self._scaled_orb is None:
+                self._scaled_orb = cv2.ORB_create(2000)
+                self._scaled_kp1, self._scaled_des1 = (
+                    self._scaled_orb.detectAndCompute(
+                        self.ecc_ref_gray,
+                        self.ecc_stable_mask,
+                    )
+                )
+            orb = self._scaled_orb
+            ref_kp = self._scaled_kp1
+            ref_des = self._scaled_des1
+            target = self._ecc_target(gray)
+            mask = self.ecc_stable_mask
+            ransac_threshold = max(
+                1.0,
+                3.0 * max(self.ecc_scale_x, self.ecc_scale_y),
+            )
+        else:
+            orb = self.orb
+            ref_kp = self.kp1
+            ref_des = self.des1
+            target = gray
+            mask = self.stable_mask
+            ransac_threshold = 3.0
+
+        if ref_des is None or ref_kp is None:
+            return None
+        target_kp, target_des = orb.detectAndCompute(target, mask)
+        if target_des is None:
+            return None
+
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = sorted(
+            matcher.match(ref_des, target_des),
+            key=lambda match: match.distance,
+        )
+        top_matches = matches[: max(4, int(len(matches) * 0.15))]
+        if len(top_matches) < 3:
+            return None
+
+        ref_points = np.float32(
+            [ref_kp[match.queryIdx].pt for match in top_matches]
+        ).reshape(-1, 1, 2)
+        target_points = np.float32(
+            [target_kp[match.trainIdx].pt for match in top_matches]
+        ).reshape(-1, 1, 2)
+        matrix, inliers = cv2.estimateAffine2D(
+            target_points,
+            ref_points,
+            ransacReprojThreshold=ransac_threshold,
+        )
+        if matrix is None:
+            return None
+        if scaled:
+            matrix = self._affine_from_ecc_scale(matrix)
+        if not self._is_plausible_affine(matrix, inliers):
+            return None
+        return matrix
+
+    def _refine_affine_with_ecc(
+        self,
+        gray: np.ndarray,
+        initial_matrix: np.ndarray,
+        *,
+        min_correlation: float,
+        max_iterations: int = 50,
+    ) -> tuple[np.ndarray | None, float | None]:
+        try:
+            criteria = (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                max_iterations,
+                # Scanner pages have already been initialized by ORB.  An
+                # epsilon below this keeps iterating on sub-pixel noise
+                # without meaningfully improving the alignment.
+                1e-5,
+            )
+            ecc_initial_full = cv2.invertAffineTransform(
+                initial_matrix
+            ).astype(np.float32)
+            ecc_initial = self._affine_to_ecc_scale(ecc_initial_full)
+            correlation, refined_matrix = cv2.findTransformECC(
+                self.ecc_ref_gray,
+                self._ecc_target(gray),
+                ecc_initial,
+                cv2.MOTION_AFFINE,
+                criteria,
+                self.ecc_stable_mask,
+                5,
+            )
+            refined_full = cv2.invertAffineTransform(
+                self._affine_from_ecc_scale(refined_matrix)
+            )
+            correlation = float(correlation)
+            if (
+                np.isfinite(correlation)
+                and correlation > min_correlation
+                and self._is_plausible_affine(refined_full)
+            ):
+                return refined_full, correlation
+            return None, correlation
+        except Exception:
+            return None, None
+
+    def _quick_alignment_score(
+        self,
+        gray: np.ndarray,
+        matrix: np.ndarray,
+    ) -> float:
+        try:
+            quick_gray = (
+                cv2.resize(
+                    gray,
+                    (
+                        self.quick_ref_gray.shape[1],
+                        self.quick_ref_gray.shape[0],
+                    ),
+                    interpolation=cv2.INTER_AREA,
+                )
+                if gray.shape != self.quick_ref_gray.shape
+                else gray
+            )
+            quick_matrix = self._affine_to_scale(
+                matrix,
+                self.quick_scale_x,
+                self.quick_scale_y,
+            )
+            aligned = cv2.warpAffine(
+                quick_gray,
+                quick_matrix,
+                (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=255,
+            )
+            valid = cv2.warpAffine(
+                self._quick_valid_source,
+                quick_matrix,
+                (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            base_mask = (
+                self.quick_stable_mask
+                if self.quick_stable_mask is not None
+                else self._quick_full_mask
+            )
+            mask = cv2.bitwise_and(base_mask, valid)
+            if cv2.countNonZero(mask) < mask.size * 0.15:
+                return float("-inf")
+            return float(cv2.computeECC(self.quick_ref_gray, aligned, mask))
+        except Exception:
+            return float("-inf")
+
+    def _adaptive_ecc_threshold(self) -> float:
+        if self._last_ecc_correlation is None:
+            return self._ADAPTIVE_ECC_MIN_CORRELATION
+        return max(
+            self._ADAPTIVE_ECC_MIN_CORRELATION,
+            self._last_ecc_correlation - 0.08,
+        )
+
+    def _remember_alignment(
+        self,
+        matrix: np.ndarray,
+        correlation: float | None,
+        stage: str,
+    ) -> None:
+        self._last_affine = matrix.astype(np.float32, copy=True)
+        if correlation is not None and np.isfinite(correlation):
+            self._last_ecc_correlation = float(correlation)
+        self.last_alignment_stage = stage
+
+    def _warp_aligned(
+        self,
+        working_img: np.ndarray,
+        matrix: np.ndarray,
+    ) -> np.ndarray:
+        border_value = 255 if working_img.ndim == 2 else (255, 255, 255)
+        return cv2.warpAffine(
+            working_img,
+            matrix,
+            (self.ref_w, self.ref_h),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=border_value,
+        )
 
     def align(self, img: np.ndarray) -> np.ndarray:
         # 특징점, ECC, 최종 warp가 모두 같은 좌표계를 사용하도록 먼저 크기를
@@ -262,82 +538,57 @@ class ImageAligner:
             if working_img.ndim == 3
             else working_img
         )
-        kp2, des2 = self.orb.detectAndCompute(gray, self.stable_mask)
-        if des2 is None:
-            return working_img
-
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = sorted(matcher.match(self.des1, des2), key=lambda m: m.distance)
-        top_matches = matches[: max(4, int(len(matches) * 0.15))]
-
-        if len(top_matches) < 3:
-            return working_img
-
-        pts1 = np.float32([self.kp1[m.queryIdx].pt for m in top_matches]).reshape(
-            -1, 1, 2
-        )
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in top_matches]).reshape(-1, 1, 2)
-
-        # affine transform: rotation + translation + scale, no perspective (no twisting)
-        M, inliers = cv2.estimateAffine2D(
-            pts2, pts1, ransacReprojThreshold=3.0
-        )
-        if M is None or not self._is_plausible_affine(M, inliers):
-            return working_img
-
-        # --- ECC 정밀 정합 (sub-pixel refinement) ---
-        # estimateAffine2D의 M은 입력→기준이지만 findTransformECC의 행렬은
-        # 기준→입력 방향입니다. ECC 전후에 역행렬로 방향을 맞춥니다.
-        if self.refine_ecc:
-            try:
-                criteria = (
-                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                    50,
-                    # Scanner pages have already been initialized by ORB.  An
-                    # epsilon below this keeps iterating on sub-pixel noise
-                    # without meaningfully improving the alignment.
-                    1e-5,
+        if self.adaptive_cascade and self._last_affine is not None:
+            quick_score = self._quick_alignment_score(gray, self._last_affine)
+            self.last_quick_score = quick_score
+            if quick_score >= self._ADAPTIVE_QUICK_MIN_CORRELATION:
+                refined, correlation = self._refine_affine_with_ecc(
+                    gray,
+                    self._last_affine,
+                    min_correlation=self._adaptive_ecc_threshold(),
+                    max_iterations=self._ADAPTIVE_WARM_ECC_ITERATIONS,
                 )
-                ecc_gray = (
-                    cv2.resize(
-                        gray,
-                        (self.ecc_ref_gray.shape[1], self.ecc_ref_gray.shape[0]),
-                        interpolation=cv2.INTER_AREA,
+                if refined is not None:
+                    self._remember_alignment(refined, correlation, "warm_ecc")
+                    return self._warp_aligned(working_img, refined)
+
+            scaled_matrix = self._estimate_affine_with_orb(gray, scaled=True)
+            if scaled_matrix is not None:
+                refined, correlation = self._refine_affine_with_ecc(
+                    gray,
+                    scaled_matrix,
+                    min_correlation=self._adaptive_ecc_threshold(),
+                    max_iterations=self._ADAPTIVE_SCALED_ECC_ITERATIONS,
+                )
+                if refined is not None:
+                    self._remember_alignment(
+                        refined,
+                        correlation,
+                        "scaled_orb",
                     )
-                    if self.ecc_scale_x < 1.0 or self.ecc_scale_y < 1.0
-                    else gray
-                )
-                ecc_initial_full = cv2.invertAffineTransform(M).astype(np.float32)
-                ecc_initial = self._affine_to_ecc_scale(ecc_initial_full)
-                correlation, M_refined = cv2.findTransformECC(
-                    self.ecc_ref_gray,
-                    ecc_gray,
-                    ecc_initial,
-                    cv2.MOTION_AFFINE,
-                    criteria,
-                    self.ecc_stable_mask,
-                    5,
-                )
-                refined_full = cv2.invertAffineTransform(
-                    self._affine_from_ecc_scale(M_refined)
-                )
-                if (
-                    np.isfinite(correlation)
-                    and correlation > 0.20
-                    and self._is_plausible_affine(refined_full)
-                ):
-                    M = refined_full
-            except Exception:
-                pass  # ECC 실패 시 ORB 결과 그대로 사용
+                    return self._warp_aligned(working_img, refined)
 
-        border_value = 255 if working_img.ndim == 2 else (255, 255, 255)
-        return cv2.warpAffine(
-            working_img,
-            M,
-            (self.ref_w, self.ref_h),
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=border_value,
-        )
+        # 최종 폴백은 기존 전체 해상도 ORB → ECC 경로를 그대로 사용합니다.
+        matrix = self._estimate_affine_with_orb(gray, scaled=False)
+        if matrix is None:
+            self.last_alignment_stage = "unaligned"
+            return working_img
+
+        correlation = None
+        if self.refine_ecc:
+            refined, correlation = self._refine_affine_with_ecc(
+                gray,
+                matrix,
+                min_correlation=0.20,
+            )
+            if refined is not None:
+                matrix = refined
+
+        if self.adaptive_cascade:
+            self._remember_alignment(matrix, correlation, "full_orb")
+        else:
+            self.last_alignment_stage = "full_orb"
+        return self._warp_aligned(working_img, matrix)
 
 
 def apply_rotation(img: np.ndarray, rot_code: int, fine_angle: float) -> np.ndarray:
