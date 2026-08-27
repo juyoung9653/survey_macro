@@ -1,6 +1,8 @@
+from io import BytesIO
 from typing import Optional
 
 import openpyxl
+from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -212,9 +214,14 @@ def _write_stats_formulas(
             escaped_fn = _escape_excel_string(file_filter)
             nr_formula = (
                 f'=COUNTIFS({result_col_range},"",{file_col_range},"{escaped_fn}")'
+                f'+COUNTIFS({result_col_range},"검수필요*",'
+                f'{file_col_range},"{escaped_fn}")'
             )
         else:
-            nr_formula = f'=COUNTIF({result_col_range},"")'
+            nr_formula = (
+                f'=COUNTIF({result_col_range},"")'
+                f'+COUNTIF({result_col_range},"검수필요*")'
+            )
 
         cell = ws.cell(row=row, column=last_col, value=nr_formula)
         cell.fill = _non_resp_fill
@@ -258,6 +265,47 @@ def _write_stats_formulas(
     return row
 
 
+def _write_review_sheet(wb, results: list[dict]) -> None:
+    review_items = [
+        item
+        for result in results
+        for item in result.get("__review_items__", [])
+        if isinstance(item, dict)
+    ]
+    if not review_items:
+        return
+
+    ws = wb.create_sheet("검수필요", index=1)
+    headers = ["파일명", "페이지", "문항", "후보", "사유", "원본 이미지"]
+    for column, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=column, value=header)
+        cell.font = _header_font
+        cell.fill = _header_fill
+        cell.border = _thin_border
+        cell.alignment = _center_align
+
+    for row_index, item in enumerate(review_items, start=2):
+        for column, key in enumerate(headers[:-1], start=1):
+            cell = ws.cell(row=row_index, column=column, value=str(item.get(key, "")))
+            cell.border = _thin_border
+            cell.alignment = _wrap_align
+        image_bytes = item.get("이미지")
+        if isinstance(image_bytes, bytes) and image_bytes:
+            image = OpenpyxlImage(BytesIO(image_bytes))
+            scale = min(1.0, 520 / max(1, image.width), 180 / max(1, image.height))
+            image.width = round(image.width * scale)
+            image.height = round(image.height * scale)
+            ws.add_image(image, f"F{row_index}")
+            ws.row_dimensions[row_index].height = max(40, image.height * 0.75 + 8)
+        ws.cell(row=row_index, column=6).border = _thin_border
+
+    widths = [18, 24, 28, 28, 42, 72]
+    for column, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(column)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{len(review_items) + 1}"
+
+
 def export_to_excel(
     results: list[dict],
     config: Optional[TemplatePreset] = None,
@@ -273,7 +321,7 @@ def export_to_excel(
         ws_result = wb.active
         ws_result.title = "결과"
 
-        headers = list(results[0].keys())
+        headers = [key for key in results[0] if not key.startswith("__")]
         ws_result.append(headers)
 
         for item in results:
@@ -281,6 +329,8 @@ def export_to_excel(
             ws_result.append(row)
 
         last_data_row = len(results) + 1
+
+        _write_review_sheet(wb, results)
 
         # 필드 → 결과 시트 열 매핑
         field_col_map: dict[str, str] = {}

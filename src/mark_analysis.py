@@ -19,6 +19,34 @@ _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS = 5
 _SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO = 0.45
 _SHARED_STROKE_MIN_SHAPE_SPREAD = 0.18
 _FULL_LOCAL_SEARCH_RADIUS = 2
+_CHECKBOX_CANCEL_MIN_COMBINED_RATIO = 1.75
+_CHECKBOX_CANCEL_MIN_RUNNER_INK = 30
+_CHECKBOX_CANCEL_MIN_SHAPE_SPREAD = 0.35
+_CHECKBOX_RELIABLE_MARK_STRENGTH = 0.025
+
+
+def _expand_comment_box(box: Box) -> Box:
+    """Cover handwriting that strays around a configured free-text line.
+
+    Comment boxes in older presets usually describe only the printed answer
+    line. Respondents commonly start beside the ``답:`` label or continue on
+    the whitespace below it, so use a deliberately asymmetric, bounded
+    corridor around that line.
+    """
+    if box.w < 900:
+        return Box(box.page_idx, box.x, box.y, box.w, box.h)
+
+    left = min(240, round(box.w * 0.22))
+    right = min(90, round(box.w * 0.08))
+    top = min(35, round(box.h * 0.25))
+    bottom = min(210, round(box.h * 1.80))
+    return Box(
+        page_idx=box.page_idx,
+        x=max(0, box.x - left),
+        y=max(0, box.y - top),
+        w=box.w + left + right,
+        h=box.h + top + bottom,
+    )
 
 
 @dataclass
@@ -646,6 +674,111 @@ def extract_ink_info_from_mask(pure_ink_mask: np.ndarray, box: Box) -> tuple[int
     area = (x2 - x1) * (y2 - y1)
 
     return ink_pixels, area
+
+
+def _comment_region_has_meaningful_ink(
+    pure_ink_mask: np.ndarray,
+    box: Box,
+) -> bool:
+    """Reject isolated scan residue while retaining fragmented handwriting."""
+    image_h, image_w = pure_ink_mask.shape[:2]
+    x1 = max(0, box.x)
+    y1 = max(0, box.y)
+    x2 = min(image_w, box.x + box.w)
+    y2 = min(image_h, box.y + box.h)
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    roi = (pure_ink_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+    component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        roi, connectivity=8
+    )
+    compact_component_count = 0
+    compact_ink_pixels = 0
+    for component_idx in range(1, component_count):
+        width = int(stats[component_idx, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_idx, cv2.CC_STAT_HEIGHT])
+        area = int(stats[component_idx, cv2.CC_STAT_AREA])
+        span = max(width, height)
+        density = area / max(1, width * height)
+        aspect = span / max(1, min(width, height))
+        if area < 12:
+            continue
+        if aspect >= 6.0 and density <= 0.20:
+            continue
+        if span <= 32 and density >= 0.45:
+            compact_component_count += 1
+            compact_ink_pixels += area
+            continue
+        return True
+
+    # Template subtraction can split small handwritten Korean glyphs into
+    # several dense islands. One or two such islands are commonly scan dust;
+    # a sufficiently strong cluster is a real free-text response.
+    return compact_component_count >= 3 and compact_ink_pixels >= 300
+
+
+def _comment_has_overprint_evidence(
+    target_gray: np.ndarray,
+    template_gray: np.ndarray,
+    box: Box,
+) -> bool:
+    """Detect a localized pen stroke drawn over the printed answer label.
+
+    Binary template subtraction intentionally removes printed glyphs and can
+    also hide a response written directly on top of them. For long free-text
+    lines, compare darkness in a narrow label window with its taller local
+    context. The absolute energy guard prevents ordinary registration residue
+    from being promoted to a response.
+    """
+    if box.w < 900 or target_gray.size == 0 or template_gray.size == 0:
+        return False
+    if target_gray.ndim == 3:
+        target_gray = cv2.cvtColor(target_gray, cv2.COLOR_BGR2GRAY)
+    if template_gray.ndim == 3:
+        template_gray = cv2.cvtColor(template_gray, cv2.COLOR_BGR2GRAY)
+    if template_gray.shape != target_gray.shape:
+        template_gray = cv2.resize(
+            template_gray,
+            (target_gray.shape[1], target_gray.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    def darkness_energy(
+        x1: int, y1: int, x2: int, y2: int
+    ) -> tuple[int, int]:
+        image_h, image_w = target_gray.shape[:2]
+        x1 = max(0, min(image_w, x1))
+        y1 = max(0, min(image_h, y1))
+        x2 = max(x1, min(image_w, x2))
+        y2 = max(y1, min(image_h, y2))
+        if x2 <= x1 or y2 <= y1:
+            return 0, 0
+        delta = (
+            template_gray[y1:y2, x1:x2].astype(np.int16)
+            - target_gray[y1:y2, x1:x2].astype(np.int16)
+        )
+        darker = delta >= 20
+        return int(delta[darker].sum()), int(delta.size)
+
+    context_energy, _ = darkness_energy(
+        box.x - round(box.w * 0.018),
+        box.y - round(box.h * 0.18),
+        box.x + round(box.w * 0.036),
+        box.y + round(box.h * 1.18),
+    )
+    focus_energy, focus_area = darkness_energy(
+        box.x - round(box.w * 0.026),
+        box.y + round(box.h * 0.20),
+        box.x + round(box.w * 0.046),
+        box.y + round(box.h * 0.98),
+    )
+    minimum_focus_energy = round(focus_area * 1.45)
+    return (
+        context_energy > 0
+        and focus_energy >= minimum_focus_energy
+        and focus_energy >= context_energy * 0.80
+    )
 
 
 def _is_checkbox_like(box: Box, image_shape: tuple[int, ...]) -> bool:
@@ -1678,7 +1811,7 @@ def _checkbox_cancellation_runner_up_index(
     halo_infos: list[_CheckboxHaloInfo],
     check_results: list[bool],
 ) -> int | None:
-    """Recognize a dense crossed-out small box followed by one normal check."""
+    """Return the intended mark beside a strong two-dimensional cancellation."""
     if not (
         len(checkbox_infos) == len(halo_infos) == len(check_results)
     ):
@@ -1697,24 +1830,101 @@ def _checkbox_cancellation_runner_up_index(
         zip(candidates, combined_inks), key=lambda item: item[1], reverse=True
     )
     (top_idx, top_ink), (runner_idx, runner_ink) = ordered
-    if runner_ink <= 0 or top_ink < runner_ink * _CANCEL_MARK_MIN_INK_RATIO:
+    if (
+        runner_ink < _CHECKBOX_CANCEL_MIN_RUNNER_INK
+        or top_ink < runner_ink * _CHECKBOX_CANCEL_MIN_COMBINED_RATIO
+    ):
         return None
 
     top_info = checkbox_infos[top_idx]
     runner_info = checkbox_infos[runner_idx]
-    top_fill = top_info.ink_pixels / max(1, top_info.area)
-    runner_fill = runner_info.ink_pixels / max(1, runner_info.area)
-    top_density = _local_mark_bbox_density(top_info.ink_mask)
     runner_has_stroke = (
         runner_info.stroke_span_ratio >= 0.35
         or halo_infos[runner_idx].ink_pixels >= 12
     )
+    shape_cancel = (
+        _checkbox_mark_shape_spread(top_info, halo_infos[top_idx])
+        >= _CHECKBOX_CANCEL_MIN_SHAPE_SPREAD
+    )
+    dense_cancel = (
+        top_ink >= runner_ink * _CANCEL_MARK_MIN_INK_RATIO
+        and top_info.ink_pixels / max(1, top_info.area) >= 0.18
+        and _local_mark_bbox_density(top_info.ink_mask) >= 0.28
+        and runner_info.ink_pixels / max(1, runner_info.area) <= 0.22
+    )
     if (
-        top_fill < 0.18
-        or top_density < 0.28
-        or runner_fill > 0.22
-        or runner_info.mark_strength < 0.025
+        top_info.mark_strength < _CHECKBOX_RELIABLE_MARK_STRENGTH
+        or runner_info.mark_strength < _CHECKBOX_RELIABLE_MARK_STRENGTH
         or not runner_has_stroke
+        or not (shape_cancel or dense_cancel)
     ):
         return None
     return runner_idx
+
+
+def _checkbox_ambiguous_indices(
+    checkbox_infos: list[_CheckboxInkInfo],
+    halo_infos: list[_CheckboxHaloInfo],
+    check_results: list[bool],
+) -> list[int]:
+    """Return two independently credible marks that should not be guessed."""
+    if not (
+        len(checkbox_infos) == len(halo_infos) == len(check_results)
+    ):
+        return []
+    candidates = [
+        index for index, is_checked in enumerate(check_results) if is_checked
+    ]
+    if len(candidates) != 2:
+        return []
+    for index in candidates:
+        direct = checkbox_infos[index]
+        halo = halo_infos[index]
+        if (
+            direct.ink_pixels + halo.ink_pixels
+            < _CHECKBOX_CANCEL_MIN_RUNNER_INK
+            or direct.mark_strength < _CHECKBOX_RELIABLE_MARK_STRENGTH
+            or direct.stroke_span_ratio < 0.35
+            or halo.ink_pixels < 12
+        ):
+            return []
+    return candidates
+
+
+def _suppress_isolated_weak_checkbox_marks(
+    checkbox_infos: list[_CheckboxInkInfo],
+    halo_infos: list[_CheckboxHaloInfo],
+    check_results: list[bool],
+) -> list[bool]:
+    """Drop a tiny isolated speck only when a strong sibling mark exists."""
+    if not (
+        len(checkbox_infos) == len(halo_infos) == len(check_results)
+    ):
+        return list(check_results)
+    selected = [index for index, value in enumerate(check_results) if value]
+    if len(selected) < 2:
+        return list(check_results)
+    strong = {
+        index
+        for index in selected
+        if (
+            checkbox_infos[index].ink_pixels + halo_infos[index].ink_pixels >= 50
+            and checkbox_infos[index].mark_strength >= 0.25
+        )
+    }
+    if not strong:
+        return list(check_results)
+
+    filtered = list(check_results)
+    for index in selected:
+        if index in strong:
+            continue
+        direct = checkbox_infos[index]
+        halo = halo_infos[index]
+        if (
+            direct.ink_pixels + halo.ink_pixels <= 6
+            and halo.ink_pixels == 0
+            and direct.stroke_span_ratio < 0.30
+        ):
+            filtered[index] = False
+    return filtered

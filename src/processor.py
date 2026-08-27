@@ -34,10 +34,14 @@ from .mark_analysis import (
     _build_stable_region_mask,
     _cancellation_runner_up_index,
     _checkbox_box_key,
+    _checkbox_ambiguous_indices,
     _checkbox_cancellation_runner_up_index,
     _checkbox_difference_features,
     _checkbox_mark_shape_spread,
+    _comment_has_overprint_evidence,
+    _comment_region_has_meaningful_ink,
     _correlation_choice_is_ambiguous,
+    _expand_comment_box,
     _extract_checkbox_halo_info,
     _filter_checkbox_mark_components,
     _is_checkbox_like,
@@ -48,6 +52,7 @@ from .mark_analysis import (
     _refine_checkbox_box,
     _resolve_checkbox_halo_ownership,
     _scaled_shift_is_consistent,
+    _suppress_isolated_weak_checkbox_marks,
     enforce_single_choice,
     evaluate_checkbox_halo_marks,
     evaluate_checkbox_marks,
@@ -890,7 +895,10 @@ def _analysis_survey_work(
 def _select_working_boxes(
     field, z_sorted_boxes: list[Box], all_boxes: list[Box]
 ) -> list[Box]:
-    if field.is_comment or field.allow_duplicates:
+    if field.is_comment:
+        return [_expand_comment_box(box) for box in z_sorted_boxes]
+
+    if field.allow_duplicates:
         return [copy.copy(b) for b in z_sorted_boxes]
 
     return expand_isolated_boxes(z_sorted_boxes, all_boxes, scale_factor=2.0)
@@ -1858,6 +1866,24 @@ def _collect_ink_data(
     return inks, areas, valid_boxes
 
 
+def _encode_review_crop(
+    gray_page: np.ndarray,
+    boxes: list[Box],
+) -> bytes | None:
+    """Encode a compact original-image crop around one ambiguous field."""
+    if gray_page.size == 0 or not boxes:
+        return None
+    image_h, image_w = gray_page.shape[:2]
+    x1 = max(0, min(box.x for box in boxes) - 70)
+    y1 = max(0, min(box.y for box in boxes) - 55)
+    x2 = min(image_w, max(box.x + box.w for box in boxes) + 70)
+    y2 = min(image_h, max(box.y + box.h for box in boxes) + 55)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    success, encoded = cv2.imencode(".png", gray_page[y1:y2, x1:x2])
+    return encoded.tobytes() if success else None
+
+
 # Survey processing and pipeline orchestration
 
 
@@ -2068,6 +2094,12 @@ def process_survey_data(
                 direct or halo
                 for direct, halo in zip(direct_results, halo_results)
             ]
+            if field.allow_duplicates:
+                check_results = _suppress_isolated_weak_checkbox_marks(
+                    checkbox_infos,
+                    halo_infos,
+                    check_results,
+                )
             valid_boxes = [
                 info.box if is_reliable else source_box
                 for info, is_reliable, source_box in zip(
@@ -2116,10 +2148,24 @@ def process_survey_data(
         areas = halo_areas if checkbox_mode else current_areas
 
         if field.is_comment:
-            check_results = [
-                (ink > 10) or (area > 0 and (ink / area) >= 0.01)
-                for ink, area in zip(inks, areas)
-            ]
+            check_results = []
+            for source_box, working_box in zip(scoring_boxes, valid_boxes):
+                page_idx = working_box.page_idx
+                has_ink = page_idx in pure_ink_masks and (
+                    _comment_region_has_meaningful_ink(
+                        pure_ink_masks[page_idx], working_box
+                    )
+                )
+                template = dynamic_templates.get(page_idx)
+                has_overprint = (
+                    not has_ink
+                    and page_idx in survey_gray_pages
+                    and template is not None
+                    and _comment_has_overprint_evidence(
+                        survey_gray_pages[page_idx], template, source_box
+                    )
+                )
+                check_results.append(has_ink or has_overprint)
 
         if field.is_comment:
             has_comment = False
@@ -2147,6 +2193,7 @@ def process_survey_data(
             row_data[field.name] = "있음" if has_comment else ""
             continue
 
+        ambiguous_indices: list[int] = []
         if not field.allow_duplicates:
             if checkbox_mode and sum(check_results) > 1:
                 correction_idx = _checkbox_cancellation_runner_up_index(
@@ -2160,23 +2207,30 @@ def process_survey_data(
                         for index in range(len(check_results))
                     ]
                 else:
-                    checked_indices = [
-                        index
-                        for index, is_checked in enumerate(check_results)
-                        if is_checked
-                    ]
-                    best_idx = max(
-                        checked_indices,
-                        key=lambda index: (
-                            direct_strengths[index],
-                            direct_inks[index] * 3 + halo_inks[index],
-                            direct_inks[index] / max(1, direct_areas[index]),
-                            halo_inks[index] / max(1, halo_areas[index]),
-                        ),
+                    ambiguous_indices = _checkbox_ambiguous_indices(
+                        checkbox_infos,
+                        halo_infos,
+                        check_results,
                     )
-                    check_results = [
-                        index == best_idx for index in range(len(check_results))
-                    ]
+                    if not ambiguous_indices:
+                        checked_indices = [
+                            index
+                            for index, is_checked in enumerate(check_results)
+                            if is_checked
+                        ]
+                        best_idx = max(
+                            checked_indices,
+                            key=lambda index: (
+                                direct_strengths[index],
+                                direct_inks[index] * 3 + halo_inks[index],
+                                direct_inks[index] / max(1, direct_areas[index]),
+                                halo_inks[index] / max(1, halo_areas[index]),
+                            ),
+                        )
+                        check_results = [
+                            index == best_idx
+                            for index in range(len(check_results))
+                        ]
             else:
                 correction_idx = None
                 if not checkbox_mode:
@@ -2219,7 +2273,34 @@ def process_survey_data(
                     mapped_value = field.value_map[label_number - 1].strip()
                 checked_labels.append((label, mapped_value))
 
-        if checked_labels:
+        if ambiguous_indices:
+            candidate_values = [
+                mapped_value if mapped_value else label
+                for label, mapped_value in checked_labels
+            ]
+            candidate_text = "/".join(candidate_values)
+            row_data[field.name] = f"검수필요({candidate_text})"
+            page_indices = {
+                valid_boxes[index].page_idx for index in ambiguous_indices
+            }
+            review_image = None
+            if len(page_indices) == 1:
+                page_idx = next(iter(page_indices))
+                if page_idx in survey_gray_pages:
+                    review_image = _encode_review_crop(
+                        survey_gray_pages[page_idx], valid_boxes
+                    )
+            row_data.setdefault("__review_items__", []).append(
+                {
+                    "파일명": fname,
+                    "페이지": survey_label,
+                    "문항": field.name,
+                    "후보": candidate_text,
+                    "사유": "두 선택지의 표식이 모두 뚜렷해 자동 확정하지 않음",
+                    "이미지": review_image,
+                }
+            )
+        elif checked_labels:
             output_values = [mv if mv else lbl for lbl, mv in checked_labels]
             row_data[field.name] = ",".join(output_values)
         else:
@@ -2383,6 +2464,7 @@ def _build_page_aligners(
         ImageAligner(
             reference,
             stable_mask=_build_stable_region_mask(reference.shape, config, page_idx),
+            sparse_lk=True,
         )
         for page_idx, reference in enumerate(alignment_references)
     ]
@@ -2795,9 +2877,11 @@ def _analyze_single_file(
         def consume_survey_result(result, completed_surveys: int) -> None:
             row_data, debug_base, ink_base, debug_ann, ink_ann, cp = result
             field_values = [
-                v for k, v in row_data.items() if k not in ("파일명", "페이지")
+                v
+                for k, v in row_data.items()
+                if k not in ("파일명", "페이지") and not k.startswith("__")
             ]
-            if any(v.strip() for v in field_values):
+            if any(str(v).strip() for v in field_values):
                 file_results.append(row_data)
 
             for local_p in sorted(debug_base):

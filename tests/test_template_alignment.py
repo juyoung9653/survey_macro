@@ -403,6 +403,137 @@ class TemplateAlignmentTests(unittest.TestCase):
         self.assertEqual(aligner.last_alignment_stage, "warm_ecc")
         self.assertTrue(np.array_equal(aligned, reference))
 
+    def test_sparse_lk_recovers_small_affine_with_short_ecc_refinement(self):
+        reference = _make_form(height=1000, width=700)
+        height, width = reference.shape
+        ref_to_target = cv2.getRotationMatrix2D(
+            (width / 2, height / 2), -0.25, 1.001
+        ).astype(np.float32)
+        ref_to_target[0, 2] += 4.0
+        ref_to_target[1, 2] -= 3.0
+        target_to_ref = cv2.invertAffineTransform(ref_to_target)
+        target = cv2.warpAffine(
+            reference,
+            ref_to_target,
+            (width, height),
+            borderValue=255,
+        )
+        aligner = ImageAligner(reference, sparse_lk=True)
+        aligner._last_affine = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        aligner._last_ecc_correlation = 0.90
+
+        with patch.object(
+            aligner,
+            "_refine_affine_with_ecc",
+            wraps=aligner._refine_affine_with_ecc,
+        ) as refine_ecc:
+            aligned = aligner.align(target)
+
+        corners = np.float32(
+            [
+                [[0, 0]],
+                [[width - 1, 0]],
+                [[0, height - 1]],
+                [[width - 1, height - 1]],
+            ]
+        )
+        expected_corners = cv2.transform(corners, target_to_ref)
+        actual_corners = cv2.transform(corners, aligner._last_affine)
+        corner_error = np.linalg.norm(
+            expected_corners.reshape(-1, 2) - actual_corners.reshape(-1, 2),
+            axis=1,
+        )
+
+        refine_ecc.assert_called_once()
+        self.assertEqual(
+            refine_ecc.call_args.kwargs["max_iterations"],
+            ImageAligner._SPARSE_LK_ECC_ITERATIONS,
+        )
+        self.assertEqual(aligner.last_alignment_stage, "warm_lk_ecc")
+        self.assertGreaterEqual(
+            aligner.last_lk_inlier_count, ImageAligner._SPARSE_LK_MIN_TRACKS
+        )
+        self.assertLess(float(corner_error.max()), 0.75)
+        self.assertEqual(aligned.shape, reference.shape)
+
+    def test_sparse_lk_rejection_uses_unchanged_ecc_fallback(self):
+        reference = _make_form()
+        aligner = ImageAligner(reference, sparse_lk=True)
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        aligner._last_affine = identity.copy()
+        aligner._last_ecc_correlation = 0.90
+
+        with (
+            patch.object(
+                aligner,
+                "_quick_alignment_score",
+                return_value=0.95,
+            ),
+            patch.object(
+                aligner,
+                "_estimate_affine_with_sparse_lk",
+                return_value=(None, 0.40),
+            ) as sparse_lk,
+            patch.object(
+                aligner,
+                "_refine_affine_with_ecc",
+                return_value=(identity.copy(), 0.95),
+            ) as refine_ecc,
+        ):
+            aligned = aligner.align(reference)
+
+        sparse_lk.assert_called_once()
+        refine_ecc.assert_called_once()
+        self.assertEqual(aligner.last_alignment_stage, "warm_ecc")
+        self.assertTrue(np.array_equal(aligned, reference))
+
+    def test_sparse_lk_short_ecc_failure_retries_full_warm_ecc(self):
+        reference = _make_form()
+        aligner = ImageAligner(reference, sparse_lk=True)
+        identity = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32
+        )
+        aligner._last_affine = identity.copy()
+        aligner._last_ecc_correlation = 0.90
+
+        with (
+            patch.object(
+                aligner,
+                "_quick_alignment_score",
+                return_value=0.95,
+            ),
+            patch.object(
+                aligner,
+                "_estimate_affine_with_sparse_lk",
+                return_value=(identity.copy(), 0.95),
+            ),
+            patch.object(
+                aligner,
+                "_refine_affine_with_ecc",
+                side_effect=[
+                    (None, 0.40),
+                    (identity.copy(), 0.95),
+                ],
+            ) as refine_ecc,
+        ):
+            aligned = aligner.align(reference)
+
+        self.assertEqual(refine_ecc.call_count, 2)
+        self.assertEqual(
+            refine_ecc.call_args_list[0].kwargs["max_iterations"],
+            ImageAligner._SPARSE_LK_ECC_ITERATIONS,
+        )
+        self.assertEqual(
+            refine_ecc.call_args_list[1].kwargs["max_iterations"],
+            ImageAligner._ADAPTIVE_WARM_ECC_ITERATIONS,
+        )
+        self.assertEqual(aligner.last_alignment_stage, "warm_ecc")
+        self.assertTrue(np.array_equal(aligned, reference))
+
     def test_image_aligner_escalates_scaled_failure_to_existing_full_path(self):
         reference = _make_form()
         aligner = ImageAligner(reference, adaptive_cascade=True)

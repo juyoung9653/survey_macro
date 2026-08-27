@@ -138,6 +138,16 @@ class ImageAligner:
     _ADAPTIVE_ECC_MIN_CORRELATION = 0.60
     _ADAPTIVE_WARM_ECC_ITERATIONS = 12
     _ADAPTIVE_SCALED_ECC_ITERATIONS = 15
+    _SPARSE_LK_MAX_CORNERS = 400
+    _SPARSE_LK_MIN_TRACKS = 18
+    _SPARSE_LK_MIN_TRACK_RATIO = 0.30
+    _SPARSE_LK_MIN_INLIER_RATIO = 0.45
+    _SPARSE_LK_MAX_FB_MEDIAN = 0.75
+    _SPARSE_LK_MAX_FB_P90 = 1.75
+    _SPARSE_LK_MAX_REPROJECTION_MEDIAN = 0.55
+    _SPARSE_LK_MAX_REPROJECTION_P90 = 1.25
+    _SPARSE_LK_SCORE_TOLERANCE = 0.002
+    _SPARSE_LK_ECC_ITERATIONS = 4
 
     def __init__(
         self,
@@ -146,6 +156,7 @@ class ImageAligner:
         ecc_max_dimension: int = 1200,
         stable_mask: np.ndarray | None = None,
         adaptive_cascade: bool = True,
+        sparse_lk: bool = False,
     ):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
@@ -153,10 +164,16 @@ class ImageAligner:
         self.ref_h, self.ref_w = self.ref_gray.shape[:2]
         self.refine_ecc = refine_ecc
         self.adaptive_cascade = bool(adaptive_cascade and refine_ecc)
+        self.sparse_lk = bool(sparse_lk and self.adaptive_cascade)
         self._last_affine: np.ndarray | None = None
         self._last_ecc_correlation: float | None = None
         self.last_alignment_stage = "full_orb"
         self.last_quick_score: float | None = None
+        self.last_lk_track_count = 0
+        self.last_lk_inlier_count = 0
+        self.last_lk_fb_error: float | None = None
+        self.last_lk_reprojection_error: float | None = None
+        self.last_lk_rejection_reason: str | None = None
         long_side = max(self.ref_h, self.ref_w)
         if refine_ecc and ecc_max_dimension > 0 and long_side > ecc_max_dimension:
             scale = ecc_max_dimension / long_side
@@ -222,6 +239,7 @@ class ImageAligner:
             dtype=np.uint8,
         )
         self._quick_full_mask = self._quick_valid_source.copy()
+        self._sparse_lk_ref_points = self._prepare_sparse_lk_points()
 
     def _prepare_stable_mask(
         self, stable_mask: np.ndarray | None
@@ -241,6 +259,25 @@ class ImageAligner:
         if cv2.countNonZero(stable_mask) < self.ref_h * self.ref_w * 0.15:
             return None
         return stable_mask
+
+    def _prepare_sparse_lk_points(self) -> np.ndarray | None:
+        if not self.sparse_lk:
+            return None
+        min_distance = max(8, round(max(self.ecc_ref_gray.shape) * 0.0125))
+        try:
+            points = cv2.goodFeaturesToTrack(
+                self.ecc_ref_gray,
+                maxCorners=self._SPARSE_LK_MAX_CORNERS,
+                qualityLevel=0.01,
+                minDistance=min_distance,
+                mask=self.ecc_stable_mask,
+                blockSize=7,
+            )
+        except Exception:
+            return None
+        if points is None or len(points) < self._SPARSE_LK_MIN_TRACKS:
+            return None
+        return points.astype(np.float32, copy=False)
 
     def _is_plausible_affine(
         self, matrix: np.ndarray, inliers: np.ndarray | None = None
@@ -443,6 +480,172 @@ class ImageAligner:
         except Exception:
             return None, None
 
+    def _estimate_affine_with_sparse_lk(
+        self,
+        gray: np.ndarray,
+        initial_matrix: np.ndarray,
+        initial_score: float | None,
+    ) -> tuple[np.ndarray | None, float | None]:
+        """Refine an affine estimate with sparse LK, or reject it for ECC fallback."""
+        ref_points = self._sparse_lk_ref_points
+        self.last_lk_track_count = 0
+        self.last_lk_inlier_count = 0
+        self.last_lk_fb_error = None
+        self.last_lk_reprojection_error = None
+        self.last_lk_rejection_reason = None
+        if ref_points is None:
+            self.last_lk_rejection_reason = "no_reference_points"
+            return None, None
+
+        try:
+            target = self._ecc_target(gray)
+            scaled_initial = self._affine_to_ecc_scale(initial_matrix)
+            ref_to_target = cv2.invertAffineTransform(scaled_initial)
+            target_seed = cv2.transform(ref_points, ref_to_target)
+            target_points, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+                self.ecc_ref_gray,
+                target,
+                ref_points,
+                target_seed.copy(),
+                winSize=(31, 31),
+                maxLevel=3,
+                criteria=(
+                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                    20,
+                    0.01,
+                ),
+                flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+                minEigThreshold=1e-4,
+            )
+            if target_points is None or forward_status is None:
+                self.last_lk_rejection_reason = "forward_flow"
+                return None, None
+
+            backward_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+                target,
+                self.ecc_ref_gray,
+                target_points,
+                ref_points.copy(),
+                winSize=(31, 31),
+                maxLevel=3,
+                criteria=(
+                    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                    20,
+                    0.01,
+                ),
+                flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+                minEigThreshold=1e-4,
+            )
+            if backward_points is None or backward_status is None:
+                self.last_lk_rejection_reason = "backward_flow"
+                return None, None
+
+            flat_ref = ref_points.reshape(-1, 2)
+            flat_target = target_points.reshape(-1, 2)
+            flat_backward = backward_points.reshape(-1, 2)
+            finite = (
+                np.isfinite(flat_target).all(axis=1)
+                & np.isfinite(flat_backward).all(axis=1)
+            )
+            valid = (
+                (forward_status.reshape(-1) > 0)
+                & (backward_status.reshape(-1) > 0)
+                & finite
+            )
+            fb_errors = np.linalg.norm(flat_backward - flat_ref, axis=1)
+            valid &= fb_errors <= self._SPARSE_LK_MAX_FB_P90
+            valid_count = int(np.count_nonzero(valid))
+            self.last_lk_track_count = valid_count
+            if (
+                valid_count < self._SPARSE_LK_MIN_TRACKS
+                or valid_count / len(ref_points) < self._SPARSE_LK_MIN_TRACK_RATIO
+            ):
+                self.last_lk_rejection_reason = "track_count"
+                return None, None
+
+            valid_ref = flat_ref[valid].reshape(-1, 1, 2)
+            valid_target = flat_target[valid].reshape(-1, 1, 2)
+            valid_fb = fb_errors[valid]
+            fb_median = float(np.median(valid_fb))
+            fb_p90 = float(np.percentile(valid_fb, 90))
+            self.last_lk_fb_error = fb_median
+            if (
+                fb_median > self._SPARSE_LK_MAX_FB_MEDIAN
+                or fb_p90 > self._SPARSE_LK_MAX_FB_P90
+            ):
+                self.last_lk_rejection_reason = "forward_backward_error"
+                return None, None
+
+            matrix, inliers = cv2.estimateAffine2D(
+                valid_target,
+                valid_ref,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=1.25,
+                maxIters=1000,
+                confidence=0.99,
+                refineIters=10,
+            )
+            if matrix is None or inliers is None:
+                self.last_lk_rejection_reason = "affine_estimation"
+                return None, None
+            inlier_mask = inliers.reshape(-1) > 0
+            inlier_count = int(np.count_nonzero(inlier_mask))
+            self.last_lk_inlier_count = inlier_count
+            if (
+                inlier_count < self._SPARSE_LK_MIN_TRACKS
+                or inlier_count / valid_count < self._SPARSE_LK_MIN_INLIER_RATIO
+            ):
+                self.last_lk_rejection_reason = "inlier_count"
+                return None, None
+
+            inlier_ref = valid_ref.reshape(-1, 2)[inlier_mask]
+            inlier_target = valid_target.reshape(-1, 2)[inlier_mask]
+            x_span = float(np.ptp(inlier_ref[:, 0]))
+            y_span = float(np.ptp(inlier_ref[:, 1]))
+            height, width = self.ecc_ref_gray.shape
+            hull_area = float(cv2.contourArea(cv2.convexHull(inlier_ref)))
+            if (
+                x_span < width * 0.35
+                or y_span < height * 0.35
+                or hull_area < width * height * 0.08
+            ):
+                self.last_lk_rejection_reason = "spatial_distribution"
+                return None, None
+
+            projected_ref = cv2.transform(
+                inlier_target.reshape(-1, 1, 2), matrix
+            ).reshape(-1, 2)
+            reprojection = np.linalg.norm(projected_ref - inlier_ref, axis=1)
+            reprojection_median = float(np.median(reprojection))
+            reprojection_p90 = float(np.percentile(reprojection, 90))
+            self.last_lk_reprojection_error = reprojection_median
+            if (
+                reprojection_median > self._SPARSE_LK_MAX_REPROJECTION_MEDIAN
+                or reprojection_p90 > self._SPARSE_LK_MAX_REPROJECTION_P90
+            ):
+                self.last_lk_rejection_reason = "reprojection_error"
+                return None, None
+
+            full_matrix = self._affine_from_ecc_scale(matrix)
+            if not self._is_plausible_affine(full_matrix, inliers):
+                self.last_lk_rejection_reason = "implausible_affine"
+                return None, None
+
+            score = self._quick_alignment_score(gray, full_matrix)
+            minimum_score = self._adaptive_ecc_threshold()
+            if initial_score is not None and np.isfinite(initial_score):
+                minimum_score = max(
+                    minimum_score,
+                    initial_score - self._SPARSE_LK_SCORE_TOLERANCE,
+                )
+            if not np.isfinite(score) or score < minimum_score:
+                self.last_lk_rejection_reason = "quick_score"
+                return None, score
+            return full_matrix.astype(np.float32), score
+        except Exception:
+            self.last_lk_rejection_reason = "exception"
+            return None, None
+
     def _quick_alignment_score(
         self,
         gray: np.ndarray,
@@ -541,6 +744,27 @@ class ImageAligner:
         if self.adaptive_cascade and self._last_affine is not None:
             quick_score = self._quick_alignment_score(gray, self._last_affine)
             self.last_quick_score = quick_score
+            if self.sparse_lk:
+                sparse_matrix, sparse_score = self._estimate_affine_with_sparse_lk(
+                    gray,
+                    self._last_affine,
+                    quick_score,
+                )
+                if sparse_matrix is not None:
+                    refined, correlation = self._refine_affine_with_ecc(
+                        gray,
+                        sparse_matrix,
+                        min_correlation=self._adaptive_ecc_threshold(),
+                        max_iterations=self._SPARSE_LK_ECC_ITERATIONS,
+                    )
+                    if refined is not None:
+                        self.last_quick_score = sparse_score
+                        self._remember_alignment(
+                            refined,
+                            correlation,
+                            "warm_lk_ecc",
+                        )
+                        return self._warp_aligned(working_img, refined)
             if quick_score >= self._ADAPTIVE_QUICK_MIN_CORRELATION:
                 refined, correlation = self._refine_affine_with_ecc(
                     gray,
@@ -554,6 +778,30 @@ class ImageAligner:
 
             scaled_matrix = self._estimate_affine_with_orb(gray, scaled=True)
             if scaled_matrix is not None:
+                if self.sparse_lk:
+                    scaled_score = self._quick_alignment_score(gray, scaled_matrix)
+                    sparse_matrix, sparse_score = (
+                        self._estimate_affine_with_sparse_lk(
+                            gray,
+                            scaled_matrix,
+                            scaled_score,
+                        )
+                    )
+                    if sparse_matrix is not None:
+                        refined, correlation = self._refine_affine_with_ecc(
+                            gray,
+                            sparse_matrix,
+                            min_correlation=self._adaptive_ecc_threshold(),
+                            max_iterations=self._SPARSE_LK_ECC_ITERATIONS,
+                        )
+                        if refined is not None:
+                            self.last_quick_score = sparse_score
+                            self._remember_alignment(
+                                refined,
+                                correlation,
+                                "scaled_orb_lk_ecc",
+                            )
+                            return self._warp_aligned(working_img, refined)
                 refined, correlation = self._refine_affine_with_ecc(
                     gray,
                     scaled_matrix,
