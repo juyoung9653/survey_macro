@@ -5,6 +5,11 @@ import cv2
 import numpy as np
 
 from src.models import Box, Field, TemplatePreset
+from src.mark_analysis import (
+    _best_shift_by_local_binary_overlap,
+    _best_shift_with_safe_local_fallback,
+    _prepare_template_alignment_cache,
+)
 from src.processor import (
     _CheckboxHaloInfo,
     _CheckboxInkInfo,
@@ -74,6 +79,70 @@ class TemplateAlignmentTests(unittest.TestCase):
         self.assertEqual(result, (150.0, 150, -4, 3))
         self.assertEqual(empty_result, (float("-inf"), 0, 0, 0))
 
+    def test_local_binary_shift_matches_full_correlation_when_confident(self):
+        template = np.zeros((80, 90), np.uint8)
+        cv2.rectangle(template, (18, 15), (52, 48), 255, -1)
+        cv2.line(template, (24, 55), (68, 61), 255, 3)
+        matrix = np.array([[1.0, 0.0, 3.0], [0.0, 1.0, -2.0]])
+        target = cv2.warpAffine(template, matrix, (90, 80))
+        max_shift = 8
+        padded_target = cv2.copyMakeBorder(
+            target,
+            max_shift,
+            max_shift,
+            max_shift,
+            max_shift,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+        reference_pixels = cv2.countNonZero(template)
+
+        local_result, is_confident = _best_shift_by_local_binary_overlap(
+            template,
+            padded_target,
+            max_shift,
+            reference_pixels,
+            (3, -2),
+        )
+        full_result = _best_shift_by_correlation(
+            template, padded_target, max_shift, reference_pixels
+        )
+
+        self.assertTrue(is_confident)
+        self.assertEqual(local_result, full_result)
+
+    def test_local_binary_shift_falls_back_when_winner_hits_window_edge(self):
+        template = np.zeros((80, 90), np.uint8)
+        cv2.rectangle(template, (18, 15), (52, 48), 255, -1)
+        matrix = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, 0.0]])
+        target = cv2.warpAffine(template, matrix, (90, 80))
+        max_shift = 8
+        padded_target = cv2.copyMakeBorder(
+            target,
+            max_shift,
+            max_shift,
+            max_shift,
+            max_shift,
+            cv2.BORDER_CONSTANT,
+            value=0,
+        )
+        reference_pixels = cv2.countNonZero(template)
+
+        with patch(
+            "src.mark_analysis._best_shift_by_correlation",
+            wraps=_best_shift_by_correlation,
+        ) as full_search:
+            result = _best_shift_with_safe_local_fallback(
+                template,
+                padded_target,
+                max_shift,
+                reference_pixels,
+                (2, 0),
+            )
+
+        full_search.assert_called_once()
+        self.assertEqual(result[2:], (5, 0))
+
     def test_identity_alignment_is_unchanged(self):
         template = _dark_mask(_make_form())
 
@@ -94,6 +163,31 @@ class TemplateAlignmentTests(unittest.TestCase):
         aligned = _align_template_mask_by_coverage(template, target_mask)
 
         self.assertGreater(_overlap(aligned, target_mask), _overlap(template, target_mask))
+
+    def test_template_alignment_cache_reuses_fixed_preprocessing(self):
+        form = _make_form()
+        height, width = form.shape
+        template = _dark_mask(form)
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 0.35, 1.0)
+        matrix[0, 2] += 5
+        matrix[1, 2] -= 4
+        target = cv2.warpAffine(form, matrix, (width, height), borderValue=255)
+        target_mask = _dark_mask(target)
+        cache = _prepare_template_alignment_cache(template, target_mask.shape)
+
+        with patch(
+            "src.mark_analysis._prepare_template_alignment_cache",
+            wraps=_prepare_template_alignment_cache,
+        ) as prepare_cache:
+            first = _align_template_mask_by_coverage(
+                template, target_mask, template_cache=cache
+            )
+            second = _align_template_mask_by_coverage(
+                template, target_mask, template_cache=cache
+            )
+
+        prepare_cache.assert_not_called()
+        self.assertTrue(np.array_equal(first, second))
 
     def test_coverage_alignment_verifies_only_confident_fine_angle_at_full_size(self):
         template = np.zeros((1000, 700), np.uint8)

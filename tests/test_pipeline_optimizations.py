@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -350,6 +351,30 @@ class PipelineOptimizationTests(unittest.TestCase):
         max_active = 0
         active_lock = threading.Lock()
 
+        class NewThreadExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self.threads = []
+
+            def submit(self, function, *args):
+                future = Future()
+
+                def run():
+                    try:
+                        future.set_result(function(*args))
+                    except BaseException as error:
+                        future.set_exception(error)
+
+                thread = threading.Thread(target=run)
+                thread.start()
+                self.threads.append(thread)
+                return future
+
+            def shutdown(self, wait=True):
+                if wait:
+                    for thread in self.threads:
+                        thread.join()
+
         class FakeAligner:
             def align(self, image):
                 nonlocal active, max_active
@@ -374,10 +399,13 @@ class PipelineOptimizationTests(unittest.TestCase):
 
             controller = ParallelControllerStub()
             progress = []
-            with patch(
-                "src.processor._build_page_aligners",
-                side_effect=lambda *_args: [FakeAligner()],
-            ) as build_aligners:
+            with (
+                patch(
+                    "src.processor._build_page_aligners",
+                    side_effect=lambda *_args: [FakeAligner()],
+                ) as build_aligners,
+                patch("src.processor.ThreadPoolExecutor", NewThreadExecutor),
+            ):
                 _, samples = _collect_template_samples(
                     str(pdf_path),
                     TemplatePreset(page_count=1),
@@ -397,7 +425,7 @@ class PipelineOptimizationTests(unittest.TestCase):
             for data in samples[0]
         ]
         self.assertGreater(max_active, 1)
-        self.assertGreaterEqual(build_aligners.call_count, 2)
+        self.assertEqual(build_aligners.call_count, 2)
         self.assertEqual(controller.pending_tasks, [4])
         self.assertEqual(progress, [(1, 4), (2, 4), (3, 4), (4, 4)])
         self.assertEqual(decoded_means, sorted(decoded_means))

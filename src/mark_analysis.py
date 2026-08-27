@@ -18,6 +18,7 @@ _RUNNER_UP_MAX_BBOX_DENSITY = 0.20
 _CHECKBOX_MIN_DIRECT_EVIDENCE_PIXELS = 5
 _SHARED_STROKE_MIN_LOCAL_SUPPORT_RATIO = 0.45
 _SHARED_STROKE_MIN_SHAPE_SPREAD = 0.18
+_FULL_LOCAL_SEARCH_RADIUS = 2
 
 
 @dataclass
@@ -54,6 +55,123 @@ class _CheckboxFieldAnalysis:
     halo_infos: list[_CheckboxHaloInfo]
 
 
+def _resize_binary_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+    resized = cv2.resize(mask, (width, height), interpolation=cv2.INTER_AREA)
+    return cv2.threshold(resized, 32, 255, cv2.THRESH_BINARY)[1]
+
+
+def _rotate_binary_mask(mask: np.ndarray, angle: float) -> np.ndarray:
+    height, width = mask.shape[:2]
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, 1.0)
+    return cv2.warpAffine(
+        mask,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+@dataclass(frozen=True)
+class _TemplateAlignmentCache:
+    """Immutable template-side preprocessing reused within one analysis."""
+
+    template_mask: np.ndarray
+    search_template_mask: np.ndarray
+    alignment_mask: np.ndarray | None
+    template_pixels: int
+    angles: tuple[float, ...]
+    search_scale: float
+    search_size: tuple[int, int]
+    small_template_pixels: int
+    coarse_rotations: dict[float, np.ndarray]
+    fine_search_scale: float
+    fine_search_size: tuple[int, int]
+    fine_template: np.ndarray
+    fine_template_pixels: int
+
+
+def _prepare_template_alignment_cache(
+    template_mask: np.ndarray,
+    image_shape: tuple[int, ...],
+    max_angle: float = 0.6,
+    alignment_mask: np.ndarray | None = None,
+) -> _TemplateAlignmentCache:
+    height, width = image_shape[:2]
+    if template_mask.shape[:2] != (height, width):
+        template_mask = cv2.resize(
+            template_mask,
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    prepared_alignment_mask = None
+    search_template_mask = template_mask
+    if alignment_mask is not None and alignment_mask.size > 0:
+        prepared_alignment_mask = alignment_mask
+        if prepared_alignment_mask.ndim == 3:
+            prepared_alignment_mask = cv2.cvtColor(
+                prepared_alignment_mask, cv2.COLOR_BGR2GRAY
+            )
+        if prepared_alignment_mask.shape[:2] != (height, width):
+            prepared_alignment_mask = cv2.resize(
+                prepared_alignment_mask,
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        prepared_alignment_mask = np.where(
+            prepared_alignment_mask > 0, 255, 0
+        ).astype(np.uint8)
+        if cv2.countNonZero(prepared_alignment_mask) >= height * width * 0.15:
+            search_template_mask = cv2.bitwise_and(
+                template_mask, prepared_alignment_mask
+            )
+        else:
+            prepared_alignment_mask = None
+
+    angle_count = max(0, round(max_angle / 0.1))
+    angles = tuple(step * 0.1 for step in range(-angle_count, angle_count + 1))
+    search_scale = min(0.5, 900.0 / max(height, width))
+    search_size = (
+        max(1, round(width * search_scale)),
+        max(1, round(height * search_scale)),
+    )
+    small_template = _resize_binary_mask(search_template_mask, *search_size)
+
+    fine_search_scale = max(
+        search_scale, min(0.75, 2000.0 / max(height, width))
+    )
+    fine_search_size = (
+        max(1, round(width * fine_search_scale)),
+        max(1, round(height * fine_search_scale)),
+    )
+    fine_template = (
+        small_template
+        if fine_search_scale == search_scale
+        else _resize_binary_mask(search_template_mask, *fine_search_size)
+    )
+
+    return _TemplateAlignmentCache(
+        template_mask=template_mask,
+        search_template_mask=search_template_mask,
+        alignment_mask=prepared_alignment_mask,
+        template_pixels=cv2.countNonZero(search_template_mask),
+        angles=angles,
+        search_scale=search_scale,
+        search_size=search_size,
+        small_template_pixels=cv2.countNonZero(small_template),
+        coarse_rotations={
+            angle: _rotate_binary_mask(small_template, angle)
+            for angle in angles
+        },
+        fine_search_scale=fine_search_scale,
+        fine_search_size=fine_search_size,
+        fine_template=fine_template,
+        fine_template_pixels=cv2.countNonZero(fine_template),
+    )
+
+
 def _best_shift_by_correlation(
     template_mask: np.ndarray,
     padded_target: np.ndarray,
@@ -85,6 +203,102 @@ def _best_shift_by_correlation(
     # 회전 보간으로 마스크 면적이 변하는 후보만 약하게 감점합니다.
     score = float(overlap) - abs(candidate_pixels - reference_pixels) * 0.2
     return score, overlap, dx, dy
+
+
+def _best_shift_by_local_binary_overlap(
+    template_mask: np.ndarray,
+    padded_target: np.ndarray,
+    max_shift: int,
+    reference_pixels: int,
+    predicted_shift: tuple[int, int],
+    radius: int = _FULL_LOCAL_SEARCH_RADIUS,
+) -> tuple[tuple[float, int, int, int], bool]:
+    """Search a small binary window and report whether its winner is safe."""
+    candidate_pixels = cv2.countNonZero(template_mask)
+    if candidate_pixels <= 0:
+        return (float("-inf"), 0, 0, 0), False
+
+    predicted_x = max(-max_shift, min(max_shift, predicted_shift[0]))
+    predicted_y = max(-max_shift, min(max_shift, predicted_shift[1]))
+    min_dx = max(-max_shift, predicted_x - radius)
+    max_dx = min(max_shift, predicted_x + radius)
+    min_dy = max(-max_shift, predicted_y - radius)
+    max_dy = min(max_shift, predicted_y + radius)
+
+    x, y, width, height = cv2.boundingRect(template_mask)
+    template_roi = np.ascontiguousarray(
+        template_mask[y : y + height, x : x + width]
+    )
+    overlap_mask = np.empty_like(template_roi)
+    best_overlap = -1
+    runner_up_overlap = -1
+    best_dx = predicted_x
+    best_dy = predicted_y
+
+    for dy in range(min_dy, max_dy + 1):
+        target_y = y + max_shift + dy
+        for dx in range(min_dx, max_dx + 1):
+            target_x = x + max_shift + dx
+            target_roi = padded_target[
+                target_y : target_y + height,
+                target_x : target_x + width,
+            ]
+            cv2.bitwise_and(template_roi, target_roi, dst=overlap_mask)
+            overlap = cv2.countNonZero(overlap_mask)
+            if overlap > best_overlap:
+                runner_up_overlap = best_overlap
+                best_overlap = overlap
+                best_dx = dx
+                best_dy = dy
+            elif overlap > runner_up_overlap:
+                runner_up_overlap = overlap
+
+    penalty = abs(candidate_pixels - reference_pixels) * 0.2
+    score = float(best_overlap) - penalty
+    runner_up_score = (
+        float(runner_up_overlap) - penalty
+        if runner_up_overlap >= 0
+        else float("-inf")
+    )
+    touches_unsearched_edge = (
+        (best_dx == min_dx and min_dx > -max_shift)
+        or (best_dx == max_dx and max_dx < max_shift)
+        or (best_dy == min_dy and min_dy > -max_shift)
+        or (best_dy == max_dy and max_dy < max_shift)
+    )
+    is_confident = (
+        not touches_unsearched_edge
+        and not _correlation_choice_is_ambiguous(
+            score,
+            runner_up_score,
+            reference_pixels,
+        )
+    )
+    return (score, best_overlap, best_dx, best_dy), is_confident
+
+
+def _best_shift_with_safe_local_fallback(
+    template_mask: np.ndarray,
+    padded_target: np.ndarray,
+    max_shift: int,
+    reference_pixels: int,
+    predicted_shift: tuple[int, int],
+) -> tuple[float, int, int, int]:
+    local_result, is_confident = _best_shift_by_local_binary_overlap(
+        template_mask,
+        padded_target,
+        max_shift,
+        reference_pixels,
+        predicted_shift,
+    )
+    if is_confident:
+        return local_result
+    return _best_shift_by_correlation(
+        template_mask,
+        padded_target,
+        max_shift,
+        reference_pixels,
+    )
 
 
 def _correlation_choice_is_ambiguous(
@@ -154,6 +368,7 @@ def _align_template_mask_by_coverage(
     max_angle: float = 0.6,
     max_shift: int = 8,
     alignment_mask: np.ndarray | None = None,
+    template_cache: _TemplateAlignmentCache | None = None,
 ) -> np.ndarray:
     """템플릿 선이 대상의 어두운 픽셀을 가장 많이 덮도록 미세 정합합니다.
 
@@ -161,28 +376,23 @@ def _align_template_mask_by_coverage(
     정합된 페이지의 잔여 오차만 보정하므로 탐색 범위를 작게 제한합니다.
     """
     h, w = target_mask.shape[:2]
-    if template_mask.shape[:2] != (h, w):
-        template_mask = cv2.resize(
-            template_mask, (w, h), interpolation=cv2.INTER_NEAREST
+    if template_cache is None:
+        template_cache = _prepare_template_alignment_cache(
+            template_mask,
+            target_mask.shape,
+            max_angle,
+            alignment_mask,
         )
 
-    search_template_mask = template_mask
+    template_mask = template_cache.template_mask
+    search_template_mask = template_cache.search_template_mask
     search_target_mask = target_mask
-    if alignment_mask is not None and alignment_mask.size > 0:
-        if alignment_mask.ndim == 3:
-            alignment_mask = cv2.cvtColor(alignment_mask, cv2.COLOR_BGR2GRAY)
-        if alignment_mask.shape[:2] != (h, w):
-            alignment_mask = cv2.resize(
-                alignment_mask, (w, h), interpolation=cv2.INTER_NEAREST
-            )
-        alignment_mask = np.where(alignment_mask > 0, 255, 0).astype(np.uint8)
-        if cv2.countNonZero(alignment_mask) >= h * w * 0.15:
-            search_template_mask = cv2.bitwise_and(
-                template_mask, alignment_mask
-            )
-            search_target_mask = cv2.bitwise_and(target_mask, alignment_mask)
+    if template_cache.alignment_mask is not None:
+        search_target_mask = cv2.bitwise_and(
+            target_mask, template_cache.alignment_mask
+        )
 
-    template_pixels = cv2.countNonZero(search_template_mask)
+    template_pixels = template_cache.template_pixels
     target_pixels = cv2.countNonZero(search_target_mask)
     if template_pixels < 32 or target_pixels < 32:
         return template_mask
@@ -196,27 +406,15 @@ def _align_template_mask_by_coverage(
         return template_mask
 
     # 긴 변을 최대 900px로 줄여 각도와 대략적인 이동량을 빠르게 찾습니다.
-    search_scale = min(0.5, 900.0 / max(h, w))
-    search_w = max(1, round(w * search_scale))
-    search_h = max(1, round(h * search_scale))
+    search_scale = template_cache.search_scale
+    search_w, search_h = template_cache.search_size
     # INTER_AREA로 축소한 뒤 낮은 임계값으로 다시 이진화해 가는 선의 소실을 줄입니다.
-    small_template = cv2.resize(
-        search_template_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
-    )
-    small_target = cv2.resize(
-        search_target_mask, (search_w, search_h), interpolation=cv2.INTER_AREA
-    )
-    _, small_template = cv2.threshold(
-        small_template, 32, 255, cv2.THRESH_BINARY
-    )
-    _, small_target = cv2.threshold(small_target, 32, 255, cv2.THRESH_BINARY)
-    small_template_pixels = cv2.countNonZero(small_template)
+    small_template_pixels = template_cache.small_template_pixels
+    small_target = _resize_binary_mask(search_target_mask, search_w, search_h)
     if small_template_pixels == 0:
         return template_mask
 
-    angle_step = 0.1
-    angle_count = max(0, round(max_angle / angle_step))
-    angles = [step * angle_step for step in range(-angle_count, angle_count + 1)]
+    angles = template_cache.angles
     small_shift = max(0, int(np.ceil(max_shift * search_scale)))
     small_padded_target = cv2.copyMakeBorder(
         small_target,
@@ -227,21 +425,11 @@ def _align_template_mask_by_coverage(
         cv2.BORDER_CONSTANT,
         value=0,
     )
-    center = (search_w / 2.0, search_h / 2.0)
-
     best_coarse_key = (float("-inf"), 0, float("-inf"))
     best_coarse = (0.0, 0, 0)
 
     for angle in angles:
-        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(
-            small_template,
-            matrix,
-            (search_w, search_h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
+        rotated = template_cache.coarse_rotations[angle]
         score, overlap, dx, dy = _best_shift_by_correlation(
             rotated, small_padded_target, small_shift, small_template_pixels
         )
@@ -276,30 +464,18 @@ def _align_template_mask_by_coverage(
     # sufficient for the 0.1-degree coarse sweep but can quantize away a
     # 0.05-degree difference.  Only the strongest candidate is then verified at
     # full resolution; ambiguous candidates retain the exhaustive path.
-    fine_search_scale = min(0.75, 2000.0 / max(h, w))
+    fine_search_scale = template_cache.fine_search_scale
     if fine_search_scale > search_scale:
-        fine_search_w = max(1, round(w * fine_search_scale))
-        fine_search_h = max(1, round(h * fine_search_scale))
-        fine_template = cv2.resize(
-            search_template_mask,
-            (fine_search_w, fine_search_h),
-            interpolation=cv2.INTER_AREA,
+        fine_search_w, fine_search_h = template_cache.fine_search_size
+        fine_target = _resize_binary_mask(
+            search_target_mask, fine_search_w, fine_search_h
         )
-        fine_target = cv2.resize(
-            search_target_mask,
-            (fine_search_w, fine_search_h),
-            interpolation=cv2.INTER_AREA,
-        )
-        _, fine_template = cv2.threshold(
-            fine_template, 32, 255, cv2.THRESH_BINARY
-        )
-        _, fine_target = cv2.threshold(fine_target, 32, 255, cv2.THRESH_BINARY)
     else:
         fine_search_scale = search_scale
         fine_search_w, fine_search_h = search_w, search_h
-        fine_template, fine_target = small_template, small_target
+        fine_target = small_target
 
-    fine_template_pixels = cv2.countNonZero(fine_template)
+    fine_template_pixels = template_cache.fine_template_pixels
     fine_shift = max(0, int(np.ceil(max_shift * fine_search_scale)))
     fine_padded_target = cv2.copyMakeBorder(
         fine_target,
@@ -310,20 +486,11 @@ def _align_template_mask_by_coverage(
         cv2.BORDER_CONSTANT,
         value=0,
     )
-    fine_center = (fine_search_w / 2.0, fine_search_h / 2.0)
     fine_results: list[
         tuple[tuple[float, int, float], float, int, int]
     ] = []
     for angle in sorted(fine_angles):
-        matrix = cv2.getRotationMatrix2D(fine_center, angle, 1.0)
-        rotated = cv2.warpAffine(
-            fine_template,
-            matrix,
-            (fine_search_w, fine_search_h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
+        rotated = _rotate_binary_mask(template_cache.fine_template, angle)
         score, overlap, dx, dy = _best_shift_by_correlation(
             rotated, fine_padded_target, fine_shift, fine_template_pixels
         )
@@ -342,21 +509,25 @@ def _align_template_mask_by_coverage(
             best_fine[0][0], ranked_fine[1][0][0], fine_template_pixels
         )
     )
+    fine_shifts = {
+        result[1]: (result[2], result[3]) for result in fine_results
+    }
 
     full_results: dict[float, tuple[tuple[float, int, float], float, int, int]] = {}
 
     def evaluate_full(angle: float):
-        matrix = cv2.getRotationMatrix2D(full_center, angle, 1.0)
-        rotated = cv2.warpAffine(
-            search_template_mask,
-            matrix,
-            (w, h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+        rotated = _rotate_binary_mask(search_template_mask, angle)
+        fine_dx, fine_dy = fine_shifts[angle]
+        predicted_shift = (
+            round(fine_dx / fine_search_scale),
+            round(fine_dy / fine_search_scale),
         )
-        score, overlap, dx, dy = _best_shift_by_correlation(
-            rotated, full_padded_target, max_shift, template_pixels
+        score, overlap, dx, dy = _best_shift_with_safe_local_fallback(
+            rotated,
+            full_padded_target,
+            max_shift,
+            template_pixels,
+            predicted_shift,
         )
         motion = abs(angle) + abs(dx) + abs(dy)
         result = ((score, overlap, -motion), angle, dx, dy)
@@ -410,6 +581,7 @@ def extract_pure_ink_mask(
     template_dilate_pct: float = 0.3,
     prepared_template_mask: np.ndarray | None = None,
     alignment_mask: np.ndarray | None = None,
+    template_alignment_cache: _TemplateAlignmentCache | None = None,
 ) -> np.ndarray:
     """템플릿을 대상에 미세 정합해 제거하고 순수 사용자 잉크만 추출합니다."""
     if target_gray.ndim == 3:
@@ -431,6 +603,7 @@ def extract_pure_ink_mask(
         template_mask,
         target_mask,
         alignment_mask=alignment_mask,
+        template_cache=template_alignment_cache,
     )
 
     # 3. 남은 미세 정합 오차만큼 템플릿 마스크 확장

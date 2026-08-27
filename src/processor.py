@@ -4,7 +4,6 @@ import hashlib
 import os
 import sys
 import tempfile
-import threading
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from .mark_analysis import (
     _CheckboxFieldAnalysis,
     _CheckboxHaloInfo,
     _CheckboxInkInfo,
+    _TemplateAlignmentCache,
     _align_template_mask_by_coverage,
     _best_shift_by_correlation,
     _build_stable_region_mask,
@@ -44,6 +44,7 @@ from .mark_analysis import (
     _local_mark_bbox_density,
     _mark_bbox_density,
     _prepare_checkbox_template_interiors,
+    _prepare_template_alignment_cache,
     _refine_checkbox_box,
     _resolve_checkbox_halo_ownership,
     _scaled_shift_is_consistent,
@@ -76,6 +77,7 @@ _ANALYSIS_RENDERED_SURVEY_WORK = 3.0
 _ANALYSIS_PROGRESS_START = 2.0
 _ANALYSIS_PROGRESS_SPAN = 95.0
 _ANALYSIS_PLAN_EPOCH_WINDOWS = 4
+_TEMPLATE_ALIGNMENT_STATE_LANES = 2
 
 _SamplePage = bytes | np.ndarray
 
@@ -1871,6 +1873,7 @@ def process_survey_data(
     ]
     | None = None,
     prepared_stable_region_masks: dict[int, np.ndarray | None] | None = None,
+    template_alignment_caches: dict[int, _TemplateAlignmentCache] | None = None,
 ) -> tuple[dict, dict, dict, dict, dict, dict]:
     fname = survey_data.get("fname", "")
     survey_label = survey_data["row_title"]
@@ -1912,6 +1915,9 @@ def process_survey_data(
                 config.template_dilate_pct,
                 template_masks.get(local_p) if template_masks else None,
                 stable_region_masks.get(local_p),
+                template_alignment_caches.get(local_p)
+                if template_alignment_caches
+                else None,
             )
 
     # 반복 응답이 중앙값 템플릿에 섞여 지워진 경우에도 검토 PDF에서 보이도록,
@@ -2449,27 +2455,27 @@ def _collect_template_samples(
                 if progress_cb:
                     progress_cb(survey_idx + 1, limit)
         else:
-            worker_state = threading.local()
+            alignment_lanes: list[list[ImageAligner] | None] = []
             retain_raw_samples: bool | None = None
 
             def align_and_encode(
-                local_p: int, page_img: np.ndarray
+                lane_idx: int, local_p: int, page_img: np.ndarray
             ) -> tuple[int, _SamplePage]:
-                worker_aligners = getattr(worker_state, "aligners", None)
-                if worker_aligners is None:
-                    worker_aligners = _build_page_aligners(
+                lane_aligners = alignment_lanes[lane_idx]
+                if lane_aligners is None:
+                    lane_aligners = _build_page_aligners(
                         alignment_references, config
                     )
-                    worker_state.aligners = worker_aligners
+                    alignment_lanes[lane_idx] = lane_aligners
                 rotated = apply_rotation(
                     page_img,
                     config.rot_code,
                     config.fine_angle_for_page(local_p),
                 )
                 aligner = (
-                    worker_aligners[local_p]
-                    if local_p < len(worker_aligners)
-                    else worker_aligners[-1]
+                    lane_aligners[local_p]
+                    if local_p < len(lane_aligners)
+                    else lane_aligners[-1]
                 )
                 aligned = aligner.align(rotated)
                 if retain_raw_samples:
@@ -2483,6 +2489,9 @@ def _collect_template_samples(
                     len(jobs),
                     int(getattr(resource_controller, "cpu_count", 1)),
                 ),
+            )
+            alignment_lanes.extend(
+                [None] * min(max_workers, _TEMPLATE_ALIGNMENT_STATE_LANES)
             )
             render_memory = _estimate_render_memory_bytes(
                 alignment_references
@@ -2520,7 +2529,9 @@ def _collect_template_samples(
                             raw_pipeline_peak <= available_headroom
                         )
                     window_size = min(
-                        len(jobs) - job_idx, plan.worker_count
+                        len(jobs) - job_idx,
+                        int(plan.worker_count),
+                        len(alignment_lanes),
                     )
                     epoch_end = min(
                         len(jobs),
@@ -2530,11 +2541,15 @@ def _collect_template_samples(
                     next_submit = job_idx
                     pending = deque()
 
-                    def submit_job(job):
+                    def submit_job(job_position: int):
+                        job = jobs[job_position]
                         _survey_idx, local_p, global_p = job
                         page_img = _render_pdf_page(doc, global_p, dpi)
+                        # Bind warm alignment history to a stable lane instead
+                        # of whichever executor thread happens to run the job.
+                        lane_idx = job_position % len(alignment_lanes)
                         return executor.submit(
-                            align_and_encode, local_p, page_img
+                            align_and_encode, lane_idx, local_p, page_img
                         )
 
                     while (
@@ -2542,7 +2557,7 @@ def _collect_template_samples(
                         and len(pending) < window_size
                     ):
                         pending.append(
-                            (jobs[next_submit], submit_job(jobs[next_submit]))
+                            (jobs[next_submit], submit_job(next_submit))
                         )
                         next_submit += 1
 
@@ -2553,7 +2568,7 @@ def _collect_template_samples(
                             pending.append(
                                 (
                                     jobs[next_submit],
-                                    submit_job(jobs[next_submit]),
+                                    submit_job(next_submit),
                                 )
                             )
                             next_submit += 1
@@ -2710,6 +2725,15 @@ def _analyze_single_file(
             )
             for page_idx, reference in enumerate(alignment_references)
         }
+        template_alignment_caches = {
+            page_idx: _prepare_template_alignment_cache(
+                template_mask,
+                alignment_references[page_idx].shape,
+                alignment_mask=stable_region_masks.get(page_idx),
+            )
+            for page_idx, template_mask in template_masks.items()
+            if page_idx < len(alignment_references)
+        }
 
         page_count = config.page_count
         rot_code = config.rot_code
@@ -2743,6 +2767,7 @@ def _analyze_single_file(
                 trust_checkbox_layout=trust_checkbox_layout,
                 checkbox_template_interiors=checkbox_template_interiors,
                 prepared_stable_region_masks=stable_region_masks,
+                template_alignment_caches=template_alignment_caches,
             )
             encoded_debug = {
                 local_p: _encode_page_image(image)
