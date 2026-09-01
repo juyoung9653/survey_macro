@@ -30,12 +30,10 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QGraphicsScene,
     QGraphicsView,
@@ -317,11 +315,11 @@ class MainCanvas(QGraphicsView):
                 self.parent_window.add_comment_box_from_stitched(
                     rect.x(), rect.y(), rect.width(), rect.height()
                 )
-                self.parent_window.set_edit_mode(self.MODE_SELECT)
             else:
                 self.parent_window.add_pending_box_from_stitched(
                     rect.x(), rect.y(), rect.width(), rect.height()
                 )
+            self.parent_window.set_edit_mode(self.MODE_SELECT)
         elif operation == "select":
             ctrl_pressed = bool(
                 event.modifiers() & Qt.KeyboardModifier.ControlModifier
@@ -721,6 +719,8 @@ class MainWindow(QMainWindow):
         self.pages = []
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        self._inferred_display_templates = {}
+        self._analysis_validation_error = ""
         self.file_paths = []
 
         self.preset_dir = Path(os.getenv("LOCALAPPDATA")) / "CheckFinder" / "presets"
@@ -800,6 +800,15 @@ class MainWindow(QMainWindow):
         settings_menu = file_menu.addMenu("설정")
         dup_action = settings_menu.addAction("중복 허용")
         dup_action.triggered.connect(self.open_value_mapping)
+        self.manual_fine_angle_action = settings_menu.addAction(
+            "수동 기울기 조정..."
+        )
+        self.manual_fine_angle_action.setToolTip(
+            "자동 보정 후에도 기울어진 경우에만 전체 각도를 직접 조정합니다."
+        )
+        self.manual_fine_angle_action.triggered.connect(
+            self.open_manual_fine_angle_dialog
+        )
 
         cache_action = file_menu.addAction("캐시 삭제")
         cache_action.triggered.connect(self.clear_cache)
@@ -813,51 +822,49 @@ class MainWindow(QMainWindow):
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
+        self.setStyleSheet(
+            "QToolTip { color: #263238; background-color: #FFFDE7; "
+            "border: 1px solid #90A4AE; padding: 5px; }"
+        )
         main_layout = QVBoxLayout(main_widget)
 
         # 상단 툴바 버튼
         btn_layout = QHBoxLayout()
 
-        self.edit_mode_group = QButtonGroup(self)
-        self.edit_mode_group.setExclusive(True)
-
-        self.select_tool_btn = QPushButton("선택·이동")
-        self.select_tool_btn.setCheckable(True)
-        self.select_tool_btn.setChecked(True)
-        self.select_tool_btn.setToolTip(
-            "클릭은 1개 선택, Ctrl+클릭은 개별 추가·해제, "
-            "Shift+클릭은 기준 박스부터 범위 선택입니다."
-        )
         self.draw_box_tool_btn = QPushButton("선택지 추가")
         self.draw_box_tool_btn.setCheckable(True)
         self.draw_box_tool_btn.setToolTip(
-            "추가할 선택지 영역을 마우스로 드래그합니다. Esc를 누르면 선택 모드로 돌아갑니다."
+            "새 선택지 영역을 드래그합니다. 다시 누르면 그리기를 취소합니다."
         )
         self.draw_comment_tool_btn = QPushButton("자유기입 영역 추가")
         self.draw_comment_tool_btn.setCheckable(True)
         self.draw_comment_tool_btn.setToolTip(
-            "글이나 숫자를 적는 영역을 드래그하면 자유기입 문항이 바로 만들어집니다."
+            "글이나 숫자를 적는 영역을 드래그합니다. 다시 누르면 그리기를 취소합니다."
         )
         mode_buttons = {
-            self.select_tool_btn: MainCanvas.MODE_SELECT,
             self.draw_box_tool_btn: MainCanvas.MODE_DRAW_BOX,
             self.draw_comment_tool_btn: MainCanvas.MODE_DRAW_COMMENT,
         }
         for button, mode in mode_buttons.items():
-            self.edit_mode_group.addButton(button)
             button.toggled.connect(
-                lambda checked, selected_mode=mode: checked
-                and self.set_edit_mode(selected_mode)
+                lambda checked, selected_mode=mode: self.set_edit_mode(
+                    selected_mode if checked else MainCanvas.MODE_SELECT
+                )
             )
 
-        group_btn = QPushButton("문항으로 묶기")
-        group_btn.setStyleSheet("background-color: #2196F3; color: white;")
-        group_btn.setToolTip("선택한 박스들을 하나의 문항으로 묶습니다.")
-        group_btn.clicked.connect(self.group_boxes)
+        self.group_btn = QPushButton("문항으로 묶기")
+        self.group_btn.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; }"
+        )
+        self.group_btn.setToolTip(
+            "선택한 박스들을 하나의 문항으로 묶습니다."
+        )
+        self.group_btn.clicked.connect(self.group_boxes)
 
         self.value_map_btn = QPushButton("선택지 이름 설정")
         self.value_map_btn.setStyleSheet(
-            "background-color: #7E57C2; color: white; font-weight: bold;"
+            "QPushButton { background-color: #7E57C2; color: white; "
+            "font-weight: bold; }"
         )
         self.value_map_btn.setToolTip("문항 이름과 각 선택지의 결과값을 설정합니다.")
         self.value_map_btn.clicked.connect(self.open_value_mapping)
@@ -868,10 +875,14 @@ class MainWindow(QMainWindow):
         )
         self.comment_field_btn.clicked.connect(self.assign_comment_field)
 
-        del_btn = QPushButton("선택 삭제")
-        del_btn.setStyleSheet("background-color: #f44336; color: white;")
-        del_btn.setToolTip("선택한 박스를 삭제합니다. Ctrl+Z로 되돌릴 수 있습니다.")
-        del_btn.clicked.connect(self.delete_selected_boxes)
+        self.delete_selected_btn = QPushButton("선택 삭제")
+        self.delete_selected_btn.setStyleSheet(
+            "QPushButton { background-color: #f44336; color: white; }"
+        )
+        self.delete_selected_btn.setToolTip(
+            "선택한 박스를 삭제합니다. Ctrl+Z로 되돌릴 수 있습니다."
+        )
+        self.delete_selected_btn.clicked.connect(self.delete_selected_boxes)
 
         self.undo_btn = QPushButton("실행 취소")
         self.undo_btn.setToolTip("마지막 편집을 되돌립니다. (Ctrl+Z)")
@@ -892,12 +903,13 @@ class MainWindow(QMainWindow):
 
         self.exec_btn = QPushButton("▶ 분석 실행")
         self.exec_btn.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold;"
+            "QPushButton { background-color: #4CAF50; color: white; "
+            "font-weight: bold; }"
         )
         self.exec_btn.clicked.connect(self.execute_analysis)
 
         if hasattr(self, "file_menu_btn"):
-            self.file_menu_btn.setFixedHeight(group_btn.sizeHint().height())
+            self.file_menu_btn.setFixedHeight(self.group_btn.sizeHint().height())
             btn_layout.addWidget(self.file_menu_btn)
 
         self.load_pdf_btn = QPushButton("PDF 불러오기")
@@ -927,21 +939,9 @@ class MainWindow(QMainWindow):
         )
         btn_layout.addWidget(self.document_status_label)
 
-        # 자동 페이지 수평 보정 뒤 전체 페이지에 더할 수동 보정값
-        btn_layout.addWidget(QLabel("전체 미세 회전:"))
-        self.fine_angle_spin = QDoubleSpinBox()
-        self.fine_angle_spin.setRange(-10.0, 10.0)
-        self.fine_angle_spin.setSingleStep(0.1)
-        self.fine_angle_spin.setDecimals(1)
-        self.fine_angle_spin.setValue(0.0)
-        self.fine_angle_spin.setSuffix("°")
-        self.fine_angle_spin.setFixedWidth(80)
-        self.fine_angle_spin.valueChanged.connect(self.change_fine_angle)
-        btn_layout.addWidget(self.fine_angle_spin)
-
-        self.auto_deskew_btn = QPushButton("자동 수평 맞춤")
+        self.auto_deskew_btn = QPushButton("기울기 다시 맞추기")
         self.auto_deskew_btn.setToolTip(
-            "설문지의 페이지 종류별 기울기를 한 번 계산해 저장합니다."
+            "PDF를 열 때 자동으로 맞춘 기울기를 다시 계산합니다."
         )
         self.auto_deskew_btn.clicked.connect(self.auto_deskew_pages)
         btn_layout.addWidget(self.auto_deskew_btn)
@@ -952,14 +952,13 @@ class MainWindow(QMainWindow):
 
         edit_layout = QHBoxLayout()
         edit_layout.addWidget(QLabel("편집 도구:"))
-        edit_layout.addWidget(self.select_tool_btn)
         edit_layout.addWidget(self.draw_box_tool_btn)
         edit_layout.addWidget(self.draw_comment_tool_btn)
         edit_layout.addSpacing(8)
-        edit_layout.addWidget(group_btn)
+        edit_layout.addWidget(self.group_btn)
         edit_layout.addWidget(self.value_map_btn)
         edit_layout.addWidget(self.comment_field_btn)
-        edit_layout.addWidget(del_btn)
+        edit_layout.addWidget(self.delete_selected_btn)
         edit_layout.addStretch(1)
         self.open_results_btn = QPushButton("결과 폴더")
         self.open_results_btn.setToolTip("분석 결과가 저장되는 폴더를 엽니다.")
@@ -1009,9 +1008,16 @@ class MainWindow(QMainWindow):
             preset_text = "미적용"
         if getattr(self, "_preset_dirty", False):
             preset_text += " (수정됨)"
+        display_text = ""
+        validation_error = getattr(self, "_analysis_validation_error", "")
+        if getattr(self, "_inferred_display_templates", {}):
+            display_text = " · 화면: 자동 생성 빈 양식"
+        elif validation_error:
+            display_text = " · 분석 전 확인 필요"
         self.document_status_label.setText(
-            f"{document_text} · 프리셋: {preset_text}"
+            f"{document_text} · 프리셋: {preset_text}{display_text}"
         )
+        self.document_status_label.setToolTip(validation_error)
 
     def _set_preset_dirty(self, dirty: bool = True):
         self._preset_dirty = bool(dirty)
@@ -1103,6 +1109,8 @@ class MainWindow(QMainWindow):
         self.current_preset_name = None
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        self._inferred_display_templates = {}
+        self._analysis_validation_error = ""
         self.is_a_view = False
         self._preset_dirty = False
         MainWindow._clear_edit_history(self)
@@ -1117,6 +1125,12 @@ class MainWindow(QMainWindow):
             ),
             "analysis_reference_pages": list(
                 getattr(self, "_analysis_reference_pages", [])
+            ),
+            "inferred_display_templates": dict(
+                getattr(self, "_inferred_display_templates", {})
+            ),
+            "analysis_validation_error": getattr(
+                self, "_analysis_validation_error", ""
             ),
             "preset": copy.deepcopy(getattr(self, "preset", TemplatePreset())),
             "pending_boxes": copy.deepcopy(getattr(self, "pending_boxes", [])),
@@ -1133,6 +1147,12 @@ class MainWindow(QMainWindow):
         self.pages = snapshot["pages"]
         self._pages_are_canonical = snapshot["pages_are_canonical"]
         self._analysis_reference_pages = snapshot["analysis_reference_pages"]
+        self._inferred_display_templates = dict(
+            snapshot.get("inferred_display_templates", {})
+        )
+        self._analysis_validation_error = snapshot.get(
+            "analysis_validation_error", ""
+        )
         self.preset = snapshot["preset"]
         self.pending_boxes = snapshot["pending_boxes"]
         self.selected_boxes = []
@@ -1350,15 +1370,37 @@ class MainWindow(QMainWindow):
         if hasattr(self, "canvas"):
             self.canvas.set_mode(self.edit_mode)
         mode_buttons = {
-            MainCanvas.MODE_SELECT: getattr(self, "select_tool_btn", None),
             MainCanvas.MODE_DRAW_BOX: getattr(self, "draw_box_tool_btn", None),
             MainCanvas.MODE_DRAW_COMMENT: getattr(
                 self, "draw_comment_tool_btn", None
             ),
         }
-        button = mode_buttons.get(self.edit_mode)
-        if button is not None and not button.isChecked():
-            button.setChecked(True)
+        default_text = {
+            MainCanvas.MODE_DRAW_BOX: "선택지 추가",
+            MainCanvas.MODE_DRAW_COMMENT: "자유기입 영역 추가",
+        }
+        default_tooltip = {
+            MainCanvas.MODE_DRAW_BOX: (
+                "새 선택지 영역을 드래그합니다. 다시 누르면 그리기를 취소합니다."
+            ),
+            MainCanvas.MODE_DRAW_COMMENT: (
+                "글이나 숫자를 적는 영역을 드래그합니다. "
+                "다시 누르면 그리기를 취소합니다."
+            ),
+        }
+        for button_mode, button in mode_buttons.items():
+            if button is None:
+                continue
+            active = self.edit_mode == button_mode
+            signals_were_blocked = button.blockSignals(True)
+            button.setChecked(active)
+            button.setText("그리기 취소" if active else default_text[button_mode])
+            button.setToolTip(
+                "그리기를 취소하고 박스 선택으로 돌아갑니다."
+                if active
+                else default_tooltip[button_mode]
+            )
+            button.blockSignals(signals_were_blocked)
         self._refresh_edit_status()
 
     def _refresh_edit_status(self):
@@ -1368,9 +1410,12 @@ class MainWindow(QMainWindow):
         if not self.pages:
             text = "먼저 파일 > PDF 불러오기를 선택하세요."
         elif self.edit_mode == MainCanvas.MODE_DRAW_BOX:
-            text = "선택지 추가: 추가할 영역을 드래그하세요. Esc를 누르면 종료합니다."
+            text = "선택지 추가: 영역을 드래그하세요. 버튼을 다시 누르면 취소됩니다."
         elif self.edit_mode == MainCanvas.MODE_DRAW_COMMENT:
-            text = "자유기입 영역 추가: 글을 적는 영역을 드래그하세요."
+            text = (
+                "자유기입 영역 추가: 글을 적는 영역을 드래그하세요. "
+                "버튼을 다시 누르면 취소됩니다."
+            )
         elif selected_count == 1:
             text = (
                 "1개 선택됨: 드래그로 이동 · 모서리로 크기 조절 "
@@ -1383,7 +1428,7 @@ class MainWindow(QMainWindow):
             )
         else:
             text = (
-                "선택·이동: 클릭 1개 · Ctrl+클릭 개별 · "
+                "박스 클릭으로 선택 · Ctrl+클릭 개별 · "
                 "Shift+클릭 가로·세로·사각 범위"
             )
         self.edit_status_label.setText(text)
@@ -1639,6 +1684,78 @@ class MainWindow(QMainWindow):
             self.preset.fine_angle_for_page(page_idx),
         )
 
+    def _clear_inferred_display_templates(self, error_message: str = ""):
+        """Clear the display-only template without changing analysis pages."""
+        self._inferred_display_templates = {}
+        self._analysis_validation_error = str(error_message or "")
+        refresh = getattr(self, "_refresh_document_status", None)
+        if callable(refresh):
+            refresh()
+        status_bar = getattr(self, "statusBar", None)
+        if callable(status_bar):
+            if self._analysis_validation_error:
+                status_bar().showMessage(self._analysis_validation_error, 15000)
+            else:
+                status_bar().clearMessage()
+
+    def _set_inferred_display_templates(self, templates) -> bool:
+        """Use complete, coordinate-compatible inferred pages as canvas bases."""
+        page_count = int(getattr(self.preset, "page_count", 0))
+        pages = list(getattr(self, "pages", []))
+        if page_count <= 0 or len(pages) < page_count:
+            MainWindow._clear_inferred_display_templates(
+                self,
+                "기준 페이지가 부족해 안전한 분석 좌표를 확인할 수 없습니다.",
+            )
+            return False
+
+        candidates = templates if isinstance(templates, dict) else {}
+        validated: dict[int, np.ndarray] = {}
+        for page_idx in range(page_count):
+            template = candidates.get(page_idx)
+            if (
+                not isinstance(template, np.ndarray)
+                or template.size == 0
+                or template.ndim not in (2, 3)
+                or (template.ndim == 3 and template.shape[2] != 3)
+            ):
+                MainWindow._clear_inferred_display_templates(
+                    self,
+                    f"{page_idx + 1}쪽의 자동 생성 빈 양식이 없어 분석할 수 없습니다.",
+                )
+                return False
+
+            configured_page = MainWindow._configured_template_page(
+                self, pages[page_idx], page_idx
+            )
+            if template.shape[:2] != configured_page.shape[:2]:
+                expected_h, expected_w = configured_page.shape[:2]
+                actual_h, actual_w = template.shape[:2]
+                MainWindow._clear_inferred_display_templates(
+                    self,
+                    f"{page_idx + 1}쪽 자동 생성 빈 양식 크기"
+                    f"({actual_w}×{actual_h})가 기준 페이지 크기"
+                    f"({expected_w}×{expected_h})와 달라 분석할 수 없습니다.",
+                )
+                return False
+            validated[page_idx] = template
+
+        self._inferred_display_templates = validated
+        self._analysis_validation_error = ""
+        refresh = getattr(self, "_refresh_document_status", None)
+        if callable(refresh):
+            refresh()
+        status_bar = getattr(self, "statusBar", None)
+        if callable(status_bar):
+            status_bar().clearMessage()
+        return True
+
+    def _canvas_base_page(self, page: np.ndarray, page_idx: int) -> np.ndarray:
+        template = getattr(self, "_inferred_display_templates", {}).get(page_idx)
+        if isinstance(template, np.ndarray) and template.size > 0:
+            return template
+        return MainWindow._configured_template_page(self, page, page_idx)
+
     def _reload_raw_template_pages(self, progress_cb=None) -> bool:
         """Restore source pages before changing a transform baked into a preset."""
         if not self.file_paths or self.preset.page_count <= 0:
@@ -1653,6 +1770,7 @@ class MainWindow(QMainWindow):
         self.pages = raw_pages
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        MainWindow._clear_inferred_display_templates(self)
         if len(raw_pages) < self.preset.page_count:
             self.preset.page_count = len(raw_pages)
             self._filter_boxes_outside_page_count()
@@ -1687,6 +1805,12 @@ class MainWindow(QMainWindow):
         )
         previous_analysis_reference_pages = list(
             getattr(self, "_analysis_reference_pages", [])
+        )
+        previous_inferred_display_templates = dict(
+            getattr(self, "_inferred_display_templates", {})
+        )
+        previous_analysis_validation_error = getattr(
+            self, "_analysis_validation_error", ""
         )
         previous_pending_boxes = list(getattr(self, "pending_boxes", []))
         previous_selected_boxes = list(getattr(self, "selected_boxes", []))
@@ -1743,6 +1867,8 @@ class MainWindow(QMainWindow):
         self.selected_boxes.clear()
         self._selection_anchor = None
         self._analysis_reference_pages = []
+        self._inferred_display_templates = {}
+        self._analysis_validation_error = ""
         self._sync_rotation_index()
         self._sync_fine_angle_spin()
         self._sync_reverse_numbering_state()
@@ -1835,6 +1961,12 @@ class MainWindow(QMainWindow):
                 self.pages = previous_pages
                 self._pages_are_canonical = previous_pages_are_canonical
                 self._analysis_reference_pages = previous_analysis_reference_pages
+                self._inferred_display_templates = (
+                    previous_inferred_display_templates
+                )
+                self._analysis_validation_error = (
+                    previous_analysis_validation_error
+                )
                 self.pending_boxes = previous_pending_boxes
                 self.selected_boxes = previous_selected_boxes
                 self._selection_anchor = previous_selection_anchor
@@ -1867,6 +1999,9 @@ class MainWindow(QMainWindow):
                 self._analysis_reference_pages = [
                     current_templates[i] for i in range(self.preset.page_count)
                 ]
+                MainWindow._set_inferred_display_templates(
+                    self, current_templates
+                )
                 alignment_message = (
                     "자동 탐지 위치에 프리셋 설정 적용 완료 "
                     f"({remap.matched_boxes}/{remap.expected_boxes})"
@@ -1900,11 +2035,17 @@ class MainWindow(QMainWindow):
                 self._analysis_reference_pages = list(
                     saved_templates[: self.preset.page_count]
                 )
+                MainWindow._clear_inferred_display_templates(self)
                 alignment_message = "체크박스 매칭 불완전: 기존 템플릿 정렬 사용"
             else:
                 self.pages = raw_pages
                 self._pages_are_canonical = False
                 self._analysis_reference_pages = []
+                MainWindow._clear_inferred_display_templates(
+                    self,
+                    "현재 PDF와 프리셋의 체크박스 배치를 충분히 확인하지 못해 "
+                    "분석할 수 없습니다.",
+                )
                 alignment_message = "체크박스 매칭 불완전: 저장 좌표 유지"
 
             self._update_page_size()
@@ -1913,6 +2054,7 @@ class MainWindow(QMainWindow):
             self.pages = saved_templates[: self.preset.page_count]
             self._pages_are_canonical = True
             self._analysis_reference_pages = list(self.pages)
+            MainWindow._clear_inferred_display_templates(self)
             self._update_page_size()
             alignment_message = "저장된 프리셋 템플릿 표시"
 
@@ -2247,11 +2389,31 @@ class MainWindow(QMainWindow):
             self._update_page_size()
 
         if self._redetect_checkboxes_with_progress(
-            "자동 수평 맞춤", before_detect=estimate
+            "기울기 다시 맞추기", before_detect=estimate
         ):
             self.statusBar().showMessage(
-                f"자동 수평 맞춤 완료: {self._page_angle_summary()}", 10000
+                f"기울기 다시 맞추기 완료: {self._page_angle_summary()}",
+                10000,
             )
+
+    def open_manual_fine_angle_dialog(self):
+        if not self.pages or not self.file_paths:
+            QMessageBox.information(self, "알림", "먼저 PDF를 불러와주세요.")
+            return
+
+        angle, ok = QInputDialog.getDouble(
+            self,
+            "수동 기울기 조정",
+            "자동 보정 후에도 기울어진 경우에만 각도를 입력하세요.",
+            value=self.preset.fine_angle,
+            min=-10.0,
+            max=10.0,
+            decimals=1,
+            step=0.1,
+        )
+        if not ok or abs(float(angle) - self.preset.fine_angle) <= 0.0001:
+            return
+        self.change_fine_angle(float(angle))
 
     def _redetect_checkboxes_with_progress(
         self, title: str, before_detect=None
@@ -2348,7 +2510,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "완료", "캐시가 삭제되었습니다.")
 
     def change_fine_angle(self, angle: float):
-        """미세 회전 각도 조절 시 동작합니다."""
+        """Apply a confirmed manual correction and redetect the boxes once."""
         changed = abs(self.preset.fine_angle - angle) > 0.0001
         self.preset.fine_angle = angle
         if changed:
@@ -2409,8 +2571,10 @@ class MainWindow(QMainWindow):
 
         drawn_pages = []
         for i, page in enumerate(self.pages):
-            img = self._configured_template_page(page, i)
+            img = self._canvas_base_page(page, i)
             canvas_img = img.copy()
+            if canvas_img.ndim == 2:
+                canvas_img = cv2.cvtColor(canvas_img, cv2.COLOR_GRAY2BGR)
 
             if canvas_img.shape[:2] != (self.page_H, self.page_W):
                 canvas_img = cv2.resize(canvas_img, (self.page_W, self.page_H))
@@ -2958,34 +3122,6 @@ class MainWindow(QMainWindow):
         self.pending_boxes.clear()
         self.preset.fields.clear()
 
-        # ── 캐시 확인 ──
-        cached = load_checkbox_cache(
-            self.file_paths,
-            self.preset.page_count,
-            self.preset.rot_code,
-            self.preset.fine_angle,
-            self.preset.page_fine_angles,
-        )
-        if cached is not None:
-            report(0, "캐시된 체크박스 불러오는 중...")
-            question_number = 1
-            for page_idx in sorted(cached.keys()):
-                boxes = [Box(page_idx, *b) for b in cached[page_idx]]
-                rows = self._group_boxes_by_row(boxes)
-                for row in rows:
-                    row.sort(key=lambda b: b.x)
-                    field_name = f"Q{question_number}"
-                    self.preset.fields.append(Field(name=field_name, boxes=row))
-                    question_number += 1
-            report(100, "체크박스 탐지 완료 (캐시)")
-            MainWindow._clear_edit_history(self)
-            self.update_canvas()
-            if mark_dirty:
-                MainWindow._set_preset_dirty(self, True)
-            return
-
-        question_number = 1
-
         def template_progress(value: int, message: str = ""):
             mapped = int(value * 0.7)
             report(mapped, message or "템플릿 생성 중...")
@@ -3013,6 +3149,35 @@ class MainWindow(QMainWindow):
                     progress_cb=template_progress,
                     page_fine_angles=self.preset.page_fine_angles,
                 )
+        MainWindow._set_inferred_display_templates(self, templates)
+
+        # ── 캐시 확인 ──
+        cached = load_checkbox_cache(
+            self.file_paths,
+            self.preset.page_count,
+            self.preset.rot_code,
+            self.preset.fine_angle,
+            self.preset.page_fine_angles,
+        )
+        if cached is not None:
+            report(70, "캐시된 체크박스 불러오는 중...")
+            question_number = 1
+            for page_idx in sorted(cached.keys()):
+                boxes = [Box(page_idx, *b) for b in cached[page_idx]]
+                rows = self._group_boxes_by_row(boxes)
+                for row in rows:
+                    row.sort(key=lambda b: b.x)
+                    field_name = f"Q{question_number}"
+                    self.preset.fields.append(Field(name=field_name, boxes=row))
+                    question_number += 1
+            report(100, "체크박스 탐지 완료 (캐시)")
+            MainWindow._clear_edit_history(self)
+            self.update_canvas()
+            if mark_dirty:
+                MainWindow._set_preset_dirty(self, True)
+            return
+
+        question_number = 1
 
         total_pages = len(self.pages)
         report(70, "체크박스 탐지 중...")
@@ -3075,6 +3240,20 @@ class MainWindow(QMainWindow):
             return saved_references[: self.preset.page_count], True
         return list(self.pages), bool(self._pages_are_canonical)
 
+    def _analysis_input_validation_message(
+        self, analysis_pages: list[np.ndarray]
+    ) -> str:
+        existing_error = getattr(self, "_analysis_validation_error", "")
+        if existing_error:
+            return existing_error
+        page_count = int(getattr(self.preset, "page_count", 0))
+        if page_count <= 0 or len(analysis_pages) < page_count:
+            return "분석에 필요한 페이지별 기준 템플릿이 모두 준비되지 않았습니다."
+        for page_idx, page in enumerate(analysis_pages[:page_count]):
+            if not isinstance(page, np.ndarray) or page.size == 0:
+                return f"{page_idx + 1}쪽 기준 템플릿이 비어 있어 분석할 수 없습니다."
+        return ""
+
     def execute_analysis(self):
         if not self.file_paths or not self.preset.fields:
             QMessageBox.warning(self, "경고", "파일이나 생성된 템플릿 항목이 없습니다.")
@@ -3086,6 +3265,16 @@ class MainWindow(QMainWindow):
             return
         if self._analysis_thread is not None and self._analysis_thread.isRunning():
             QMessageBox.information(self, "알림", "이미 분석이 진행 중입니다.")
+            return
+
+        analysis_pages, pages_preprocessed = self._analysis_input_pages()
+        validation_message = self._analysis_input_validation_message(analysis_pages)
+        if validation_message:
+            QMessageBox.warning(
+                self,
+                "분석 실행 불가",
+                f"{validation_message}\n\nPDF와 프리셋을 확인한 뒤 다시 탐지해주세요.",
+            )
             return
 
         self._analysis_progress = self._show_progress_dialog(
@@ -3102,7 +3291,6 @@ class MainWindow(QMainWindow):
         self.exec_btn.setEnabled(False)
 
         thread = QThread(self)
-        analysis_pages, pages_preprocessed = self._analysis_input_pages()
         worker = _AnalysisWorker(
             list(self.file_paths),
             analysis_pages,

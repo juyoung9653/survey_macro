@@ -2,10 +2,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -17,7 +20,7 @@ from PyQt6.QtWidgets import (
 
 from src.localization import install_korean_translations
 from src.models import Field, TemplatePreset
-from src.ui import MainWindow, ValueMappingDialog
+from src.ui import MainCanvas, MainWindow, ValueMappingDialog
 
 
 _APP = QApplication.instance() or QApplication([])
@@ -120,6 +123,11 @@ class UiSafetyTests(unittest.TestCase):
         window.preset = TemplatePreset(
             page_count=1, fields=[Field(name="기존 문항")]
         )
+        raw_page = np.full((20, 15, 3), 180, np.uint8)
+        display_template = np.full((20, 15, 3), 255, np.uint8)
+        window.pages = [raw_page]
+        window._update_page_size()
+        window._set_inferred_display_templates({0: display_template})
         window.current_preset_name = "기존 프리셋"
         window._preset_dirty = False
         progress = _ProgressStub()
@@ -140,6 +148,8 @@ class UiSafetyTests(unittest.TestCase):
         self.assertEqual(window.file_paths, ["previous.pdf"])
         self.assertEqual([field.name for field in window.preset.fields], ["기존 문항"])
         self.assertEqual(window.current_preset_name, "기존 프리셋")
+        self.assertIs(window.pages[0], raw_page)
+        self.assertIs(window._inferred_display_templates[0], display_template)
         self.assertTrue(progress.closed)
         self.assertIn("읽기 오류", critical.call_args.args[2])
         window.close()
@@ -201,6 +211,168 @@ class UiSafetyTests(unittest.TestCase):
         self.assertEqual(window.help_btn.text(), "도움말")
         self.assertIn("#7E57C2", window.value_map_btn.styleSheet())
         self.assertLessEqual(window.centralWidget().sizeHint().width(), 1280)
+        window.close()
+
+    def test_canvas_uses_inferred_blank_template_without_replacing_source_page(self):
+        window = MainWindow()
+        raw_page = np.full((40, 30, 3), 180, np.uint8)
+        blank_template = np.full((40, 30, 3), 255, np.uint8)
+        raw_before = raw_page.copy()
+        window.file_paths = ["survey.pdf"]
+        window.pages = [raw_page]
+        window.preset = TemplatePreset(page_count=1)
+        window._update_page_size()
+
+        accepted = window._set_inferred_display_templates({0: blank_template})
+
+        self.assertTrue(accepted)
+        self.assertIs(window._canvas_base_page(raw_page, 0), blank_template)
+        self.assertIs(window.pages[0], raw_page)
+        self.assertTrue(np.array_equal(raw_page, raw_before))
+        self.assertEqual(window._analysis_reference_pages, [])
+        self.assertIn("화면: 자동 생성 빈 양식", window.document_status_label.text())
+        window.close()
+
+    def test_mismatched_display_template_blocks_analysis_instead_of_hiding_error(self):
+        window = MainWindow()
+        raw_page = np.full((40, 30, 3), 180, np.uint8)
+        wrong_size = np.full((41, 30, 3), 255, np.uint8)
+        window.file_paths = ["survey.pdf"]
+        window.pages = [raw_page]
+        window.preset = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q1")],
+        )
+        window._update_page_size()
+
+        accepted = window._set_inferred_display_templates({0: wrong_size})
+
+        self.assertFalse(accepted)
+        self.assertEqual(window._inferred_display_templates, {})
+        self.assertIn("크기", window._analysis_validation_error)
+        self.assertIn("크기", window.document_status_label.toolTip())
+        self.assertIs(window._canvas_base_page(raw_page, 0), raw_page)
+        with (
+            patch("src.ui.QMessageBox.warning") as warning,
+            patch.object(window, "_show_progress_dialog") as show_progress,
+        ):
+            window.execute_analysis()
+        self.assertEqual(warning.call_args.args[1], "분석 실행 불가")
+        self.assertIn("크기", warning.call_args.args[2])
+        show_progress.assert_not_called()
+        window.close()
+
+    def test_checkbox_cache_still_loads_the_inferred_display_template(self):
+        window = MainWindow()
+        raw_page = np.full((40, 30, 3), 180, np.uint8)
+        blank_template = np.full((40, 30, 3), 255, np.uint8)
+        window.file_paths = ["survey.pdf"]
+        window.pages = [raw_page]
+        window.preset = TemplatePreset(page_count=1)
+        window._update_page_size()
+
+        with (
+            patch(
+                "src.ui.generate_ui_templates",
+                return_value={0: blank_template},
+            ) as generate,
+            patch(
+                "src.ui.load_checkbox_cache",
+                return_value={0: [(4, 5, 8, 8)]},
+            ),
+            patch("src.ui.save_checkbox_cache") as save_cache,
+        ):
+            window.auto_detect(mark_dirty=False)
+
+        generate.assert_called_once()
+        save_cache.assert_not_called()
+        self.assertIs(window._inferred_display_templates[0], blank_template)
+        self.assertEqual(len(window.preset.fields), 1)
+        window.close()
+
+    def test_draw_buttons_toggle_cancel_without_a_separate_select_button(self):
+        window = MainWindow()
+
+        self.assertFalse(hasattr(window, "select_tool_btn"))
+        self.assertEqual(window.edit_mode, MainCanvas.MODE_SELECT)
+        self.assertFalse(window.draw_box_tool_btn.isChecked())
+        self.assertFalse(window.draw_comment_tool_btn.isChecked())
+
+        window.draw_box_tool_btn.click()
+        self.assertEqual(window.edit_mode, MainCanvas.MODE_DRAW_BOX)
+        self.assertEqual(window.draw_box_tool_btn.text(), "그리기 취소")
+
+        window.draw_comment_tool_btn.click()
+        self.assertEqual(window.edit_mode, MainCanvas.MODE_DRAW_COMMENT)
+        self.assertFalse(window.draw_box_tool_btn.isChecked())
+        self.assertEqual(window.draw_box_tool_btn.text(), "선택지 추가")
+        self.assertEqual(window.draw_comment_tool_btn.text(), "그리기 취소")
+
+        window.draw_comment_tool_btn.click()
+        self.assertEqual(window.edit_mode, MainCanvas.MODE_SELECT)
+        self.assertFalse(window.draw_comment_tool_btn.isChecked())
+        self.assertEqual(
+            window.draw_comment_tool_btn.text(), "자유기입 영역 추가"
+        )
+        window.close()
+
+    def test_successful_draw_returns_to_normal_selection(self):
+        parent = SimpleNamespace(
+            add_pending_box_from_stitched=Mock(),
+            set_edit_mode=Mock(),
+        )
+        canvas = MainCanvas(parent)
+        canvas.mode = MainCanvas.MODE_DRAW_BOX
+        canvas.operation = "draw"
+        canvas.start_pos = canvas.mapToScene(QPoint(10, 10))
+        event = Mock()
+        event.button.return_value = Qt.MouseButton.LeftButton
+        event.pos.return_value = QPoint(60, 60)
+
+        canvas.mouseReleaseEvent(event)
+
+        parent.add_pending_box_from_stitched.assert_called_once()
+        parent.set_edit_mode.assert_called_once_with(MainCanvas.MODE_SELECT)
+        event.accept.assert_called_once()
+        canvas.close()
+
+    def test_colored_edit_buttons_keep_tooltip_text_readable(self):
+        window = MainWindow()
+
+        self.assertIn("QToolTip", window.styleSheet())
+        self.assertIn("color: #263238", window.styleSheet())
+        for button in (
+            window.group_btn,
+            window.value_map_btn,
+            window.delete_selected_btn,
+        ):
+            with self.subTest(button=button.text()):
+                self.assertTrue(button.toolTip())
+                self.assertIn("QPushButton {", button.styleSheet())
+        window.close()
+
+    def test_manual_angle_is_hidden_and_applied_only_after_confirmation(self):
+        window = MainWindow()
+        window.file_paths = ["sample.pdf"]
+        window.pages = [object()]
+        window.preset.fine_angle = 0.2
+
+        self.assertFalse(hasattr(window, "fine_angle_spin"))
+        self.assertEqual(window.auto_deskew_btn.text(), "기울기 다시 맞추기")
+
+        with (
+            patch("src.ui.QInputDialog.getDouble", return_value=(0.4, False)),
+            patch.object(window, "change_fine_angle") as apply_angle,
+        ):
+            window.open_manual_fine_angle_dialog()
+        apply_angle.assert_not_called()
+
+        with (
+            patch("src.ui.QInputDialog.getDouble", return_value=(0.4, True)),
+            patch.object(window, "change_fine_angle") as apply_angle,
+        ):
+            window.open_manual_fine_angle_dialog()
+        apply_angle.assert_called_once_with(0.4)
         window.close()
 
 

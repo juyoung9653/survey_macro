@@ -11,6 +11,7 @@ from src.processor import (
     generate_ui_templates,
     generate_ui_templates_multi,
     remap_preset_to_detected_layout,
+    _validate_analysis_page_geometry,
 )
 from src.vision import (
     auto_detect_checkboxes,
@@ -166,6 +167,11 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                         0.0,
                         page_fine_angles=angles,
                     )
+                    _validate_analysis_page_geometry(
+                        [str(path)],
+                        [templates[page] for page in range(page_count)],
+                        TemplatePreset(page_count=page_count),
+                    )
                     self._assert_layout(templates, page_count)
 
     def test_compatible_pdfs_in_pairs_triples_and_all(self):
@@ -184,6 +190,11 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                         -1,
                         0.0,
                         page_fine_angles=angles,
+                    )
+                    _validate_analysis_page_geometry(
+                        [str(path) for path in group],
+                        [templates[page] for page in range(page_count)],
+                        TemplatePreset(page_count=page_count),
                     )
                     self._assert_layout(templates, page_count)
 
@@ -277,10 +288,16 @@ class ScanCorpusDetectionTests(unittest.TestCase):
             window._reset_state_for_new_pdf()
             window.preset.page_fine_angles = color_angles
             window._update_page_size()
+            raw_page = window.pages[0]
             window.auto_detect(mark_dirty=False)
             self.assertEqual(
                 sum(len(field.boxes) for field in window.preset.fields),
                 len(color_detected),
+            )
+            self.assertIs(window.pages[0], raw_page)
+            self.assertIs(
+                window._canvas_base_page(raw_page, 0),
+                window._inferred_display_templates[0],
             )
 
             window._apply_loaded_preset(data, preset_name="기본")

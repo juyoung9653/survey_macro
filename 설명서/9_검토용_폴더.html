@@ -40,8 +40,10 @@
                 <thead><tr><th>입력</th><th>동작</th></tr></thead>
                 <tbody>
                     <tr><td><span class="kbd">Ctrl</span> + 마우스 휠</td><td>확대·축소</td></tr>
-                    <tr><td><span class="kbd">Shift</span> + 클릭</td><td>선택에 한 영역 추가 또는 제거</td></tr>
-                    <tr><td>빈 공간 드래그</td><td>범위 안의 여러 영역 선택</td></tr>
+                    <tr><td><span class="kbd">Ctrl</span> + 클릭</td><td>선택에 한 영역 추가 또는 제거</td></tr>
+                    <tr><td><span class="kbd">Shift</span> + 클릭</td><td>기준 박스부터 가로·세로·사각 범위 선택</td></tr>
+                    <tr><td>빈 공간 드래그</td><td>범위에 걸친 여러 영역 선택</td></tr>
+                    <tr><td><span class="kbd">Ctrl</span> + 빈 공간 드래그</td><td>현재 선택에 드래그 범위 추가</td></tr>
                     <tr><td>선택 영역 드래그</td><td>한 개 또는 여러 개 함께 이동</td></tr>
                     <tr><td>노란 모서리 드래그</td><td>한 영역의 크기 조절</td></tr>
                     <tr><td>방향키</td><td>선택 영역 1픽셀 이동</td></tr>
@@ -49,7 +51,7 @@
                     <tr><td><span class="kbd">Delete</span> / <span class="kbd">Backspace</span></td><td>선택 영역 삭제</td></tr>
                     <tr><td><span class="kbd">Ctrl</span> + <span class="kbd">Z</span></td><td>실행 취소</td></tr>
                     <tr><td><span class="kbd">Ctrl</span> + <span class="kbd">Y</span></td><td>다시 실행</td></tr>
-                    <tr><td><span class="kbd">Esc</span></td><td>현재 그리기 취소 후 선택·이동 모드</td></tr>
+                    <tr><td><span class="kbd">Esc</span></td><td>현재 그리기 취소 후 기본 선택 상태</td></tr>
                     <tr><td>박스 우클릭</td><td>삭제·문항 묶기·자유기입 전환 메뉴</td></tr>
                 </tbody>
             </table>
@@ -60,13 +62,14 @@
             <table>
                 <thead><tr><th>파일</th><th>용도</th><th>생성 조건</th></tr></thead>
                 <tbody>
-                    <tr><td><code>설문결과_연.월.일.시.분.초.xlsx</code></td><td>응답 원자료, 검수 대상, 통계, 평균, 파일별 통계</td><td>분석 결과가 하나 이상 있을 때</td></tr>
-                    <tr><td><code>설문결과_연.월.일.시.분.초_자유기입.pdf</code></td><td>필기가 있는 자유기입 페이지 모음</td><td>자유기입 내용이 감지됐을 때</td></tr>
-                    <tr><td><code>00_추론된_템플릿.pdf</code></td><td>분석에서 사용한 빈 양식 기준</td><td>검토용 폴더 안에 생성</td></tr>
+                    <tr><td><code>설문결과_연.월.일.시.분.초/설문결과.xlsx</code></td><td>응답 원자료, 검수 대상, 통계, 평균, 파일별 통계</td><td>분석 결과가 하나 이상 있을 때</td></tr>
+                    <tr><td><code>설문결과_연.월.일.시.분.초/자유기입.pdf</code></td><td>필기가 있는 자유기입 페이지 모음</td><td>자유기입 내용이 감지됐을 때</td></tr>
+                    <tr><td><code>검토용/00_추론된_템플릿.pdf</code></td><td>분석에서 사용한 빈 양식 기준</td><td>날짜별 결과 폴더 안에 생성</td></tr>
                     <tr><td><code>파일명_원본포함.pdf</code></td><td>원본 위에 판독 영역·번호·체크 결과 표시</td><td>분석한 입력 PDF별 생성</td></tr>
                     <tr><td><code>파일명_잉크추출.pdf</code></td><td>양식을 줄이고 응답 잉크를 강조한 검토본</td><td>분석한 입력 PDF별 생성</td></tr>
                 </tbody>
             </table>
+            <p class="caption">완료된 날짜별 결과 폴더는 최신 30회까지만 남습니다. 오래 보관할 결과는 다른 위치에 복사해 두세요.</p>
         </section>
 
         <section class="card">

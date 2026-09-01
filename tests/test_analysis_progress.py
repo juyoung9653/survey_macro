@@ -67,10 +67,14 @@ class AnalysisProgressTests(unittest.TestCase):
                     ),
                     patch("src.processor._insert_img_into_pdf"),
                     patch("src.processor.export_to_excel", return_value=True),
+                    patch(
+                        "src.processor._prune_old_result_runs",
+                        return_value=([], []),
+                    ) as prune_old_results,
                 ):
                     success = run_analysis(
                         [str(pdf_path)],
-                        [np.full((8, 8), 255, np.uint8)],
+                        [np.full((60, 80), 255, np.uint8)],
                         TemplatePreset(page_count=1),
                         progress_cb=lambda value, message: progress_events.append(
                             (float(value), message)
@@ -89,6 +93,8 @@ class AnalysisProgressTests(unittest.TestCase):
         self.assertGreaterEqual(len(set(values)), 10)
         self.assertTrue(any("템플릿 표본 처리 중 (1/3)" in msg for msg in messages))
         self.assertTrue(any("설문 분석 중 (1/3)" in msg for msg in messages))
+        self.assertTrue(any("오래된 결과 정리 중" in msg for msg in messages))
+        prune_old_results.assert_called_once()
 
 
 if __name__ == "__main__":

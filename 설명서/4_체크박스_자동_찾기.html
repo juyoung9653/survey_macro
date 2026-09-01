@@ -17,17 +17,17 @@
     <header class="page-head">
         <span class="page-number">4</span>
         <h1>영역 추가·선택·이동·삭제</h1>
-        <p>도구를 먼저 고른 다음 작업합니다. 현재 해야 할 동작은 회색 안내 줄에서 바로 확인할 수 있습니다.</p>
+        <p>평소에는 박스를 바로 클릭해 편집하고, 새 영역을 그릴 때만 추가 도구를 누릅니다. 현재 동작은 회색 안내 줄에서 확인할 수 있습니다.</p>
     </header>
 
     <main>
         <section class="card">
-            <h2>세 가지 편집 모드</h2>
+            <h2>기본 선택과 두 가지 추가 도구</h2>
             <div class="tool-grid">
-                <div class="tool-card"><b>선택·이동</b><span>박스를 고르고 이동·크기 조절·삭제합니다. 평소에는 이 모드를 사용합니다.</span></div>
-                <div class="tool-card"><b>선택지 추가</b><span>자동 탐지에서 빠진 체크칸을 드래그해 추가합니다. 여러 개를 이어서 그릴 수 있습니다.</span></div>
+                <div class="tool-card"><b>기본 선택 상태</b><span>별도 버튼 없이 박스를 클릭해 선택하고 이동·크기 조절·삭제합니다.</span></div>
+                <div class="tool-card"><b>선택지 추가</b><span>자동 탐지에서 빠진 체크칸을 드래그합니다. 하나를 그리면 기본 선택 상태로 돌아갑니다.</span></div>
                 <div class="tool-card"><b>자유기입 영역 추가</b><span>글이나 숫자를 적는 답변 칸을 드래그합니다. 한 번 그리면 선택 모드로 돌아옵니다.</span></div>
-                <div class="tool-card"><b>Esc</b><span>그리던 작업을 취소하고 선택·이동 모드로 돌아갑니다.</span></div>
+                <div class="tool-card"><b>Esc</b><span>그리던 작업을 취소하고 기본 선택 상태로 돌아갑니다.</span></div>
             </div>
         </section>
 
@@ -37,7 +37,7 @@
                 <li><span class="button-demo">선택지 추가</span>를 누릅니다. 마우스 커서가 십자 모양으로 바뀝니다.</li>
                 <li>체크칸의 왼쪽 위에서 오른쪽 아래까지 드래그합니다.</li>
                 <li>생긴 <span class="swatch blue"></span>파란 박스가 체크칸 테두리를 감싸는지 봅니다.</li>
-                <li>필요한 칸을 모두 그린 뒤 <span class="button-demo">선택·이동</span>을 누르거나 <span class="kbd">Esc</span>를 누릅니다.</li>
+                <li>하나를 그리면 자동으로 선택 상태로 돌아갑니다. 다른 칸도 추가하려면 <span class="button-demo">선택지 추가</span>를 다시 누릅니다.</li>
             </ol>
             <div class="callout">
                 <strong>페이지 경계를 가로질러 그리지 마세요.</strong><br>
@@ -50,10 +50,11 @@
             <table>
                 <thead><tr><th>하고 싶은 일</th><th>마우스 동작</th></tr></thead>
                 <tbody>
-                    <tr><td>한 개 선택</td><td><strong>선택·이동</strong>에서 박스를 클릭</td></tr>
+                    <tr><td>한 개 선택</td><td>박스를 클릭</td></tr>
                     <tr><td>여러 개 범위 선택</td><td>박스가 없는 곳에서 드래그</td></tr>
-                    <tr><td>선택에 한 개 추가 또는 빼기</td><td><span class="kbd">Shift</span> + 박스 클릭</td></tr>
-                    <tr><td>현재 선택에 범위 추가</td><td><span class="kbd">Shift</span> + 빈 공간 드래그</td></tr>
+                    <tr><td>선택에 한 개 추가 또는 빼기</td><td><span class="kbd">Ctrl</span> + 박스 클릭</td></tr>
+                    <tr><td>가로·세로·사각 범위 선택</td><td>기준 박스를 클릭한 뒤 <span class="kbd">Shift</span> + 마지막 박스 클릭</td></tr>
+                    <tr><td>현재 선택에 드래그 범위 추가</td><td><span class="kbd">Ctrl</span> + 빈 공간 드래그</td></tr>
                     <tr><td>선택 해제</td><td>빈 곳을 짧게 클릭</td></tr>
                 </tbody>
             </table>

@@ -27,6 +27,8 @@ from src.processor import (
     _sampled_survey_is_available,
     _save_ui_template_cache,
     _select_ui_detection_templates,
+    _validate_analysis_page_geometry,
+    _validate_analysis_template_layout,
     extract_ink_info_from_mask,
     extract_checkbox_ink_info,
     extract_pure_ink_mask,
@@ -733,6 +735,7 @@ class PipelineOptimizationTests(unittest.TestCase):
                         "src.processor._analyze_single_file",
                         side_effect=analyze_file,
                     ),
+                    patch("src.processor._validate_analysis_page_geometry"),
                     patch("src.processor._insert_img_into_pdf"),
                     patch("src.processor.export_to_excel", side_effect=export_rows),
                 ):
@@ -769,36 +772,17 @@ class PipelineOptimizationTests(unittest.TestCase):
         self.assertTrue(resource_controller.closed)
         self.assertEqual(len(resource_controller.checkpoints), 3)
 
-    def test_batch_analysis_defers_files_until_a_reference_template_exists(self):
+    def test_batch_analysis_stops_before_answers_when_a_template_is_missing(self):
         file_paths = ["broken.pdf", "valid.pdf"]
         valid_samples = {0: [b"valid"]}
         template = {0: np.full((8, 8), 210, np.uint8)}
-        events: list[tuple[str, str, bool]] = []
-        exported_rows: list[dict] = []
+        analyze_file = patch("src.processor._analyze_single_file").start()
+        self.addCleanup(patch.stopall)
 
         def collect_samples(fpath, *_args, **_kwargs):
             if fpath == "broken.pdf":
                 return _file_key(fpath), {}
             return _file_key(fpath), valid_samples
-
-        def analyze_file(
-            fpath,
-            file_label,
-            _config,
-            file_template,
-            reference_templates,
-            *_args,
-            sample_pages=None,
-            **_kwargs,
-        ):
-            self.assertIs(file_template, template)
-            self.assertIs(reference_templates, template)
-            events.append(("analyze", fpath, sample_pages is None))
-            return file_label, [{"파일명": file_label, "페이지": "1p"}], []
-
-        def export_rows(results, _config, _out_path):
-            exported_rows.extend(results)
-            return True
 
         with tempfile.TemporaryDirectory() as temp_dir:
             resource_controller = _ResourceControllerStub()
@@ -814,36 +798,77 @@ class PipelineOptimizationTests(unittest.TestCase):
                         "src.processor.generate_dynamic_templates",
                         return_value=template,
                     ),
-                    patch(
-                        "src.processor._analyze_single_file",
-                        side_effect=analyze_file,
-                    ),
+                    patch("src.processor._validate_analysis_page_geometry"),
                     patch("src.processor._insert_img_into_pdf"),
-                    patch("src.processor.export_to_excel", side_effect=export_rows),
                 ):
-                    success = run_analysis(
-                        file_paths,
-                        [np.full((8, 8), 255, np.uint8)],
-                        TemplatePreset(page_count=1),
-                        resource_controller=resource_controller,
-                        output_base_dir=temp_dir,
-                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "자동 생성 템플릿.*1쪽"
+                    ):
+                        run_analysis(
+                            file_paths,
+                            [np.full((8, 8), 255, np.uint8)],
+                            TemplatePreset(page_count=1),
+                            resource_controller=resource_controller,
+                            output_base_dir=temp_dir,
+                        )
             finally:
                 os.chdir(previous_cwd)
 
-        self.assertTrue(success)
-        self.assertEqual(
-            events,
-            [
-                ("analyze", "broken.pdf", True),
-                ("analyze", "valid.pdf", False),
-            ],
-        )
-        self.assertEqual(
-            [row["파일명"] for row in exported_rows], ["broken", "valid"]
-        )
+        analyze_file.assert_not_called()
         self.assertTrue(resource_controller.started)
         self.assertTrue(resource_controller.closed)
+
+    def test_page_geometry_allows_dpi_changes_with_the_same_ratio(self):
+        reference = np.full((1000, 707), 255, np.uint8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "same-ratio.pdf"
+            doc = fitz.open()
+            doc.new_page(width=595, height=842)
+            doc.new_page(width=1190, height=1684)
+            doc.save(pdf_path)
+            doc.close()
+
+            _validate_analysis_page_geometry(
+                [str(pdf_path)],
+                [reference],
+                TemplatePreset(page_count=1),
+            )
+
+    def test_page_geometry_blocks_a_materially_different_ratio(self):
+        reference = np.full((1000, 707), 255, np.uint8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "wrong-ratio.pdf"
+            doc = fitz.open()
+            doc.new_page(width=612, height=792)
+            doc.save(pdf_path)
+            doc.close()
+
+            with self.assertRaisesRegex(ValueError, "페이지 비율.*다릅니다"):
+                _validate_analysis_page_geometry(
+                    [str(pdf_path)],
+                    [reference],
+                    TemplatePreset(page_count=1),
+                )
+
+    def test_analysis_layout_blocks_an_incompatible_checkbox_template(self):
+        template = np.full((100, 80), 255, np.uint8)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q1", boxes=[Box(0, 10, 10, 10, 10)])],
+        )
+        incompatible = SimpleNamespace(expected_boxes=1, compatible=False)
+
+        with patch(
+            "src.processor.remap_preset_to_detected_layout",
+            return_value=incompatible,
+        ):
+            with self.assertRaisesRegex(ValueError, "정합 신뢰도가 부족"):
+                _validate_analysis_template_layout(
+                    config,
+                    {0: template},
+                    [template],
+                    "다른양식",
+                )
 
     def test_ui_template_cache_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:

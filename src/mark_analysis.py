@@ -26,27 +26,27 @@ _CHECKBOX_RELIABLE_MARK_STRENGTH = 0.025
 
 
 def _expand_comment_box(box: Box) -> Box:
-    """Cover handwriting that strays around a configured free-text line.
+    """Add only enough padding to absorb small alignment errors.
 
-    Comment boxes in older presets usually describe only the printed answer
-    line. Respondents commonly start beside the ``답:`` label or continue on
-    the whitespace below it, so use a deliberately asymmetric, bounded
-    corridor around that line.
+    The configured region remains the semantic boundary. Scale a symmetric
+    safety margin by its shorter side so different scan resolutions behave
+    consistently, while keeping nearby questions outside the analysis ROI.
     """
-    if box.w < 900:
-        return Box(box.page_idx, box.x, box.y, box.w, box.h)
+    if box.w <= 0 or box.h <= 0:
+        return copy.copy(box)
 
-    left = min(240, round(box.w * 0.22))
-    right = min(90, round(box.w * 0.08))
-    top = min(35, round(box.h * 0.25))
-    bottom = min(210, round(box.h * 1.80))
-    return Box(
-        page_idx=box.page_idx,
-        x=max(0, box.x - left),
-        y=max(0, box.y - top),
-        w=box.w + left + right,
-        h=box.h + top + bottom,
-    )
+    padding = min(16, max(4, round(min(box.w, box.h) * 0.04)))
+    x1 = max(0, box.x - padding)
+    y1 = max(0, box.y - padding)
+    x2 = box.x + box.w + padding
+    y2 = box.y + box.h + padding
+
+    expanded = copy.copy(box)
+    expanded.x = x1
+    expanded.y = y1
+    expanded.w = x2 - x1
+    expanded.h = y2 - y1
+    return expanded
 
 
 @dataclass

@@ -197,6 +197,7 @@ class RedetectionProgressTests(unittest.TestCase):
         self.assertIs(window.pages[0], raw)
         self.assertFalse(window._pages_are_canonical)
         self.assertIs(window._analysis_reference_pages[0], current_template)
+        self.assertIs(window._inferred_display_templates[0], current_template)
         mapped_box = window.preset.fields[0].boxes[0]
         # The remapped preset carries the saved semantics in current-PDF geometry.
         self.assertEqual(
@@ -451,6 +452,7 @@ class RedetectionProgressTests(unittest.TestCase):
         previous_pending = [Box(0, 4, 5, 6, 6)]
         selected_box = previous_preset.fields[0].boxes[0]
         previous_selected = [selected_box]
+        previous_display = np.full_like(raw, 252)
         window = SimpleNamespace(
             file_paths=["survey.pdf"],
             pages=[raw],
@@ -459,6 +461,8 @@ class RedetectionProgressTests(unittest.TestCase):
             pending_boxes=previous_pending,
             selected_boxes=previous_selected,
             is_a_view=True,
+            _inferred_display_templates={0: previous_display},
+            _analysis_validation_error="",
             _wrap_progress=MainWindow._wrap_progress,
             _sync_rotation_index=Mock(),
             _sync_fine_angle_spin=Mock(),
@@ -511,6 +515,8 @@ class RedetectionProgressTests(unittest.TestCase):
         self.assertEqual(window.pending_boxes, previous_pending)
         self.assertEqual(window.selected_boxes, [selected_box])
         self.assertTrue(window.is_a_view)
+        self.assertIs(window._inferred_display_templates[0], previous_display)
+        self.assertEqual(window._analysis_validation_error, "")
         aligner.assert_not_called()
 
     def test_page_angles_are_estimated_once_per_template_page(self):

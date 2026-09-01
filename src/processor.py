@@ -2,6 +2,8 @@ import copy
 import gc
 import hashlib
 import os
+import re
+import shutil
 import sys
 import tempfile
 from collections import Counter, deque
@@ -84,6 +86,10 @@ _ANALYSIS_PROGRESS_START = 2.0
 _ANALYSIS_PROGRESS_SPAN = 95.0
 _ANALYSIS_PLAN_EPOCH_WINDOWS = 4
 _TEMPLATE_ALIGNMENT_STATE_LANES = 2
+_RESULT_RUN_RETENTION_COUNT = 30
+_RESULT_RUN_NAME_PATTERN = re.compile(
+    r"^설문결과_(\d{4}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})(?:_(\d+))?$"
+)
 
 _SamplePage = bytes | np.ndarray
 
@@ -91,6 +97,7 @@ _SamplePage = bytes | np.ndarray
 @dataclass(frozen=True)
 class _AnalysisOutputPaths:
     result_folder: Path
+    run_folder: Path
     review_folder: Path
     comment_path: Path
     excel_path: Path
@@ -119,24 +126,96 @@ def _prepare_analysis_output_paths(
     suffix = 1
     while True:
         run_stem = base_stem if suffix == 1 else f"{base_stem}_{suffix}"
-        review_folder = result_folder / f"{run_stem}_검토용"
-        comment_path = result_folder / f"{run_stem}_자유기입.pdf"
-        excel_path = result_folder / f"{run_stem}.xlsx"
-        if comment_path.exists() or excel_path.exists():
-            suffix += 1
-            continue
+        run_folder = result_folder / run_stem
         try:
-            # The folder acts as an atomic claim if two analyses start together.
-            review_folder.mkdir(parents=True, exist_ok=False)
+            # The run folder acts as an atomic claim if two analyses start together.
+            run_folder.mkdir(parents=False, exist_ok=False)
         except FileExistsError:
             suffix += 1
             continue
+        review_folder = run_folder / "검토용"
+        try:
+            review_folder.mkdir()
+        except Exception:
+            run_folder.rmdir()
+            raise
         return _AnalysisOutputPaths(
             result_folder=result_folder,
+            run_folder=run_folder,
             review_folder=review_folder,
-            comment_path=comment_path,
-            excel_path=excel_path,
+            comment_path=run_folder / "자유기입.pdf",
+            excel_path=run_folder / "설문결과.xlsx",
         )
+
+
+def _result_run_sort_key(run_folder: Path) -> tuple[datetime, int]:
+    match = _RESULT_RUN_NAME_PATTERN.fullmatch(run_folder.name)
+    if match is None:
+        raise ValueError(f"결과 폴더 이름 형식이 올바르지 않습니다: {run_folder.name}")
+    timestamp = datetime.strptime(match.group(1), "%Y.%m.%d.%H.%M.%S")
+    return timestamp, int(match.group(2) or 1)
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        return path.is_symlink() or (is_junction is not None and is_junction())
+    except OSError:
+        return True
+
+
+def _is_complete_result_run(run_folder: Path) -> bool:
+    return (
+        run_folder.is_dir()
+        and not _is_link_or_junction(run_folder)
+        and _RESULT_RUN_NAME_PATTERN.fullmatch(run_folder.name) is not None
+        and (run_folder / "검토용").is_dir()
+        and (run_folder / "설문결과.xlsx").is_file()
+    )
+
+
+def _delete_result_run(run_folder: Path, result_folder: Path) -> Path:
+    """Delete one verified application result without following links."""
+    run_folder = Path(run_folder)
+    result_folder = Path(result_folder).resolve()
+    if not _is_complete_result_run(run_folder):
+        raise ValueError(f"완료된 분석 결과 폴더가 아닙니다: {run_folder.name}")
+    resolved_run_folder = run_folder.resolve()
+    if resolved_run_folder.parent != result_folder:
+        raise ValueError(f"결과 폴더 밖의 경로는 삭제하지 않습니다: {run_folder}")
+    if any(_is_link_or_junction(entry) for entry in run_folder.rglob("*")):
+        raise ValueError(f"링크가 포함된 결과 폴더는 삭제하지 않습니다: {run_folder.name}")
+    shutil.rmtree(resolved_run_folder)
+    return run_folder
+
+
+def _prune_old_result_runs(
+    result_folder: Path,
+    keep_count: int = _RESULT_RUN_RETENTION_COUNT,
+) -> tuple[list[Path], list[str]]:
+    """Keep only the newest completed application result folders."""
+    result_folder = Path(result_folder).resolve()
+    if not result_folder.is_dir():
+        return [], []
+    keep_count = max(0, int(keep_count))
+    run_folders = sorted(
+        (
+            path
+            for path in result_folder.iterdir()
+            if _is_complete_result_run(path)
+        ),
+        key=_result_run_sort_key,
+        reverse=True,
+    )
+
+    deleted: list[Path] = []
+    errors: list[str] = []
+    for run_folder in run_folders[keep_count:]:
+        try:
+            deleted.append(_delete_result_run(run_folder, result_folder))
+        except Exception as exc:
+            errors.append(f"{run_folder.name}: {exc}")
+    return deleted, errors
 
 
 @dataclass
@@ -2430,10 +2509,10 @@ def process_survey_data(
 
         if field.is_comment:
             has_comment = False
-            total_boxes = len(valid_boxes)
+            total_boxes = len(scoring_boxes)
 
             for idx, (box, is_ticked) in enumerate(
-                zip(valid_boxes, check_results), start=1
+                zip(scoring_boxes, check_results), start=1
             ):
                 label_number = _label_number(total_boxes, idx, config.reverse_numbering)
                 label = str(label_number)
@@ -3331,6 +3410,110 @@ def _prepare_alignment_references(
     ]
 
 
+_PAGE_ASPECT_RATIO_TOLERANCE = 0.04
+
+
+def _validate_analysis_page_geometry(
+    file_paths: list[str],
+    alignment_references: list[np.ndarray],
+    config: TemplatePreset,
+) -> None:
+    """Reject incompatible page geometry while allowing ordinary DPI changes."""
+    page_count = int(config.page_count)
+    if page_count <= 0 or len(alignment_references) < page_count:
+        raise ValueError(
+            "분석에 필요한 페이지별 기준 템플릿이 모두 준비되지 않았습니다."
+        )
+
+    reference_ratios: list[float] = []
+    for page_idx, reference in enumerate(alignment_references[:page_count]):
+        if not isinstance(reference, np.ndarray) or reference.size == 0:
+            raise ValueError(
+                f"{page_idx + 1}쪽 기준 템플릿이 비어 있어 분석할 수 없습니다."
+            )
+        height, width = reference.shape[:2]
+        if height <= 0 or width <= 0:
+            raise ValueError(
+                f"{page_idx + 1}쪽 기준 템플릿 크기를 확인할 수 없습니다."
+            )
+        reference_ratios.append(width / height)
+
+    swaps_axes = config.rot_code in (
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    )
+    for file_path in file_paths:
+        try:
+            doc = fitz.open(file_path)
+        except Exception as exc:
+            raise ValueError(
+                f"'{Path(file_path).name}' 파일을 확인할 수 없습니다: {exc}"
+            ) from exc
+        try:
+            if len(doc) == 0:
+                raise ValueError(
+                    f"'{Path(file_path).name}'에 분석할 페이지가 없습니다."
+                )
+            for global_page_idx, page in enumerate(doc):
+                local_page_idx = global_page_idx % page_count
+                width = float(page.rect.width)
+                height = float(page.rect.height)
+                if swaps_axes:
+                    width, height = height, width
+                if width <= 0 or height <= 0:
+                    raise ValueError(
+                        f"'{Path(file_path).name}' {global_page_idx + 1}쪽의 "
+                        "페이지 크기를 확인할 수 없습니다."
+                    )
+                actual_ratio = width / height
+                expected_ratio = reference_ratios[local_page_idx]
+                relative_error = abs(actual_ratio / expected_ratio - 1.0)
+                if relative_error > _PAGE_ASPECT_RATIO_TOLERANCE:
+                    raise ValueError(
+                        "분석을 중단했습니다. "
+                        f"'{Path(file_path).name}' {global_page_idx + 1}쪽의 "
+                        f"페이지 비율({width:.0f}×{height:.0f})이 "
+                        f"{local_page_idx + 1}쪽 기준 템플릿과 다릅니다. "
+                        "같은 설문지와 방향인지 확인해주세요."
+                    )
+        finally:
+            doc.close()
+
+
+def _validate_analysis_template_layout(
+    config: TemplatePreset,
+    templates: dict[int, np.ndarray],
+    alignment_references: list[np.ndarray],
+    file_label: str,
+) -> None:
+    """Block answer extraction when a file template is missing or incompatible."""
+    required_pages = set(range(max(0, int(config.page_count))))
+    missing_pages = sorted(required_pages.difference(templates))
+    if missing_pages:
+        page_text = ", ".join(f"{page_idx + 1}쪽" for page_idx in missing_pages)
+        raise ValueError(
+            f"{file_label}: 자동 생성 템플릿에서 {page_text}을(를) 만들지 "
+            "못해 분석을 중단했습니다."
+        )
+
+    source_templates = {
+        page_idx: reference
+        for page_idx, reference in enumerate(
+            alignment_references[: config.page_count]
+        )
+    }
+    layout_check = remap_preset_to_detected_layout(
+        config,
+        templates,
+        source_templates=source_templates,
+    )
+    if layout_check.expected_boxes > 0 and not layout_check.compatible:
+        raise ValueError(
+            f"{file_label}: 체크박스 배치 정합 신뢰도가 부족해 분석을 "
+            "중단했습니다. 다른 설문지가 섞였는지 확인해주세요."
+        )
+
+
 def run_analysis(
     file_paths: list[str],
     template_pages: list,
@@ -3350,8 +3533,6 @@ def run_analysis(
     if num_files == 0:
         return False
     validate_field_names(field.name for field in config.fields)
-    output_paths = _prepare_analysis_output_paths(output_base_dir)
-    review_folder = output_paths.review_folder
     file_labels = _build_file_labels(file_paths)
     survey_counts = _file_survey_counts(file_paths, config.page_count)
     sample_counts = [
@@ -3374,8 +3555,11 @@ def run_analysis(
         template_pages_preprocessed,
     )
     if not alignment_references:
-        print("페이지 정합 기준 이미지가 없습니다.")
-        return False
+        raise ValueError("페이지 정합 기준 이미지가 없어 분석할 수 없습니다.")
+    _validate_analysis_page_geometry(file_paths, alignment_references, config)
+
+    output_paths = _prepare_analysis_output_paths(output_base_dir)
+    review_folder = output_paths.review_folder
 
     completed_work = 0.0
 
@@ -3401,7 +3585,6 @@ def run_analysis(
     controller = resource_controller or AdaptiveResourceController()
     controller.start()
     reference_templates: dict[int, np.ndarray] | None = None
-    pending_indices: list[int] = []
     all_results: list[dict] = []
     analysis_failures: list[str] = []
     completed = 0
@@ -3551,21 +3734,16 @@ def run_analysis(
                     f"파일 {index + 1}/{num_files}",
                 )
 
-            if reference_templates is None:
-                if not file_template:
-                    # 기준이 생길 때까지 경로만 기억합니다. 앞 파일의 큰 PNG 표본은
-                    # 보관하지 않고 나중에 기준 템플릿으로 다시 렌더링합니다.
-                    pending_indices.append(index)
-                    sample_pages.clear()
-                    gc.collect()
-                    continue
+            _validate_analysis_template_layout(
+                config,
+                file_template,
+                alignment_references,
+                file_label,
+            )
 
+            if reference_templates is None:
                 reference_templates = file_template
                 save_reference_template()
-                for pending_index in pending_indices:
-                    analyze_file(pending_index, reference_templates, None)
-                    gc.collect()
-                pending_indices.clear()
 
             analyze_file(
                 index,
@@ -3597,5 +3775,12 @@ def run_analysis(
     # ── 엑셀 저장 ──
     report_progress(98, "엑셀 저장 중...")
     success = export_to_excel(all_results, config, str(output_paths.excel_path))
+    if success and not analysis_failures:
+        report_progress(99, "오래된 결과 정리 중...")
+        _deleted, cleanup_errors = _prune_old_result_runs(
+            output_paths.result_folder
+        )
+        for cleanup_error in cleanup_errors:
+            print(f"결과 자동 정리 보류: {cleanup_error}")
     report_progress(100, "완료")
     return success and not analysis_failures
