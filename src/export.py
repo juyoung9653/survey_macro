@@ -6,7 +6,7 @@ from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .models import TemplatePreset
+from .models import TemplatePreset, validate_field_names
 
 
 def _try_number(s: str):
@@ -313,6 +313,8 @@ def export_to_excel(
 ) -> bool:
     if not results:
         return False
+    if config:
+        validate_field_names(field.name for field in config.fields)
 
     try:
         wb = openpyxl.Workbook()

@@ -1,107 +1,94 @@
-﻿<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>2. 실행 방법</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
-  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
-  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
-  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
-  .nav a:hover{background:#e8eaf6}
-  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
-  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
-  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
-  .card h3{font-size:17px;color:#333;margin:20px 0 8px}
-  .card p,.card li{font-size:15px;color:#444}
-  .card ul,.card ol{padding-left:22px;margin:8px 0}
-  .card li{margin-bottom:6px}
-  .tip{background:#e8eaf6;border-left:4px solid #3f51b5;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
-  .warn{background:#fff3e0;border-left:4px solid #ff9800;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
-  .fig{text-align:center;margin:18px 0;background:#fafbfc;border-radius:12px;padding:16px;border:1px solid #e8ecf0}
-  .fig svg{max-width:100%;height:auto}
-  .fig .cap{margin-top:8px;font-size:13px;color:#777}
-  code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:14px;color:#c62828}
-  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
-  @media(max-width:600px){.card{padding:20px}}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>2. 실행과 PDF 준비</title>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="wrap">
+<div class="shell">
+    <nav class="topnav" aria-label="문서 이동">
+        <a class="nav-link" href="1_이_프로그램이_뭐_하는_건가요.html">← 이전: 처음 분석하기</a>
+        <a class="nav-link" href="../설명서.html">목차</a>
+        <a class="nav-link" href="3_PDF_불러오기.html">다음: 화면 구성 →</a>
+    </nav>
 
-<div class="nav">
-  <a href="1_이_프로그램이_뭐_하는_건가요.html">◀ 이전: 소개</a>
-  <a href="../설명서.html">목차</a>
-  <a href="3_PDF_불러오기.html">다음: PDF 불러오기 ▶</a>
-</div>
+    <header class="page-head">
+        <span class="page-number">2</span>
+        <h1>실행과 PDF 준비</h1>
+        <p>프로그램을 여는 방법과, 자동 인식이 잘 되는 PDF의 조건을 정리합니다.</p>
+    </header>
 
-<div class="card">
-  <h2><span class="num">2</span> 실행 방법</h2>
+    <main>
+        <section class="card">
+            <h2>프로그램 실행</h2>
+            <div class="two-column">
+                <div class="tool-card">
+                    <b>실행 파일이 있는 경우</b>
+                    <span><code>설문지스캔.exe</code>를 더블클릭합니다. Python 설치 없이 실행하는 배포 방식입니다.</span>
+                </div>
+                <div class="tool-card">
+                    <b>소스 폴더인 경우</b>
+                    <span><code>이거_더블클릭해서_실행.py</code>를 더블클릭합니다. Python이 필요합니다.</span>
+                </div>
+            </div>
+            <p>소스 실행은 필요한 구성 요소가 없으면 자동 설치합니다. 첫 실행만 인터넷 연결과 시간이 필요할 수 있습니다.</p>
+            <div class="callout warn">
+                <strong>검은 터미널 창이 함께 열렸다면 그대로 두세요.</strong><br>
+                소스 실행 중 그 창을 닫으면 프로그램도 종료될 수 있습니다. 프로그램 창의 X 버튼으로 정상 종료하세요.
+            </div>
+        </section>
 
-  <h3>정말 간단합니다</h3>
-  <p><code>설문지 스캔</code> 폴더 안에 있는 파일 중 <strong>하나만 더블클릭</strong>하면 됩니다.</p>
+        <section class="card">
+            <h2>PDF 준비 기준</h2>
+            <table>
+                <thead><tr><th>확인할 것</th><th>권장 상태</th><th>이유</th></tr></thead>
+                <tbody>
+                    <tr><td>설문 양식</td><td>한 번에 고른 파일이 모두 동일</td><td>저장된 문항과 영역 위치를 공통으로 사용합니다.</td></tr>
+                    <tr><td>해상도</td><td>글자와 체크 선이 선명한 300 DPI 안팎</td><td>너무 흐리거나 압축이 심하면 테두리와 필기 구분이 어려워집니다.</td></tr>
+                    <tr><td>페이지 순서</td><td>각 설문이 같은 순서로 반복</td><td>예: 2쪽짜리는 1쪽·2쪽, 다음 응답의 1쪽·2쪽 순서여야 합니다.</td></tr>
+                    <tr><td>방향</td><td>가능하면 모두 같은 회전 방향</td><td>서로 뒤집힌 페이지가 섞이면 별도 보정이 필요합니다.</td></tr>
+                    <tr><td>여백</td><td>체크칸이 잘리지 않음</td><td>페이지 가장자리에서 잘린 칸은 자동 탐지하기 어렵습니다.</td></tr>
+                </tbody>
+            </table>
+        </section>
 
-  <div class="fig">
-    <svg viewBox="0 0 520 160" style="max-width:520px">
-      <rect x="10" y="10" width="500" height="140" rx="14" fill="#f5f5f5" stroke="#ccc" stroke-width="1"/>
-      <text x="30" y="40" font-size="14" fill="#333" font-weight="bold">설문지 스캔 폴더 안</text>
+        <section class="card">
+            <h2>“한 부당 페이지 수”란?</h2>
+            <p>한 사람이 작성한 설문 한 묶음에 들어가는 페이지 수입니다. PDF 파일 수와는 다릅니다.</p>
+            <ul>
+                <li>한 사람이 한 페이지만 작성: <strong>1</strong></li>
+                <li>앞면과 뒷면 두 페이지를 작성: <strong>2</strong></li>
+                <li>세 페이지짜리 설문: <strong>3</strong></li>
+            </ul>
+            <div class="callout">
+                <strong>한 PDF 안에 여러 사람의 설문이 이어져 있어도 됩니다.</strong><br>
+                예를 들어 2쪽짜리 응답 28부가 한 PDF에 있으면 총 56페이지이며, 입력값은 <strong>2</strong>입니다.
+            </div>
+            <div class="callout danger">
+                <strong>페이지 수를 잘못 입력하면 응답끼리 섞입니다.</strong><br>
+                분석 전에 첫 응답과 다음 응답의 시작 페이지가 맞는지 확인하세요.
+            </div>
+        </section>
 
-      <rect x="30" y="55" width="180" height="34" rx="8" fill="#fff" stroke="#bbb" stroke-width="1"/>
-      <text x="42" y="76" font-size="12" fill="#888">src 폴더</text>
+        <section class="card">
+            <h2>기울거나 돌아간 스캔</h2>
+            <ul>
+                <li>조금 기울어진 경우: 상단 <span class="button-demo">자동 수평 맞춤</span>을 사용합니다.</li>
+                <li>전체가 90도 돌아간 경우: <strong>파일 → 페이지 설정 → 회전</strong>에서 방향을 고릅니다.</li>
+                <li>아주 조금 더 조정할 때: <strong>전체 미세 회전</strong> 값을 바꿉니다.</li>
+            </ul>
+            <p class="caption">회전이나 수평 맞춤을 바꾸면 체크박스를 다시 탐지하므로 잠시 기다릴 수 있습니다.</p>
+        </section>
+    </main>
 
-      <rect x="220" y="55" width="180" height="34" rx="8" fill="#fff" stroke="#bbb" stroke-width="1"/>
-      <text x="232" y="76" font-size="12" fill="#888">검토용 폴더</text>
-
-      <rect x="410" y="55" width="80" height="34" rx="8" fill="#fff" stroke="#bbb" stroke-width="1"/>
-      <text x="422" y="76" font-size="12" fill="#888">백업 폴더</text>
-
-      <rect x="30" y="100" width="460" height="38" rx="8" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
-      <text x="45" y="124" font-size="14" fill="#1565c0" font-weight="bold">이거_더블클릭해서_실행.py  ← 이 파일!</text>
-    </svg>
-    <div class="cap">👆 이 파일만 더블클릭하세요. 나머지는 건드릴 필요 없습니다.</div>
-  </div>
-
-  <h3>단계별 설명</h3>
-  <ol>
-    <li><strong>폴더 열기:</strong> 바탕화면이나 다운로드 폴더에서 <code>설문지 스캔</code> 폴더를 엽니다.</li>
-    <li><strong>더블클릭:</strong> <code>이거_더블클릭해서_실행.py</code> 파일을 <strong>마우스 왼쪽 버튼으로 빠르게 두 번</strong> 클릭합니다.</li>
-    <li><strong>자동 설치 (처음 한 번만):</strong> 잠시 뒤 검은색 창(터미널)이 뜨면서 필요한 프로그램들을 자동으로 설치합니다. <strong>1~2분</strong> 정도 걸리며, 인터넷 연결이 필요합니다.</li>
-    <li><strong>프로그램 실행:</strong> 설치가 끝나면 <strong>자동으로</strong> 프로그램 창이 열립니다.</li>
-  </ol>
-
-  <div class="fig">
-    <svg viewBox="0 0 500 100" style="max-width:500px">
-      <rect x="10" y="15" width="480" height="70" rx="12" fill="#e8f5e9" stroke="#4caf50" stroke-width="2"/>
-      <text x="250" y="45" text-anchor="middle" font-size="16" fill="#2e7d32" font-weight="bold">설문지 자동 분석기</text>
-      <text x="250" y="68" text-anchor="middle" font-size="12" fill="#555">여기에 설문지 PDF를 불러오면 됩니다!</text>
-    </svg>
-    <div class="cap">이런 창이 뜨면 성공!</div>
-  </div>
-
-  <div class="warn">
-    <strong>중요! 절대 닫지 마세요:</strong><br>
-    프로그램과 함께 뜨는 <strong>검은색 창(터미널)</strong>을 닫으면 프로그램도 함께 꺼집니다.<br>
-    프로그램을 종료할 때는 프로그램 창 오른쪽 위 <strong>X 버튼</strong>을 눌러주세요.
-  </div>
-
-  <div class="tip">
-    <strong>실행이 안 된다면?</strong><br>
-    파일 위에서 <strong>마우스 우클릭 &gt; 연결 프로그램 &gt; Python</strong>을 선택해보세요.<br>
-    그래도 안 되면 관리자에게 "Python이 설치되어 있나요?"라고 물어봐 주세요.
-  </div>
-</div>
-
-<div class="nav">
-  <a href="1_이_프로그램이_뭐_하는_건가요.html">◀ 이전: 소개</a>
-  <a href="../설명서.html">목차</a>
-  <a href="3_PDF_불러오기.html">다음: PDF 불러오기 ▶</a>
-</div>
-
-<div class="footer">설문지 자동 분석기 &middot; 2. 실행 방법</div>
-
+    <nav class="bottomnav" aria-label="문서 이동">
+        <a class="nav-link" href="1_이_프로그램이_뭐_하는_건가요.html">← 이전</a>
+        <a class="nav-link" href="../설명서.html">목차</a>
+        <a class="nav-link" href="3_PDF_불러오기.html">다음: 화면 구성 →</a>
+    </nav>
+    <footer class="footer">설문지 자동 분석기 · 실행과 PDF 준비</footer>
 </div>
 </body>
 </html>
-</title></h3></code></strong></h3></strong></code></strong></code></strong></strong></strong></strong></strong></strong></strong></strong></strong></strong>

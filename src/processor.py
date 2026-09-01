@@ -62,7 +62,7 @@ from .mark_analysis import (
     extract_ink_info_from_mask,
     extract_pure_ink_mask,
 )
-from .models import Box, Field, TemplatePreset
+from .models import Box, Field, TemplatePreset, validate_field_names
 from .resources import AdaptiveResourceController, ResourceUnavailableError
 from .vision import (
     ImageAligner,
@@ -73,7 +73,8 @@ from .vision import (
 
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
-_UI_TEMPLATE_CACHE_VERSION = 6
+_UI_DETECTION_SAMPLE_LIMIT = 7
+_UI_TEMPLATE_CACHE_VERSION = 8
 _MIB = 1024 * 1024
 _ANALYSIS_SAMPLE_WORK = 2.0
 _ANALYSIS_TEMPLATE_WORK = 1.0
@@ -112,17 +113,30 @@ def _prepare_analysis_output_paths(
         else _runtime_directory()
     )
     result_folder = base_path / "결과"
-    timestamp = (now or datetime.now()).strftime("%Y.%m.%d.%H.%M")
-    run_stem = f"설문결과_{timestamp}"
-    review_folder = result_folder / f"{run_stem}_검토용"
     result_folder.mkdir(parents=True, exist_ok=True)
-    review_folder.mkdir(parents=True, exist_ok=True)
-    return _AnalysisOutputPaths(
-        result_folder=result_folder,
-        review_folder=review_folder,
-        comment_path=result_folder / f"{run_stem}_의견.pdf",
-        excel_path=result_folder / f"{run_stem}.xlsx",
-    )
+    timestamp = (now or datetime.now()).strftime("%Y.%m.%d.%H.%M.%S")
+    base_stem = f"설문결과_{timestamp}"
+    suffix = 1
+    while True:
+        run_stem = base_stem if suffix == 1 else f"{base_stem}_{suffix}"
+        review_folder = result_folder / f"{run_stem}_검토용"
+        comment_path = result_folder / f"{run_stem}_자유기입.pdf"
+        excel_path = result_folder / f"{run_stem}.xlsx"
+        if comment_path.exists() or excel_path.exists():
+            suffix += 1
+            continue
+        try:
+            # The folder acts as an atomic claim if two analyses start together.
+            review_folder.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            suffix += 1
+            continue
+        return _AnalysisOutputPaths(
+            result_folder=result_folder,
+            review_folder=review_folder,
+            comment_path=comment_path,
+            excel_path=excel_path,
+        )
 
 
 @dataclass
@@ -134,6 +148,8 @@ class PresetLayoutRemapResult:
     expected_boxes: int
     accepted: bool
     compatible: bool = True
+    matched_box_keys: frozenset[tuple[int, int, int, int, int]] = frozenset()
+    supplied_box_keys: frozenset[tuple[int, int, int, int, int]] = frozenset()
 
 
 def _fine_angle_for_page(
@@ -606,6 +622,59 @@ def generate_dynamic_templates(
     return templates
 
 
+def _select_ui_detection_templates(
+    pages_by_local_idx: dict[int, list],
+    median_templates: dict[int, np.ndarray],
+) -> dict[int, np.ndarray]:
+    """Prefer a cleaner real sample only when it exposes more valid boxes."""
+    selected = dict(median_templates)
+    for local_page, template in median_templates.items():
+        best_template = template
+        best_count = len(
+            auto_detect_checkboxes(cv2.cvtColor(template, cv2.COLOR_GRAY2BGR))
+        )
+
+        samples = pages_by_local_idx.get(local_page, [])
+        if len(samples) <= _UI_DETECTION_SAMPLE_LIMIT:
+            sample_indices = list(range(len(samples)))
+        else:
+            head_count = min(3, _UI_DETECTION_SAMPLE_LIMIT)
+            sample_indices = list(range(head_count))
+            remaining = _UI_DETECTION_SAMPLE_LIMIT - head_count
+            spread = np.linspace(
+                head_count,
+                len(samples) - 1,
+                num=remaining,
+                dtype=int,
+            )
+            sample_indices.extend(int(index) for index in spread)
+
+        for sample_index in sample_indices:
+            sample = samples[sample_index]
+            if isinstance(sample, bytes):
+                candidate = cv2.imdecode(
+                    np.frombuffer(sample, np.uint8), cv2.IMREAD_GRAYSCALE
+                )
+            else:
+                candidate = sample
+            if candidate is None:
+                continue
+            if candidate.ndim == 3:
+                candidate = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+
+            count = len(
+                auto_detect_checkboxes(
+                    cv2.cvtColor(candidate, cv2.COLOR_GRAY2BGR)
+                )
+            )
+            if count > best_count:
+                best_template = candidate
+                best_count = count
+
+        selected[local_page] = best_template
+    return selected
+
+
 def _filter_blank_pages(
     images: list[np.ndarray], std_thresh: float = 1.5
 ) -> list[np.ndarray]:
@@ -706,6 +775,9 @@ def generate_ui_templates(
                     pages_by_local_idx[local_p].append(encoded.tobytes())
 
     dynamic_templates = generate_dynamic_templates(pages_by_local_idx)
+    dynamic_templates = _select_ui_detection_templates(
+        pages_by_local_idx, dynamic_templates
+    )
     _save_ui_template_cache(cache_path, dynamic_templates)
 
     # auto_detect_checkboxes 함수는 BGR 형태를 요구하므로 변환해서 반환합니다.
@@ -837,6 +909,9 @@ def generate_ui_templates_multi(
         progress_cb(100, "템플릿 병합 완료")
 
     dynamic_templates = generate_dynamic_templates(all_by_local_idx)
+    dynamic_templates = _select_ui_detection_templates(
+        all_by_local_idx, dynamic_templates
+    )
     _save_ui_template_cache(cache_path, dynamic_templates)
 
     bgr_templates = {}
@@ -1403,6 +1478,7 @@ def remap_preset_to_detected_layout(
     templates: dict[int, np.ndarray],
     source_templates: dict[int, np.ndarray] | None = None,
     auxiliary_boxes: list[Box] | None = None,
+    detected_boxes_by_page: dict[int, list[Box]] | None = None,
 ) -> PresetLayoutRemapResult:
     """Move a saved preset into the current document's detected box coordinates.
 
@@ -1410,7 +1486,9 @@ def remap_preset_to_detected_layout(
     ordered checkbox rows after a coarse page-size scale, fit a robust transform,
     and repeat the match around that transform. A small number of obscured frames
     may be interpolated, but broad row coverage and plausible geometry are still
-    required. Comment and auxiliary boxes follow the same transform.
+    required. When current auto-detected boxes are supplied, matched checkbox
+    geometry is reused exactly; comments and auxiliary boxes follow the same
+    validated transform.
     """
     original_config = copy.deepcopy(config)
     original_auxiliary = copy.deepcopy(auxiliary_boxes or [])
@@ -1474,6 +1552,7 @@ def remap_preset_to_detected_layout(
 
     page_transforms: dict[int, np.ndarray] = {}
     snapped_refs_by_page: dict[int, list[tuple[int, int, Box]]] = {}
+    supplied_box_keys: set[tuple[int, int, int, int, int]] = set()
     matched_total = 0
     compatible = True
     for page_idx in required_pages:
@@ -1482,9 +1561,31 @@ def remap_preset_to_detected_layout(
         scaled_refs = _config_checkbox_refs(
             scaled_config, page_idx, templates[page_idx].shape
         )
-        detected = _detect_preset_checkbox_anchors(
-            templates[page_idx], scaled_refs, page_idx
+        supplied_detected = (
+            detected_boxes_by_page.get(page_idx)
+            if detected_boxes_by_page is not None
+            else None
         )
+        if supplied_detected is None:
+            detected = _detect_preset_checkbox_anchors(
+                templates[page_idx], scaled_refs, page_idx
+            )
+        else:
+            valid_supplied = [
+                copy.copy(box)
+                for box in supplied_detected
+                if box.page_idx == page_idx
+                and box.w > 0
+                and box.h > 0
+            ]
+            supplied_box_keys.update(
+                _checkbox_box_key(box) for box in valid_supplied
+            )
+            detected = [
+                box
+                for box in valid_supplied
+                if _is_checkbox_like(box, templates[page_idx].shape)
+            ]
         initial_matches, initial_row_matches, expected_row_count = (
             _match_checkbox_anchor_rows(
                 scaled_refs, detected, templates[page_idx].shape
@@ -1596,6 +1697,7 @@ def remap_preset_to_detected_layout(
 
     adjusted_config = copy.deepcopy(config)
     adjusted_auxiliary = copy.deepcopy(auxiliary_boxes or [])
+    matched_box_keys: set[tuple[int, int, int, int, int]] = set()
     for field in adjusted_config.fields:
         for box in field.boxes:
             matrix = page_transforms.get(box.page_idx)
@@ -1612,6 +1714,7 @@ def remap_preset_to_detected_layout(
     # themselves use the exact detector result so their borders remain precise.
     for page_idx, snapped_refs in snapped_refs_by_page.items():
         for field_idx, box_idx, target_box in snapped_refs:
+            matched_box_keys.add(_checkbox_box_key(target_box))
             output_box = adjusted_config.fields[field_idx].boxes[box_idx]
             output_box.x = target_box.x
             output_box.y = target_box.y
@@ -1626,6 +1729,8 @@ def remap_preset_to_detected_layout(
         expected_total,
         True,
         True,
+        frozenset(matched_box_keys),
+        frozenset(supplied_box_keys),
     )
 
 
@@ -3088,6 +3193,7 @@ def run_analysis(
     num_files = len(file_paths)
     if num_files == 0:
         return False
+    validate_field_names(field.name for field in config.fields)
     output_paths = _prepare_analysis_output_paths(output_base_dir)
     review_folder = output_paths.review_folder
     file_labels = _build_file_labels(file_paths)
@@ -3322,7 +3428,7 @@ def run_analysis(
 
         report_progress(97, "분석 결과 정리 중...")
 
-        # 의견 이미지는 파일 분석 직후 PDF 문서로 옮겼으므로 JPEG 목록을 따로
+        # 자유기입 이미지는 파일 분석 직후 PDF 문서로 옮겼으므로 JPEG 목록을 따로
         # 누적하지 않습니다.
         if len(comment_doc) > 0:
             comment_doc.save(comment_path)

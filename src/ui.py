@@ -1,15 +1,36 @@
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from PyQt6.QtCore import QObject, QRectF, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QActionGroup, QCloseEvent, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import (
+    QObject,
+    QRectF,
+    QThread,
+    QTimer,
+    Qt,
+    QUrl,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import (
+    QActionGroup,
+    QCloseEvent,
+    QDesktopServices,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -35,8 +56,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .models import Box, Field, TemplatePreset
+from .models import Box, Field, TemplatePreset, validate_field_names
 from .processor import (
+    _runtime_directory,
     generate_ui_templates,
     generate_ui_templates_multi,
     remap_preset_to_detected_layout,
@@ -67,6 +89,10 @@ ROTATION_MAP = {idx: code for idx, code in enumerate(ROTATION_CODES)}
 class MainCanvas(QGraphicsView):
     """모든 페이지가 이어 붙여진 단일 캔버스"""
 
+    MODE_SELECT = "select"
+    MODE_DRAW_BOX = "draw_box"
+    MODE_DRAW_COMMENT = "draw_comment"
+
     def __init__(self, parent_window):
         super().__init__()
         self.parent_window = parent_window
@@ -76,13 +102,17 @@ class MainCanvas(QGraphicsView):
 
         # 줌(확대/축소) 시 마우스 커서 위치를 중심으로 하도록 설정
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self.drawing = False  # 좌클릭 (박스 그리기)
-        self.selecting = False  # 우클릭 (박스 선택하기)
-
+        self.mode = self.MODE_SELECT
+        self.operation = None
         self.start_pos = None
-        self.temp_rect = None  # 그리기용 파란색 임시 박스
-        self.select_rect = None  # 범위선택용 빨간 점선 박스
+        self.temp_rect = None
+        self.select_rect = None
+        self.preview_rects = []
+        self.drag_boxes = []
+        self.resize_box = None
+        self.resize_handle = None
 
     def set_image(self, cv_img):
         if cv_img.ndim == 2:
@@ -96,6 +126,75 @@ class MainCanvas(QGraphicsView):
         self.scene.clear()
         self.scene.addPixmap(QPixmap.fromImage(qimg))
         self.scene.setSceneRect(0, 0, w, h)
+        self.temp_rect = None
+        self.select_rect = None
+        self.preview_rects = []
+
+    def set_mode(self, mode: str):
+        if mode not in {
+            self.MODE_SELECT,
+            self.MODE_DRAW_BOX,
+            self.MODE_DRAW_COMMENT,
+        }:
+            mode = self.MODE_SELECT
+        self._finish_interaction()
+        self.mode = mode
+        self.setCursor(
+            Qt.CursorShape.CrossCursor
+            if mode != self.MODE_SELECT
+            else Qt.CursorShape.ArrowCursor
+        )
+        self.setFocus()
+
+    def _remove_scene_item(self, item):
+        if item is None:
+            return
+        try:
+            if item.scene() is self.scene:
+                self.scene.removeItem(item)
+        except RuntimeError:
+            pass
+
+    def _finish_interaction(self):
+        self._remove_scene_item(self.temp_rect)
+        self._remove_scene_item(self.select_rect)
+        for item in self.preview_rects:
+            self._remove_scene_item(item)
+        self.operation = None
+        self.start_pos = None
+        self.temp_rect = None
+        self.select_rect = None
+        self.preview_rects = []
+        self.drag_boxes = []
+        self.resize_box = None
+        self.resize_handle = None
+
+    @staticmethod
+    def _drag_rect(start_pos, end_pos) -> QRectF:
+        return QRectF(start_pos, end_pos).normalized()
+
+    def _preview_pen(self) -> QPen:
+        color = (
+            Qt.GlobalColor.magenta
+            if self.mode == self.MODE_DRAW_COMMENT
+            else Qt.GlobalColor.blue
+        )
+        return QPen(color, 2, Qt.PenStyle.DashLine)
+
+    def _start_move_preview(self):
+        self.drag_boxes = list(self.parent_window.selected_boxes)
+        pen = QPen(Qt.GlobalColor.darkYellow, 2, Qt.PenStyle.DashLine)
+        self.preview_rects = [
+            self.scene.addRect(self.parent_window.get_stitched_rect(box), pen)
+            for box in self.drag_boxes
+        ]
+
+    def _start_resize_preview(self, box):
+        self.resize_box = box
+        pen = QPen(Qt.GlobalColor.darkYellow, 2, Qt.PenStyle.DashLine)
+        self.preview_rects = [
+            self.scene.addRect(self.parent_window.get_stitched_rect(box), pen)
+        ]
 
     # --- Ctrl + 마우스 휠 (확대/축소) ---
     def wheelEvent(self, event):
@@ -111,62 +210,180 @@ class MainCanvas(QGraphicsView):
             # Ctrl을 누르지 않았을 때는 일반 스크롤 동작
             super().wheelEvent(event)
 
-    # --- 마우스 클릭 및 드래그 (좌클릭: 그리기, 우클릭: 선택) ---
     def mousePressEvent(self, event):
-        self.start_pos = self.mapToScene(event.pos())
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drawing = True
-            self.temp_rect = self.scene.addRect(
-                QRectF(self.start_pos, self.start_pos), QPen(Qt.GlobalColor.blue, 2)
-            )
-        elif event.button() == Qt.MouseButton.RightButton:
-            self.selecting = True
-            self.select_rect = self.scene.addRect(
-                QRectF(self.start_pos, self.start_pos),
-                QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.DashLine),
-            )
-        else:
+        self.setFocus()
+        if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+
+        self.start_pos = self.mapToScene(event.pos())
+        if self.mode in {self.MODE_DRAW_BOX, self.MODE_DRAW_COMMENT}:
+            self.operation = "draw"
+            self.temp_rect = self.scene.addRect(
+                QRectF(self.start_pos, self.start_pos), self._preview_pen()
+            )
+            event.accept()
+            return
+
+        scale = max(0.1, abs(self.transform().m11()))
+        handle_hit = self.parent_window.resize_handle_at_stitched(
+            self.start_pos.x(), self.start_pos.y(), 9.0 / scale
+        )
+        if handle_hit is not None:
+            self.operation = "resize"
+            self.resize_box, self.resize_handle = handle_hit
+            self._start_resize_preview(self.resize_box)
+            event.accept()
+            return
+
+        clicked = self.parent_window.box_at_stitched(
+            self.start_pos.x(), self.start_pos.y()
+        )
+        modifiers = event.modifiers()
+        shift_pressed = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        ctrl_pressed = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        if clicked is not None:
+            if shift_pressed:
+                remains_selected = self.parent_window.select_box_range(
+                    clicked, additive=ctrl_pressed
+                )
+            else:
+                remains_selected = self.parent_window.select_box(
+                    clicked, additive=ctrl_pressed
+                )
+            if remains_selected:
+                self.operation = "move"
+                self._start_move_preview()
+            event.accept()
+            return
+
+        if not ctrl_pressed:
+            self.parent_window.clear_box_selection()
+        self.operation = "select"
+        self.select_rect = self.scene.addRect(
+            QRectF(self.start_pos, self.start_pos),
+            QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.DashLine),
+        )
+        event.accept()
 
     def mouseMoveEvent(self, event):
+        if self.start_pos is None:
+            super().mouseMoveEvent(event)
+            return
         cur_pos = self.mapToScene(event.pos())
-        if self.drawing and self.temp_rect:
-            self.temp_rect.setRect(QRectF(self.start_pos, cur_pos).normalized())
-        elif self.selecting and self.select_rect:
-            self.select_rect.setRect(QRectF(self.start_pos, cur_pos).normalized())
+        if self.operation == "draw" and self.temp_rect:
+            self.temp_rect.setRect(self._drag_rect(self.start_pos, cur_pos))
+        elif self.operation == "select" and self.select_rect:
+            self.select_rect.setRect(self._drag_rect(self.start_pos, cur_pos))
+        elif self.operation == "move" and self.preview_rects:
+            dx = cur_pos.x() - self.start_pos.x()
+            dy = cur_pos.y() - self.start_pos.y()
+            dx, dy = self.parent_window.bounded_move_delta(
+                self.drag_boxes, dx, dy
+            )
+            for box, item in zip(self.drag_boxes, self.preview_rects):
+                rect = self.parent_window.get_stitched_rect(box)
+                rect.translate(dx, dy)
+                item.setRect(rect)
+        elif self.operation == "resize" and self.preview_rects:
+            dx = cur_pos.x() - self.start_pos.x()
+            dy = cur_pos.y() - self.start_pos.y()
+            rect = self.parent_window.preview_resized_stitched_rect(
+                self.resize_box, self.resize_handle, dx, dy
+            )
+            self.preview_rects[0].setRect(rect)
         else:
             super().mouseMoveEvent(event)
+        event.accept()
 
     def mouseReleaseEvent(self, event):
-        end_pos = self.mapToScene(event.pos())
-        x = int(min(self.start_pos.x(), end_pos.x()))
-        y = int(min(self.start_pos.y(), end_pos.y()))
-        w = int(abs(self.start_pos.x() - end_pos.x()))
-        h = int(abs(self.start_pos.y() - end_pos.y()))
-
-        if event.button() == Qt.MouseButton.LeftButton and self.drawing:
-            self.drawing = False
-            if self.temp_rect:
-                self.scene.removeItem(self.temp_rect)
-            if w > 5 and h > 5:
-                # 스티치된(이어붙여진) 전체 좌표를 전달
-                self.parent_window.add_pending_box_from_stitched(x, y, w, h)
-            else:
-                shift_pressed = bool(
-                    event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-                )
-                self.parent_window.handle_selection_from_stitched(
-                    x, y, w, h, shift_pressed
-                )
-
-        elif event.button() == Qt.MouseButton.RightButton and self.selecting:
-            self.selecting = False
-            if self.select_rect:
-                self.scene.removeItem(self.select_rect)
-            shift_pressed = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-            self.parent_window.handle_selection_from_stitched(x, y, w, h, shift_pressed)
-        else:
+        if event.button() != Qt.MouseButton.LeftButton or self.start_pos is None:
             super().mouseReleaseEvent(event)
+            return
+
+        end_pos = self.mapToScene(event.pos())
+        rect = self._drag_rect(self.start_pos, end_pos)
+        operation = self.operation
+        mode = self.mode
+        drag_boxes = list(self.drag_boxes)
+        resize_box = self.resize_box
+        resize_handle = self.resize_handle
+        dx = end_pos.x() - self.start_pos.x()
+        dy = end_pos.y() - self.start_pos.y()
+        self._finish_interaction()
+
+        if operation == "draw" and rect.width() > 5 and rect.height() > 5:
+            if mode == self.MODE_DRAW_COMMENT:
+                self.parent_window.add_comment_box_from_stitched(
+                    rect.x(), rect.y(), rect.width(), rect.height()
+                )
+                self.parent_window.set_edit_mode(self.MODE_SELECT)
+            else:
+                self.parent_window.add_pending_box_from_stitched(
+                    rect.x(), rect.y(), rect.width(), rect.height()
+                )
+        elif operation == "select":
+            ctrl_pressed = bool(
+                event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            )
+            self.parent_window.handle_selection_from_stitched(
+                rect.x(), rect.y(), rect.width(), rect.height(), ctrl_pressed
+            )
+        elif operation == "move" and drag_boxes:
+            dx, dy = self.parent_window.bounded_move_delta(drag_boxes, dx, dy)
+            self.parent_window.move_selected_boxes(dx, dy)
+        elif operation == "resize" and resize_box is not None:
+            self.parent_window.resize_box(
+                resize_box, resize_handle, dx, dy
+            )
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        clicked = self.parent_window.box_at_stitched(
+            scene_pos.x(), scene_pos.y()
+        )
+        if clicked is None:
+            return
+        if not any(box is clicked for box in self.parent_window.selected_boxes):
+            self.parent_window.select_box(clicked, additive=False)
+        self.parent_window.show_box_context_menu(
+            self.mapToGlobal(event.pos()), clicked
+        )
+        event.accept()
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.parent_window.undo_edit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self.parent_window.redo_edit()
+            event.accept()
+            return
+        if event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
+            self.parent_window.delete_selected_boxes()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self._finish_interaction()
+            self.parent_window.set_edit_mode(self.MODE_SELECT)
+            event.accept()
+            return
+        movement = {
+            Qt.Key.Key_Left: (-1, 0),
+            Qt.Key.Key_Right: (1, 0),
+            Qt.Key.Key_Up: (0, -1),
+            Qt.Key.Key_Down: (0, 1),
+        }.get(event.key())
+        if movement and self.parent_window.selected_boxes:
+            step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+            self.parent_window.move_selected_boxes(
+                movement[0] * step, movement[1] * step
+            )
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class _BatchApplyDialog(QDialog):
@@ -177,8 +394,8 @@ class _BatchApplyDialog(QDialog):
         self.setMinimumWidth(350)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"현재 그룹: {src_name}"))
-        layout.addWidget(QLabel("번호 개수가 같은 그룹 (일괄 적용 대상):"))
+        layout.addWidget(QLabel(f"현재 문항: {src_name}"))
+        layout.addWidget(QLabel("선택지 개수가 같은 문항 (일괄 적용 대상):"))
 
         self.checkboxes: list[tuple[QCheckBox, int]] = []
         for idx, name in candidates:
@@ -203,7 +420,7 @@ class _BatchApplyDialog(QDialog):
     def _on_accept(self):
         self.selected_indices = [idx for cb, idx in self.checkboxes if cb.isChecked()]
         if not self.selected_indices:
-            QMessageBox.warning(self, "알림", "선택된 그룹이 없습니다.")
+            QMessageBox.warning(self, "알림", "선택된 문항이 없습니다.")
             return
         self.accept()
 
@@ -220,20 +437,20 @@ class ValueMappingDialog(QDialog):
         self.working_show_average = [f.show_average for f in fields]
         self.row_index_order = []
 
-        self.setWindowTitle("값 매핑")
+        self.setWindowTitle("문항 및 선택지 설정")
         self.setMinimumSize(480, 460)
 
         layout = QVBoxLayout(self)
 
         group_layout = QHBoxLayout()
-        group_layout.addWidget(QLabel("그룹 선택"))
+        group_layout.addWidget(QLabel("문항 선택"))
         self.group_combo = QComboBox()
         self.group_combo.addItems([f.name for f in fields])
         group_layout.addWidget(self.group_combo)
         layout.addLayout(group_layout)
 
         name_layout = QHBoxLayout()
-        name_layout.addWidget(QLabel("그룹명"))
+        name_layout.addWidget(QLabel("문항 이름"))
         self.group_name_edit = QLineEdit()
         name_layout.addWidget(self.group_name_edit)
         layout.addLayout(name_layout)
@@ -251,7 +468,7 @@ class ValueMappingDialog(QDialog):
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["번호", "값"])
+        self.table.setHorizontalHeaderLabels(["번호", "선택지 이름"])
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
@@ -409,7 +626,9 @@ class ValueMappingDialog(QDialog):
                 candidates.append((i, f.name))
 
         if not candidates:
-            QMessageBox.information(self, "알림", "번호 개수가 같은 그룹이 없습니다.")
+            QMessageBox.information(
+                self, "알림", "선택지 개수가 같은 문항이 없습니다."
+            )
             return
 
         dialog = _BatchApplyDialog(self, self.fields[src_idx].name, candidates)
@@ -426,6 +645,11 @@ class ValueMappingDialog(QDialog):
 
     def accept(self):
         self._save_current_group()
+        try:
+            cleaned_names = validate_field_names(self.working_names)
+        except ValueError as exc:
+            QMessageBox.warning(self, "문항 이름 확인", str(exc))
+            return
         for idx, field in enumerate(self.fields):
             box_count = len(field.boxes)
             values = self.working_maps[idx] if idx < len(self.working_maps) else []
@@ -435,12 +659,7 @@ class ValueMappingDialog(QDialog):
                 values = values[:box_count]
             field.value_map = values
 
-            name = (
-                self.working_names[idx] if idx < len(self.working_names) else field.name
-            )
-            name = name.strip() if isinstance(name, str) else field.name
-            if name:
-                field.name = name
+            field.name = cleaned_names[idx]
 
             dup = (
                 self.working_allow_duplicates[idx]
@@ -507,6 +726,7 @@ class MainWindow(QMainWindow):
         self.preset_dir = Path(os.getenv("LOCALAPPDATA")) / "CheckFinder" / "presets"
         self.preset_dir.mkdir(parents=True, exist_ok=True)
         self.current_preset_name = None
+        self._preset_dirty = False
 
         self.is_a_view = False  # False = B안(1열 세로연결), True = A안(2열 세로연결)
         self.rot_idx = 0
@@ -515,6 +735,11 @@ class MainWindow(QMainWindow):
 
         self.pending_boxes = []
         self.selected_boxes = []
+        self._selection_anchor: Box | None = None
+        self.edit_mode = MainCanvas.MODE_SELECT
+        self._undo_history = []
+        self._redo_history = []
+        self._edit_history_limit = 50
 
         self._analysis_thread: QThread | None = None
         self._analysis_worker: _AnalysisWorker | None = None
@@ -593,19 +818,77 @@ class MainWindow(QMainWindow):
         # 상단 툴바 버튼
         btn_layout = QHBoxLayout()
 
-        group_btn = QPushButton("선택 묶기 (그룹화)")
+        self.edit_mode_group = QButtonGroup(self)
+        self.edit_mode_group.setExclusive(True)
+
+        self.select_tool_btn = QPushButton("선택·이동")
+        self.select_tool_btn.setCheckable(True)
+        self.select_tool_btn.setChecked(True)
+        self.select_tool_btn.setToolTip(
+            "클릭은 1개 선택, Ctrl+클릭은 개별 추가·해제, "
+            "Shift+클릭은 기준 박스부터 범위 선택입니다."
+        )
+        self.draw_box_tool_btn = QPushButton("선택지 추가")
+        self.draw_box_tool_btn.setCheckable(True)
+        self.draw_box_tool_btn.setToolTip(
+            "추가할 선택지 영역을 마우스로 드래그합니다. Esc를 누르면 선택 모드로 돌아갑니다."
+        )
+        self.draw_comment_tool_btn = QPushButton("자유기입 영역 추가")
+        self.draw_comment_tool_btn.setCheckable(True)
+        self.draw_comment_tool_btn.setToolTip(
+            "글이나 숫자를 적는 영역을 드래그하면 자유기입 문항이 바로 만들어집니다."
+        )
+        mode_buttons = {
+            self.select_tool_btn: MainCanvas.MODE_SELECT,
+            self.draw_box_tool_btn: MainCanvas.MODE_DRAW_BOX,
+            self.draw_comment_tool_btn: MainCanvas.MODE_DRAW_COMMENT,
+        }
+        for button, mode in mode_buttons.items():
+            self.edit_mode_group.addButton(button)
+            button.toggled.connect(
+                lambda checked, selected_mode=mode: checked
+                and self.set_edit_mode(selected_mode)
+            )
+
+        group_btn = QPushButton("문항으로 묶기")
         group_btn.setStyleSheet("background-color: #2196F3; color: white;")
+        group_btn.setToolTip("선택한 박스들을 하나의 문항으로 묶습니다.")
         group_btn.clicked.connect(self.group_boxes)
 
-        self.value_map_btn = QPushButton("값 매핑")
+        self.value_map_btn = QPushButton("선택지 이름 설정")
+        self.value_map_btn.setStyleSheet(
+            "background-color: #7E57C2; color: white; font-weight: bold;"
+        )
+        self.value_map_btn.setToolTip("문항 이름과 각 선택지의 결과값을 설정합니다.")
         self.value_map_btn.clicked.connect(self.open_value_mapping)
 
-        self.comment_field_btn = QPushButton("의견 칸으로 지정")
+        self.comment_field_btn = QPushButton("자유기입 전환")
+        self.comment_field_btn.setToolTip(
+            "기존 문항을 자유기입 문항으로 지정하거나 해제합니다."
+        )
         self.comment_field_btn.clicked.connect(self.assign_comment_field)
 
-        del_btn = QPushButton("선택 박스 삭제")
+        del_btn = QPushButton("선택 삭제")
         del_btn.setStyleSheet("background-color: #f44336; color: white;")
+        del_btn.setToolTip("선택한 박스를 삭제합니다. Ctrl+Z로 되돌릴 수 있습니다.")
         del_btn.clicked.connect(self.delete_selected_boxes)
+
+        self.undo_btn = QPushButton("실행 취소")
+        self.undo_btn.setToolTip("마지막 편집을 되돌립니다. (Ctrl+Z)")
+        self.undo_btn.clicked.connect(self.undo_edit)
+        self.redo_btn = QPushButton("다시 실행")
+        self.redo_btn.setToolTip("되돌린 편집을 다시 적용합니다. (Ctrl+Y)")
+        self.redo_btn.clicked.connect(self.redo_edit)
+        self.undo_btn.setEnabled(False)
+        self.redo_btn.setEnabled(False)
+        self.undo_shortcut = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.Undo), self
+        )
+        self.undo_shortcut.activated.connect(self.undo_edit)
+        self.redo_shortcut = QShortcut(
+            QKeySequence(QKeySequence.StandardKey.Redo), self
+        )
+        self.redo_shortcut.activated.connect(self.redo_edit)
 
         self.exec_btn = QPushButton("▶ 분석 실행")
         self.exec_btn.setStyleSheet(
@@ -616,6 +899,33 @@ class MainWindow(QMainWindow):
         if hasattr(self, "file_menu_btn"):
             self.file_menu_btn.setFixedHeight(group_btn.sizeHint().height())
             btn_layout.addWidget(self.file_menu_btn)
+
+        self.load_pdf_btn = QPushButton("PDF 불러오기")
+        self.load_pdf_btn.setToolTip(
+            "분석할 PDF를 선택합니다. 여러 파일도 한 번에 선택할 수 있습니다."
+        )
+        self.load_pdf_btn.clicked.connect(self.load_pdf)
+        btn_layout.addWidget(self.load_pdf_btn)
+
+        self.load_preset_btn = QPushButton("프리셋 불러오기")
+        self.load_preset_btn.setToolTip(
+            "PDF를 연 뒤 저장해 둔 문항과 선택지 설정을 적용합니다."
+        )
+        self.load_preset_btn.clicked.connect(self.load_preset_dialog)
+        btn_layout.addWidget(self.load_preset_btn)
+
+        self.save_preset_btn = QPushButton("프리셋 저장")
+        self.save_preset_btn.setToolTip(
+            "현재 문항·선택지·영역 설정을 저장합니다."
+        )
+        self.save_preset_btn.clicked.connect(self.save_preset)
+        btn_layout.addWidget(self.save_preset_btn)
+
+        self.document_status_label = QLabel()
+        self.document_status_label.setStyleSheet(
+            "padding: 5px 8px; color: #1A237E; background: #E8EAF6;"
+        )
+        btn_layout.addWidget(self.document_status_label)
 
         # 자동 페이지 수평 보정 뒤 전체 페이지에 더할 수동 보정값
         btn_layout.addWidget(QLabel("전체 미세 회전:"))
@@ -635,19 +945,139 @@ class MainWindow(QMainWindow):
         )
         self.auto_deskew_btn.clicked.connect(self.auto_deskew_pages)
         btn_layout.addWidget(self.auto_deskew_btn)
-
-        btn_layout.addWidget(group_btn)
-        btn_layout.addWidget(self.value_map_btn)
-        btn_layout.addWidget(self.comment_field_btn)
-        btn_layout.addWidget(del_btn)
         btn_layout.addStretch(1)
         btn_layout.addWidget(self.exec_btn)
 
         main_layout.addLayout(btn_layout)
 
+        edit_layout = QHBoxLayout()
+        edit_layout.addWidget(QLabel("편집 도구:"))
+        edit_layout.addWidget(self.select_tool_btn)
+        edit_layout.addWidget(self.draw_box_tool_btn)
+        edit_layout.addWidget(self.draw_comment_tool_btn)
+        edit_layout.addSpacing(8)
+        edit_layout.addWidget(group_btn)
+        edit_layout.addWidget(self.value_map_btn)
+        edit_layout.addWidget(self.comment_field_btn)
+        edit_layout.addWidget(del_btn)
+        edit_layout.addStretch(1)
+        self.open_results_btn = QPushButton("결과 폴더")
+        self.open_results_btn.setToolTip("분석 결과가 저장되는 폴더를 엽니다.")
+        self.open_results_btn.clicked.connect(self.open_results_folder)
+        edit_layout.addWidget(self.open_results_btn)
+        self.help_btn = QPushButton("도움말")
+        self.help_btn.setToolTip("현재 프로그램 사용 설명서를 엽니다.")
+        self.help_btn.clicked.connect(self.open_help)
+        edit_layout.addWidget(self.help_btn)
+        edit_layout.addWidget(self.undo_btn)
+        edit_layout.addWidget(self.redo_btn)
+        main_layout.addLayout(edit_layout)
+
+        guide_layout = QHBoxLayout()
+        self.edit_status_label = QLabel()
+        self.edit_status_label.setStyleSheet(
+            "padding: 5px 8px; color: #263238; background: #ECEFF1;"
+        )
+        self.edit_legend_label = QLabel(
+            "초록: 선택형  |  보라: 자유기입  |  파랑: 미분류  |  노랑: 선택됨"
+        )
+        self.edit_legend_label.setStyleSheet("color: #546E7A; padding: 5px;")
+        guide_layout.addWidget(self.edit_status_label, 1)
+        guide_layout.addWidget(self.edit_legend_label)
+        main_layout.addLayout(guide_layout)
+
         # 단일 거대 캔버스 배치
         self.canvas = MainCanvas(self)
         main_layout.addWidget(self.canvas)
+        self.set_edit_mode(MainCanvas.MODE_SELECT)
+        self._refresh_document_status()
+
+    def _refresh_document_status(self):
+        if not hasattr(self, "document_status_label"):
+            return
+        if not self.file_paths:
+            document_text = "PDF 없음"
+        else:
+            document_text = (
+                f"PDF {len(self.file_paths)}개 · {self.preset.page_count}쪽/부"
+            )
+        if self.current_preset_name:
+            preset_text = self.current_preset_name
+        elif getattr(self, "_preset_dirty", False):
+            preset_text = "미저장 설정"
+        else:
+            preset_text = "미적용"
+        if getattr(self, "_preset_dirty", False):
+            preset_text += " (수정됨)"
+        self.document_status_label.setText(
+            f"{document_text} · 프리셋: {preset_text}"
+        )
+
+    def _set_preset_dirty(self, dirty: bool = True):
+        self._preset_dirty = bool(dirty)
+        refresh = getattr(self, "_refresh_document_status", None)
+        if callable(refresh):
+            refresh()
+
+    def _confirm_save_or_discard_changes(self, action_text: str) -> bool:
+        if not getattr(self, "_preset_dirty", False):
+            return True
+        choice = QMessageBox.warning(
+            self,
+            "저장하지 않은 변경 내용",
+            f"{action_text}\n\n현재 편집 내용을 저장할까요?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            return bool(self.save_preset())
+        return choice == QMessageBox.StandardButton.Discard
+
+    @staticmethod
+    def _manual_index_path() -> Path | None:
+        candidates = [_runtime_directory() / "설명서.html"]
+        bundle_directory = getattr(sys, "_MEIPASS", None)
+        if bundle_directory:
+            candidates.append(Path(bundle_directory) / "설명서.html")
+        return next((path for path in candidates if path.is_file()), None)
+
+    def open_help(self):
+        manual_path = self._manual_index_path()
+        if manual_path is None:
+            QMessageBox.warning(
+                self,
+                "도움말 없음",
+                "설명서.html을 찾을 수 없습니다. 프로그램을 다시 설치해주세요.",
+            )
+            return False
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(manual_path.resolve()))):
+            QMessageBox.warning(
+                self,
+                "도움말 열기 실패",
+                "기본 웹 브라우저에서 설명서를 열지 못했습니다.",
+            )
+            return False
+        return True
+
+    def open_results_folder(self):
+        result_folder = _runtime_directory() / "결과"
+        try:
+            result_folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "결과 폴더 오류", f"결과 폴더를 만들 수 없습니다.\n\n{exc}"
+            )
+            return False
+        if not QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(result_folder.resolve()))
+        ):
+            QMessageBox.warning(
+                self, "결과 폴더 열기 실패", "결과 폴더를 열지 못했습니다."
+            )
+            return False
+        return True
 
     def _sync_reverse_numbering_state(self):
         is_on = bool(self.preset.reverse_numbering)
@@ -667,11 +1097,296 @@ class MainWindow(QMainWindow):
     def _reset_state_for_new_pdf(self):
         self.pending_boxes.clear()
         self.selected_boxes.clear()
+        self._selection_anchor = None
         self.preset.fields.clear()
         self.preset.page_fine_angles.clear()
+        self.current_preset_name = None
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
         self.is_a_view = False
+        self._preset_dirty = False
+        MainWindow._clear_edit_history(self)
+        self._refresh_document_status()
+
+    def _capture_document_state(self) -> dict:
+        return {
+            "file_paths": list(getattr(self, "file_paths", [])),
+            "pages": list(getattr(self, "pages", [])),
+            "pages_are_canonical": bool(
+                getattr(self, "_pages_are_canonical", False)
+            ),
+            "analysis_reference_pages": list(
+                getattr(self, "_analysis_reference_pages", [])
+            ),
+            "preset": copy.deepcopy(getattr(self, "preset", TemplatePreset())),
+            "pending_boxes": copy.deepcopy(getattr(self, "pending_boxes", [])),
+            "is_a_view": bool(getattr(self, "is_a_view", False)),
+            "rot_idx": int(getattr(self, "rot_idx", 0)),
+            "current_preset_name": getattr(self, "current_preset_name", None),
+            "preset_dirty": bool(getattr(self, "_preset_dirty", False)),
+            "undo_history": copy.deepcopy(getattr(self, "_undo_history", [])),
+            "redo_history": copy.deepcopy(getattr(self, "_redo_history", [])),
+        }
+
+    def _restore_document_state(self, snapshot: dict):
+        self.file_paths = snapshot["file_paths"]
+        self.pages = snapshot["pages"]
+        self._pages_are_canonical = snapshot["pages_are_canonical"]
+        self._analysis_reference_pages = snapshot["analysis_reference_pages"]
+        self.preset = snapshot["preset"]
+        self.pending_boxes = snapshot["pending_boxes"]
+        self.selected_boxes = []
+        self.is_a_view = snapshot["is_a_view"]
+        self.rot_idx = snapshot["rot_idx"]
+        self.current_preset_name = snapshot["current_preset_name"]
+        self._preset_dirty = snapshot["preset_dirty"]
+        self._undo_history = snapshot["undo_history"]
+        self._redo_history = snapshot["redo_history"]
+        for method_name in (
+            "_sync_rotation_actions",
+            "_sync_fine_angle_spin",
+            "_sync_reverse_numbering_state",
+            "_update_page_size",
+            "_update_history_buttons",
+            "update_canvas",
+            "_refresh_document_status",
+        ):
+            method = getattr(self, method_name, None)
+            if callable(method):
+                method()
+
+    def _capture_edit_state(self):
+        return copy.deepcopy((self.preset.fields, self.pending_boxes))
+
+    @staticmethod
+    def _box_geometry_key(box: Box) -> tuple[int, int, int, int, int]:
+        return (box.page_idx, box.x, box.y, box.w, box.h)
+
+    @staticmethod
+    def _boxes_share_region(first: Box, second: Box) -> bool:
+        if first.page_idx != second.page_idx:
+            return False
+        width_ratio = max(first.w, second.w) / max(1, min(first.w, second.w))
+        height_ratio = max(first.h, second.h) / max(1, min(first.h, second.h))
+        if width_ratio > 1.8 or height_ratio > 1.8:
+            return False
+        left = max(first.x, second.x)
+        top = max(first.y, second.y)
+        right = min(first.x + first.w, second.x + second.w)
+        bottom = min(first.y + first.h, second.y + second.h)
+        intersection = max(0, right - left) * max(0, bottom - top)
+        smaller_area = min(first.w * first.h, second.w * second.h)
+        if smaller_area > 0 and intersection / smaller_area >= 0.5:
+            return True
+        first_center = (first.x + first.w / 2, first.y + first.h / 2)
+        second_center = (second.x + second.w / 2, second.y + second.h / 2)
+        tolerance = max(4.0, min(first.w, first.h, second.w, second.h) * 0.45)
+        return (
+            abs(first_center[0] - second_center[0]) <= tolerance
+            and abs(first_center[1] - second_center[1]) <= tolerance
+        )
+
+    @staticmethod
+    def _box_region_match_cost(first: Box, second: Box) -> float:
+        first_center = (first.x + first.w / 2, first.y + first.h / 2)
+        second_center = (second.x + second.w / 2, second.y + second.h / 2)
+        scale = max(4.0, min(first.w, first.h, second.w, second.h))
+        center_cost = (
+            abs(first_center[0] - second_center[0])
+            + abs(first_center[1] - second_center[1])
+        ) / scale
+        size_cost = abs(first.w - second.w) / max(first.w, second.w, 1)
+        size_cost += abs(first.h - second.h) / max(first.h, second.h, 1)
+        return center_cost + size_cost
+
+    @staticmethod
+    def _merge_detected_box_geometry(
+        preset: TemplatePreset,
+        pending_boxes: list[Box],
+        detected_boxes_by_page: dict[int, list[Box]],
+        matched_keys: set[tuple[int, int, int, int, int]],
+        supplied_keys: set[tuple[int, int, int, int, int]],
+    ) -> int:
+        """Reuse nearby current geometry and discard unmatched old detections."""
+        current_boxes = [
+            box
+            for boxes in detected_boxes_by_page.values()
+            for box in boxes
+            if MainWindow._box_geometry_key(box) in supplied_keys
+        ]
+        matchable_boxes = [
+            box
+            for field in preset.fields
+            if not field.is_comment
+            for box in field.boxes
+        ] + list(pending_boxes)
+        exact_output_ids = {
+            id(box)
+            for box in matchable_boxes
+            if MainWindow._box_geometry_key(box) in matched_keys
+        }
+        reused_count = sum(
+            MainWindow._box_geometry_key(box) in matched_keys
+            for box in current_boxes
+        )
+
+        current_candidates = [
+            (index, box)
+            for index, box in enumerate(current_boxes)
+            if MainWindow._box_geometry_key(box) not in matched_keys
+        ]
+        output_candidates = [
+            (index, box)
+            for index, box in enumerate(matchable_boxes)
+            if id(box) not in exact_output_ids
+        ]
+        candidate_pairs = []
+        for current_index, current_box in current_candidates:
+            for output_index, output_box in output_candidates:
+                if not MainWindow._boxes_share_region(current_box, output_box):
+                    continue
+                candidate_pairs.append(
+                    (
+                        MainWindow._box_region_match_cost(
+                            current_box, output_box
+                        ),
+                        current_index,
+                        output_index,
+                        current_box,
+                        output_box,
+                    )
+                )
+
+        assigned_current: set[int] = set()
+        assigned_output: set[int] = set()
+        for (
+            _cost,
+            current_index,
+            output_index,
+            current_box,
+            output_box,
+        ) in sorted(candidate_pairs, key=lambda item: item[:3]):
+            if (
+                current_index in assigned_current
+                or output_index in assigned_output
+            ):
+                continue
+            output_box.x = current_box.x
+            output_box.y = current_box.y
+            output_box.w = current_box.w
+            output_box.h = current_box.h
+            assigned_current.add(current_index)
+            assigned_output.add(output_index)
+
+        reused_count += len(assigned_current)
+        return reused_count
+
+    def _restore_edit_state(self, snapshot):
+        fields, pending_boxes = copy.deepcopy(snapshot)
+        self.preset.fields = fields
+        self.pending_boxes = pending_boxes
+        self.selected_boxes.clear()
+        self._selection_anchor = None
+        self.update_canvas()
+
+    def _update_history_buttons(self):
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.setEnabled(bool(self._undo_history))
+        if hasattr(self, "redo_btn"):
+            self.redo_btn.setEnabled(bool(self._redo_history))
+
+    def _clear_edit_history(self):
+        if hasattr(self, "_undo_history"):
+            self._undo_history.clear()
+        if hasattr(self, "_redo_history"):
+            self._redo_history.clear()
+        MainWindow._update_history_buttons(self)
+
+    def _commit_edit(self, previous_state, description: str) -> bool:
+        current_state = self._capture_edit_state()
+        if current_state == previous_state:
+            return False
+        self._undo_history.append((previous_state, description))
+        if len(self._undo_history) > self._edit_history_limit:
+            self._undo_history.pop(0)
+        self._redo_history.clear()
+        self._update_history_buttons()
+        MainWindow._set_preset_dirty(self, True)
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage(
+                f"{description} · Ctrl+Z로 되돌릴 수 있습니다.", 5000
+            )
+        return True
+
+    def undo_edit(self):
+        if not self._undo_history:
+            return
+        previous_state, description = self._undo_history.pop()
+        self._redo_history.append((self._capture_edit_state(), description))
+        self._restore_edit_state(previous_state)
+        self._update_history_buttons()
+        MainWindow._set_preset_dirty(self, True)
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage(f"실행 취소: {description}", 4000)
+
+    def redo_edit(self):
+        if not self._redo_history:
+            return
+        next_state, description = self._redo_history.pop()
+        self._undo_history.append((self._capture_edit_state(), description))
+        self._restore_edit_state(next_state)
+        self._update_history_buttons()
+        MainWindow._set_preset_dirty(self, True)
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage(f"다시 실행: {description}", 4000)
+
+    def set_edit_mode(self, mode: str):
+        valid_modes = {
+            MainCanvas.MODE_SELECT,
+            MainCanvas.MODE_DRAW_BOX,
+            MainCanvas.MODE_DRAW_COMMENT,
+        }
+        self.edit_mode = mode if mode in valid_modes else MainCanvas.MODE_SELECT
+        if hasattr(self, "canvas"):
+            self.canvas.set_mode(self.edit_mode)
+        mode_buttons = {
+            MainCanvas.MODE_SELECT: getattr(self, "select_tool_btn", None),
+            MainCanvas.MODE_DRAW_BOX: getattr(self, "draw_box_tool_btn", None),
+            MainCanvas.MODE_DRAW_COMMENT: getattr(
+                self, "draw_comment_tool_btn", None
+            ),
+        }
+        button = mode_buttons.get(self.edit_mode)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        self._refresh_edit_status()
+
+    def _refresh_edit_status(self):
+        if not hasattr(self, "edit_status_label"):
+            return
+        selected_count = len(self.selected_boxes)
+        if not self.pages:
+            text = "먼저 파일 > PDF 불러오기를 선택하세요."
+        elif self.edit_mode == MainCanvas.MODE_DRAW_BOX:
+            text = "선택지 추가: 추가할 영역을 드래그하세요. Esc를 누르면 종료합니다."
+        elif self.edit_mode == MainCanvas.MODE_DRAW_COMMENT:
+            text = "자유기입 영역 추가: 글을 적는 영역을 드래그하세요."
+        elif selected_count == 1:
+            text = (
+                "1개 선택됨: 드래그로 이동 · 모서리로 크기 조절 "
+                "· Ctrl 개별 선택 · Shift 범위 선택"
+            )
+        elif selected_count > 1:
+            text = (
+                f"{selected_count}개 선택됨: 드래그로 함께 이동 · "
+                "Ctrl 개별 추가·해제 · Shift 범위 선택"
+            )
+        else:
+            text = (
+                "선택·이동: 클릭 1개 · Ctrl+클릭 개별 · "
+                "Shift+클릭 가로·세로·사각 범위"
+            )
+        self.edit_status_label.setText(text)
 
     @staticmethod
     def _group_boxes_by_row(boxes: list[Box]) -> list[list[Box]]:
@@ -699,6 +1414,17 @@ class MainWindow(QMainWindow):
             rows.append(current_row)
 
         return rows
+
+    def _boxes_in_reading_order(self, boxes: list[Box]) -> list[Box]:
+        by_page: dict[int, list[Box]] = {}
+        for box in boxes:
+            by_page.setdefault(box.page_idx, []).append(box)
+
+        ordered = []
+        for page_idx in sorted(by_page):
+            for row in self._group_boxes_by_row(by_page[page_idx]):
+                ordered.extend(sorted(row, key=lambda box: box.x))
+        return ordered
 
     def _all_boxes(self) -> list[Box]:
         boxes = list(self.pending_boxes)
@@ -764,8 +1490,12 @@ class MainWindow(QMainWindow):
             return img
 
     def toggle_reverse_numbering(self, checked: bool):
-        self.preset.reverse_numbering = bool(checked)
+        checked = bool(checked)
+        changed = self.preset.reverse_numbering != checked
+        self.preset.reverse_numbering = checked
         self._sync_reverse_numbering_state()
+        if changed:
+            MainWindow._set_preset_dirty(self, True)
 
     def _show_progress_dialog(self, title: str, label: str) -> QProgressDialog:
         dialog = QProgressDialog(label, None, 0, 100, self)
@@ -799,23 +1529,27 @@ class MainWindow(QMainWindow):
 
     def open_value_mapping(self):
         if not self.preset.fields:
-            QMessageBox.information(self, "알림", "값을 매핑할 그룹이 없습니다.")
+            QMessageBox.information(self, "알림", "선택지 이름을 설정할 문항이 없습니다.")
             return
 
+        previous_state = self._capture_edit_state()
         dialog = ValueMappingDialog(
             self, self.preset.fields, self.preset.reverse_numbering
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._commit_edit(previous_state, "문항과 선택지 이름 변경")
             self.update_canvas()
 
     def assign_comment_field(self):
         if not self.preset.fields:
-            QMessageBox.information(self, "알림", "의견 칸으로 지정할 그룹이 없습니다.")
+            QMessageBox.information(
+                self, "알림", "자유기입으로 전환할 문항이 없습니다."
+            )
             return
 
         names = [f.name for f in self.preset.fields]
         name, ok = QInputDialog.getItem(
-            self, "의견 칸 지정", "그룹 선택:", names, 0, False
+            self, "자유기입 전환", "문항 선택:", names, 0, False
         )
         if not ok or not name:
             return
@@ -827,15 +1561,22 @@ class MainWindow(QMainWindow):
         if target.is_comment:
             reply = QMessageBox.question(
                 self,
-                "의견 칸 해제",
-                "이미 의견 칸입니다. 해제할까요?",
+                "자유기입 지정 해제",
+                "이미 자유기입 문항입니다. 지정을 해제할까요?",
             )
             if reply == QMessageBox.StandardButton.Yes:
+                previous_state = self._capture_edit_state()
                 target.is_comment = False
-                QMessageBox.information(self, "완료", "의견 칸 지정이 해제되었습니다.")
+                self._commit_edit(previous_state, "자유기입 지정 해제")
+                QMessageBox.information(
+                    self, "완료", "자유기입 지정이 해제되었습니다."
+                )
         else:
+            previous_state = self._capture_edit_state()
             target.is_comment = True
-            QMessageBox.information(self, "완료", "의견 칸으로 지정되었습니다.")
+            self._commit_edit(previous_state, "자유기입으로 지정")
+            QMessageBox.information(self, "완료", "자유기입으로 지정되었습니다.")
+        self.update_canvas()
 
     def _sanitize_config_name(self, name: str) -> str:
         invalid_chars = '<>:"/\\|?*'
@@ -949,10 +1690,20 @@ class MainWindow(QMainWindow):
         )
         previous_pending_boxes = list(getattr(self, "pending_boxes", []))
         previous_selected_boxes = list(getattr(self, "selected_boxes", []))
+        previous_selection_anchor = getattr(self, "_selection_anchor", None)
         previous_is_a_view = getattr(self, "is_a_view", False)
         page_count = max(1, int(data.get("page_count", 1)))
         fine_angle = float(data.get("fine_angle", 0.0))
         rot_code = int(data.get("rot_code", -1))
+        can_reuse_current_detection = bool(
+            self.file_paths
+            and previous_preset is not None
+            and not previous_pages_are_canonical
+            and previous_preset.page_count == page_count
+            and previous_preset.rot_code == rot_code
+            and abs(previous_preset.fine_angle - fine_angle) < 0.001
+            and len(previous_preset.page_fine_angles) >= page_count
+        )
         raw_page_angles = data.get("page_fine_angles", [])
         if not isinstance(raw_page_angles, list):
             raw_page_angles = []
@@ -962,14 +1713,21 @@ class MainWindow(QMainWindow):
                 page_fine_angles.append(float(value))
             except (TypeError, ValueError):
                 page_fine_angles.append(0.0)
-        if (
-            not page_fine_angles
-            and previous_preset is not None
-            and previous_preset.rot_code == rot_code
-            and abs(previous_preset.fine_angle - fine_angle) < 0.001
-            and len(previous_preset.page_fine_angles) >= page_count
-        ):
+        if can_reuse_current_detection:
             page_fine_angles = list(previous_preset.page_fine_angles[:page_count])
+
+        detected_boxes_by_page: dict[int, list[Box]] | None = None
+        if can_reuse_current_detection:
+            detected_boxes_by_page = {}
+            for field in previous_preset.fields:
+                if field.is_comment:
+                    continue
+                for box in field.boxes:
+                    detected_boxes_by_page.setdefault(box.page_idx, []).append(
+                        copy.copy(box)
+                    )
+            if not any(detected_boxes_by_page.values()):
+                detected_boxes_by_page = None
         self.preset = TemplatePreset(
             page_count=page_count,
             fine_angle=fine_angle,
@@ -983,6 +1741,7 @@ class MainWindow(QMainWindow):
         self.pending_boxes = [Box.from_dict(b) for b in data.get("pending_boxes", [])]
         self.is_a_view = bool(data.get("is_a_view", False))
         self.selected_boxes.clear()
+        self._selection_anchor = None
         self._analysis_reference_pages = []
         self._sync_rotation_index()
         self._sync_fine_angle_spin()
@@ -1052,7 +1811,22 @@ class MainWindow(QMainWindow):
                 current_templates,
                 source_templates=source_templates,
                 auxiliary_boxes=self.pending_boxes,
+                detected_boxes_by_page=detected_boxes_by_page,
             )
+            if detected_boxes_by_page and not remap.accepted:
+                # The broad first-pass detector can miss small or faint boxes.
+                # Retry with the preset-sized detector before deciding that the
+                # form is incompatible or falling back to canonical alignment.
+                preset_redetection = remap_preset_to_detected_layout(
+                    self.preset,
+                    current_templates,
+                    source_templates=source_templates,
+                    auxiliary_boxes=self.pending_boxes,
+                )
+                if preset_redetection.accepted or not getattr(
+                    remap, "compatible", True
+                ):
+                    remap = preset_redetection
             if not getattr(remap, "compatible", True):
                 # A clearly different form must not be warped into the saved
                 # template. Restore the complete previous editing state so a
@@ -1063,6 +1837,7 @@ class MainWindow(QMainWindow):
                 self._analysis_reference_pages = previous_analysis_reference_pages
                 self.pending_boxes = previous_pending_boxes
                 self.selected_boxes = previous_selected_boxes
+                self._selection_anchor = previous_selection_anchor
                 self.is_a_view = previous_is_a_view
                 self._sync_rotation_index()
                 self._sync_fine_angle_spin()
@@ -1073,56 +1848,33 @@ class MainWindow(QMainWindow):
                     "현재 PDF와 일치하지 않는 프리셋이라 불러올 수 없습니다."
                 )
             if remap.accepted:
-                inverse_transforms = {}
-                for i in range(self.preset.page_count):
-                    forward = remap.page_transforms.get(i)
-                    if forward is None:
-                        current_h, current_w = current_templates[i].shape[:2]
-                        saved_h, saved_w = source_templates[i].shape[:2]
-                        forward = np.float64(
-                            [
-                                [current_w / max(1, saved_w), 0.0, 0.0],
-                                [0.0, current_h / max(1, saved_h), 0.0],
-                            ]
-                        )
-                    inverse_transforms[i] = cv2.invertAffineTransform(
-                        np.asarray(forward, dtype=np.float64)
+                self.preset = remap.config
+                self.pending_boxes = list(remap.auxiliary_boxes)
+                matched_keys = set(getattr(remap, "matched_box_keys", ()))
+                supplied_keys = set(getattr(remap, "supplied_box_keys", ()))
+                reused_current_count = 0
+                if detected_boxes_by_page and supplied_keys:
+                    reused_current_count = MainWindow._merge_detected_box_geometry(
+                        self.preset,
+                        self.pending_boxes,
+                        detected_boxes_by_page,
+                        matched_keys,
+                        supplied_keys,
                     )
 
-                canonical_pages = []
-                for i in range(self.preset.page_count):
-                    configured = apply_rotation(
-                        raw_pages[i],
-                        self.preset.rot_code,
-                        self.preset.fine_angle_for_page(i),
-                    )
-                    target_h, target_w = source_templates[i].shape[:2]
-                    border_value = (
-                        255 if configured.ndim == 2 else (255, 255, 255)
-                    )
-                    canonical_pages.append(
-                        cv2.warpAffine(
-                            configured,
-                            inverse_transforms[i],
-                            (target_w, target_h),
-                            flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=border_value,
-                        )
-                    )
-                    report(
-                        82 + int((i + 1) / self.preset.page_count * 13),
-                        "체크박스 기준 프리셋 좌표 적용 중...",
-                    )
-                self.pages = canonical_pages
-                self._pages_are_canonical = True
-                self._analysis_reference_pages = list(
-                    saved_templates[: self.preset.page_count]
-                )
+                self.pages = raw_pages
+                self._pages_are_canonical = False
+                self._analysis_reference_pages = [
+                    current_templates[i] for i in range(self.preset.page_count)
+                ]
                 alignment_message = (
-                    "체크박스 기준 프리셋 정렬 완료 "
+                    "자동 탐지 위치에 프리셋 설정 적용 완료 "
                     f"({remap.matched_boxes}/{remap.expected_boxes})"
                 )
+                if reused_current_count:
+                    alignment_message += (
+                        f" · 기존 박스 {reused_current_count}개 위치 유지"
+                    )
                 report(95, alignment_message)
             elif (
                 raw_pages
@@ -1164,29 +1916,40 @@ class MainWindow(QMainWindow):
             self._update_page_size()
             alignment_message = "저장된 프리셋 템플릿 표시"
 
+        MainWindow._clear_edit_history(self)
         self.update_canvas()
         self._sync_view_toggle_text()
         report(100, alignment_message or "프리셋 불러오기 완료")
         if alignment_message and hasattr(self, "statusBar"):
             self.statusBar().showMessage(alignment_message, 10000)
 
-    def save_preset(self):
+    def save_preset(self) -> bool:
         if self.current_preset_name:
-            self._save_preset_to_name(self.current_preset_name)
-        else:
-            self.save_preset_as()
+            return self._save_preset_to_name(self.current_preset_name)
+        return self.save_preset_as()
 
-    def save_preset_as(self):
+    def save_preset_as(self) -> bool:
         name, ok = QInputDialog.getText(
             self, "프리셋 저장", "프리셋 이름을 입력하세요:"
         )
         if not ok:
-            return
+            return False
         name = self._sanitize_config_name(name)
         if not name:
             QMessageBox.warning(self, "경고", "유효한 프리셋 이름을 입력하세요.")
-            return
-        self._save_preset_to_name(name)
+            return False
+        path = self.preset_dir / f"{name}.json"
+        if path.exists():
+            reply = QMessageBox.question(
+                self,
+                "프리셋 덮어쓰기",
+                f"'{name}' 프리셋이 이미 있습니다. 덮어쓸까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+        return self._save_preset_to_name(name)
 
     def _save_template_images(self, name: str):
         if not self.pages:
@@ -1213,30 +1976,55 @@ class MainWindow(QMainWindow):
             i += 1
         return pages
 
-    def _save_preset_to_name(self, name: str):
+    def _save_preset_to_name(self, name: str) -> bool:
+        try:
+            validate_field_names(field.name for field in self.preset.fields)
+        except ValueError as exc:
+            QMessageBox.warning(self, "문항 이름 확인", str(exc))
+            return False
         data = self._serialize_config()
         path = self.preset_dir / f"{name}.json"
         try:
             with open(path, "w", encoding="utf-8") as file:
                 json.dump(data, file, ensure_ascii=False, indent=2)
+            self._save_template_images(name)
         except Exception as exc:
             QMessageBox.critical(self, "오류", f"프리셋 저장 실패: {exc}")
-            return
-        self._save_template_images(name)
+            return False
         self.current_preset_name = name
+        MainWindow._set_preset_dirty(self, False)
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage(f"프리셋 '{name}' 저장 완료", 5000)
+        return True
 
     def _list_config_names(self) -> list[str]:
         return sorted(path.stem for path in self.preset_dir.glob("*.json"))
 
-    def _load_preset_by_name(self, name: str):
+    def _load_preset_by_name(self, name: str) -> bool:
         path = self.preset_dir / f"{name}.json"
         try:
             with open(path, "r", encoding="utf-8") as file:
                 data = json.load(file)
         except Exception as exc:
             QMessageBox.critical(self, "오류", f"프리셋 불러오기 실패: {exc}")
-            return
+            return False
+        try:
+            validate_field_names(
+                Field.from_dict(field_data).name
+                for field_data in data.get("fields", [])
+            )
+        except (TypeError, ValueError) as exc:
+            QMessageBox.critical(
+                self, "프리셋 문항 이름 오류", f"이 프리셋은 불러올 수 없습니다.\n\n{exc}"
+            )
+            return False
+        if not MainWindow._confirm_save_or_discard_changes(
+            self,
+            "다른 프리셋을 불러오면 현재 편집 내용이 바뀝니다."
+        ):
+            return False
 
+        snapshot = MainWindow._capture_document_state(self)
         progress = None
         progress_cb = None
         if self.file_paths:
@@ -1251,12 +2039,15 @@ class MainWindow(QMainWindow):
                 progress_cb=progress_cb,
             )
         except Exception as exc:
+            MainWindow._restore_document_state(self, snapshot)
             QMessageBox.critical(self, "오류", f"프리셋 적용 실패: {exc}")
-            return
+            return False
         finally:
             if progress is not None:
                 progress.close()
         self.current_preset_name = name
+        MainWindow._set_preset_dirty(self, False)
+        return True
 
     def delete_preset(self):
         names = self._list_config_names()
@@ -1299,6 +2090,9 @@ class MainWindow(QMainWindow):
 
         if self.current_preset_name == name:
             self.current_preset_name = None
+            MainWindow._set_preset_dirty(self, True)
+
+        self._refresh_document_status()
 
         QMessageBox.information(self, "완료", f"프리셋 '{name}'이(가) 삭제되었습니다.")
 
@@ -1315,66 +2109,98 @@ class MainWindow(QMainWindow):
             return
         self._load_preset_by_name(name)
 
-    def load_pdf(self):
+    def load_pdf(self) -> bool:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "PDF 선택", "", "PDF Files (*.pdf)"
         )
         if not paths:
-            return
+            return False
 
-        self.file_paths = paths
         page_count, ok = QInputDialog.getInt(
-            self, "템플릿 설정", "설문지 1부당 페이지 수를 입력하세요:", 1, 1, 10
+            self,
+            "PDF 불러오기",
+            "설문지 한 부는 몇 페이지인가요? (앞·뒤면이면 2)",
+            max(1, self.preset.page_count),
+            1,
+            10,
         )
         if not ok:
-            return
+            return False
+        if not self._confirm_save_or_discard_changes(
+            "새 PDF를 불러오면 현재 편집 내용이 바뀝니다."
+        ):
+            return False
 
-        progress = self._show_progress_dialog("PDF 로드", "PDF 로딩 중...")
-        progress_cb = self._make_progress_cb(progress)
+        snapshot = self._capture_document_state()
+        progress = None
+        try:
+            progress = self._show_progress_dialog("PDF 로드", "PDF 로딩 중...")
+            progress_cb = self._make_progress_cb(progress)
 
-        self.preset.page_count = page_count
-
-        # 첫 PDF로 기본 페이지 로드 (초기 표시용)
-        self.pages = load_pdf_pages(
-            self.file_paths[0],
-            progress_cb=self._wrap_progress(0, 35, "PDF 로딩 중...", progress_cb),
-            page_indices=list(range(page_count)),
-        )
-        self._pages_are_canonical = False
-
-        self._reset_state_for_new_pdf()
-        self._estimate_page_fine_angles(
-            progress_cb=self._wrap_progress(
-                35, 5, "자동 수평 맞춤 중...", progress_cb
-            )
-        )
-        self._update_page_size()
-        self.update_canvas()
-        self._sync_view_toggle_text()
-
-        # 다중 PDF 템플릿 생성 (더 정확한 템플릿)
-        multi_templates = None
-        if len(self.file_paths) > 1:
-            multi_templates = generate_ui_templates_multi(
-                self.file_paths,
-                page_count,
-                self.preset.rot_code,
-                self.preset.fine_angle,
+            loaded_pages = load_pdf_pages(
+                paths[0],
                 progress_cb=self._wrap_progress(
-                    40, 30, "템플릿 병합 중...", progress_cb
+                    0, 35, "PDF 로딩 중...", progress_cb
                 ),
-                page_fine_angles=self.preset.page_fine_angles,
+                page_indices=list(range(page_count)),
             )
-            # 병합 템플릿은 이미 회전·정합된 이미지입니다. self.pages까지 교체하면
-            # 표시와 분석에서 회전이 다시 적용되므로 자동 탐지 입력으로만 사용합니다.
+            if len(loaded_pages) < page_count:
+                raise ValueError(
+                    f"첫 PDF에서 {page_count}쪽을 읽어야 하지만 "
+                    f"{len(loaded_pages)}쪽만 읽었습니다."
+                )
 
-        self.auto_detect(
-            progress_cb=self._wrap_progress(70, 30, "체크박스 탐지 중...", progress_cb),
-            prebuilt_templates=multi_templates,
-        )
-        progress_cb(100, "PDF 로드 완료")
-        progress.close()
+            self.file_paths = list(paths)
+            self.preset.page_count = page_count
+            self.pages = loaded_pages
+            self._pages_are_canonical = False
+            self._reset_state_for_new_pdf()
+            self._estimate_page_fine_angles(
+                progress_cb=self._wrap_progress(
+                    35, 5, "자동 수평 맞춤 중...", progress_cb
+                )
+            )
+            self._update_page_size()
+            self.update_canvas()
+            self._sync_view_toggle_text()
+
+            # 여러 PDF의 첫 설문을 합쳐 자동 탐지 기준을 더 안정적으로 만듭니다.
+            multi_templates = None
+            if len(self.file_paths) > 1:
+                multi_templates = generate_ui_templates_multi(
+                    self.file_paths,
+                    page_count,
+                    self.preset.rot_code,
+                    self.preset.fine_angle,
+                    progress_cb=self._wrap_progress(
+                        40, 30, "템플릿 병합 중...", progress_cb
+                    ),
+                    page_fine_angles=self.preset.page_fine_angles,
+                )
+
+            self.auto_detect(
+                progress_cb=self._wrap_progress(
+                    70, 30, "체크박스 탐지 중...", progress_cb
+                ),
+                prebuilt_templates=multi_templates,
+                mark_dirty=False,
+            )
+            progress_cb(100, "PDF 로드 완료")
+        except Exception as exc:
+            self._restore_document_state(snapshot)
+            QMessageBox.critical(
+                self,
+                "PDF 불러오기 실패",
+                "PDF를 불러오지 못했습니다. 파일이 손상되었거나 암호가 "
+                f"설정됐는지 확인해주세요.\n\n세부 내용: {exc}",
+            )
+            return False
+        finally:
+            if progress is not None:
+                progress.close()
+
         QMessageBox.information(self, "완료", "PDF가 성공적으로 로드되었습니다.")
+        return True
 
     def _estimate_page_fine_angles(self, progress_cb=None) -> list[float]:
         page_count = min(self.preset.page_count, len(self.pages))
@@ -1523,7 +2349,10 @@ class MainWindow(QMainWindow):
 
     def change_fine_angle(self, angle: float):
         """미세 회전 각도 조절 시 동작합니다."""
+        changed = abs(self.preset.fine_angle - angle) > 0.0001
         self.preset.fine_angle = angle
+        if changed:
+            MainWindow._set_preset_dirty(self, True)
         if not self.pages:
             return
         self._update_page_size()
@@ -1544,6 +2373,7 @@ class MainWindow(QMainWindow):
             0.0 for _ in range(min(self.preset.page_count, len(self.pages)))
         ]
         self._sync_rotation_actions()
+        MainWindow._set_preset_dirty(self, True)
 
         if not self.pages:
             return
@@ -1570,9 +2400,11 @@ class MainWindow(QMainWindow):
             self.is_a_view = not self.is_a_view
             self.update_canvas()
             self._sync_view_toggle_text()
+            MainWindow._set_preset_dirty(self, True)
 
     def update_canvas(self):
         if not self.pages:
+            self._refresh_edit_status()
             return
 
         drawn_pages = []
@@ -1587,25 +2419,37 @@ class MainWindow(QMainWindow):
             for field in self.preset.fields:
                 for b in field.boxes:
                     if b.page_idx == i:
-                        color = (
-                            (0, 255, 255) if b in self.selected_boxes else (0, 200, 0)
-                        )
-                        thick = 4 if b in self.selected_boxes else 2
+                        selected = self._box_is_selected(b)
+                        if selected:
+                            color = (0, 210, 255)
+                        elif field.is_comment:
+                            color = (180, 60, 180)
+                        else:
+                            color = (0, 165, 70)
+                        thick = 4 if selected else 2
                         cv2.rectangle(
                             canvas_img, (b.x, b.y), (b.x + b.w, b.y + b.h), color, thick
                         )
-                        text_entries.append((field.name, b.x, max(0, b.y - 20), color))
+                        label = field.name
+                        if field.is_comment and not label.startswith("자유기입"):
+                            label = f"[자유기입] {label}"
+                        text_entries.append((label, b.x, max(0, b.y - 20), color))
+                        if selected and len(self.selected_boxes) == 1:
+                            self._draw_resize_handles(canvas_img, b)
 
             if text_entries:
                 canvas_img = self._draw_texts(canvas_img, text_entries)
 
             for b in self.pending_boxes:
                 if b.page_idx == i:
-                    color = (0, 255, 255) if b in self.selected_boxes else (255, 100, 0)
-                    thick = 4 if b in self.selected_boxes else 2
+                    selected = self._box_is_selected(b)
+                    color = (0, 210, 255) if selected else (230, 120, 20)
+                    thick = 4 if selected else 2
                     cv2.rectangle(
                         canvas_img, (b.x, b.y), (b.x + b.w, b.y + b.h), color, thick
                     )
+                    if selected and len(self.selected_boxes) == 1:
+                        self._draw_resize_handles(canvas_img, b)
 
             drawn_pages.append(canvas_img)
 
@@ -1623,26 +2467,106 @@ class MainWindow(QMainWindow):
             stitched = np.vstack(drawn_pages)
 
         self.canvas.set_image(stitched)
+        self._refresh_edit_status()
 
-    def add_pending_box_from_stitched(self, st_x, st_y, w, h):
+    @staticmethod
+    def _draw_resize_handles(image: np.ndarray, box: Box):
+        radius = 5
+        for x, y in (
+            (box.x, box.y),
+            (box.x + box.w, box.y),
+            (box.x, box.y + box.h),
+            (box.x + box.w, box.y + box.h),
+        ):
+            cv2.rectangle(
+                image,
+                (x - radius, y - radius),
+                (x + radius, y + radius),
+                (0, 210, 255),
+                -1,
+            )
+            cv2.rectangle(
+                image,
+                (x - radius, y - radius),
+                (x + radius, y + radius),
+                (70, 70, 70),
+                1,
+            )
+
+    def _box_is_selected(self, target: Box) -> bool:
+        return any(box is target for box in self.selected_boxes)
+
+    def _box_from_stitched_rect(self, st_x, st_y, width, height) -> Box | None:
+        if self.page_W <= 0 or self.page_H <= 0 or width <= 0 or height <= 0:
+            return None
+        st_x = int(round(st_x))
+        st_y = int(round(st_y))
+        width = int(round(width))
+        height = int(round(height))
+        if st_x < 0 or st_y < 0:
+            return None
+
         if self.is_a_view:
-            col = st_x // self.page_W
+            column = st_x // self.page_W
             row = st_y // self.page_H
-            page_idx = row * 2 + col
-            local_x = st_x % self.page_W
-            local_y = st_y % self.page_H
+            if column not in (0, 1):
+                return None
+            page_idx = row * 2 + column
+            local_x = st_x - column * self.page_W
+            local_y = st_y - row * self.page_H
         else:
             page_idx = st_y // self.page_H
             local_x = st_x
-            local_y = st_y % self.page_H
+            local_y = st_y - page_idx * self.page_H
 
-        if page_idx >= self.preset.page_count:
+        if not (0 <= page_idx < self.preset.page_count):
+            return None
+        right = min(self.page_W, local_x + width)
+        bottom = min(self.page_H, local_y + height)
+        local_x = max(0, min(self.page_W - 1, local_x))
+        local_y = max(0, min(self.page_H - 1, local_y))
+        if right - local_x <= 5 or bottom - local_y <= 5:
+            return None
+        return Box(
+            page_idx,
+            local_x,
+            local_y,
+            right - local_x,
+            bottom - local_y,
+        )
+
+    def add_pending_box_from_stitched(self, st_x, st_y, w, h):
+        box = self._box_from_stitched_rect(st_x, st_y, w, h)
+        if box is None:
             return
+        previous_state = self._capture_edit_state()
+        self.pending_boxes.append(box)
+        self.selected_boxes = [box]
+        self._commit_edit(previous_state, "선택지 추가")
+        self.update_canvas()
 
-        clamped_w = min(w, self.page_W - local_x)
-        clamped_h = min(h, self.page_H - local_y)
+    def _unique_field_name(self, base: str) -> str:
+        existing = {field.name for field in self.preset.fields}
+        if base not in existing:
+            return base
+        number = 2
+        while f"{base} {number}" in existing:
+            number += 1
+        return f"{base} {number}"
 
-        self.pending_boxes.append(Box(page_idx, local_x, local_y, clamped_w, clamped_h))
+    def add_comment_box_from_stitched(self, st_x, st_y, w, h):
+        box = self._box_from_stitched_rect(st_x, st_y, w, h)
+        if box is None:
+            return
+        previous_state = self._capture_edit_state()
+        field = Field(
+            name=self._unique_field_name("자유기입"),
+            boxes=[box],
+            is_comment=True,
+        )
+        self.preset.fields.append(field)
+        self.selected_boxes = [box]
+        self._commit_edit(previous_state, "자유기입 영역 추가")
         self.update_canvas()
 
     def get_stitched_rect(self, box: Box) -> QRectF:
@@ -1656,91 +2580,370 @@ class MainWindow(QMainWindow):
             row = box.page_idx
             return QRectF(box.x, row * self.page_H + box.y, box.w, box.h)
 
-    def handle_selection_from_stitched(self, x, y, w, h, shift_pressed):
-        sel_rect = QRectF(x, y, w, h)
-        all_boxes = self._all_boxes()
+    def box_at_stitched(self, x, y) -> Box | None:
+        matches = [
+            box
+            for box in self._all_boxes()
+            if self.get_stitched_rect(box).contains(x, y)
+        ]
+        return min(matches, key=lambda box: box.w * box.h) if matches else None
 
-        if w < 5 and h < 5:
-            clicked = None
-            for b in all_boxes:
-                b_rect = self.get_stitched_rect(b)
-                if b_rect.contains(x, y):
-                    if clicked is None or (b.w * b.h < clicked.w * clicked.h):
-                        clicked = b
-
-            if clicked:
-                if clicked in self.selected_boxes:
-                    self.selected_boxes.remove(clicked)
-                else:
-                    if not shift_pressed:
-                        self.selected_boxes.clear()
-                    self.selected_boxes.append(clicked)
-            else:
-                if not shift_pressed:
-                    self.selected_boxes.clear()
+    def select_box(self, box: Box, additive: bool = False) -> bool:
+        already_selected = self._box_is_selected(box)
+        if additive and already_selected:
+            self.selected_boxes = [
+                selected for selected in self.selected_boxes if selected is not box
+            ]
+            remains_selected = False
+            if getattr(self, "_selection_anchor", None) is box:
+                self._selection_anchor = (
+                    self.selected_boxes[-1] if self.selected_boxes else None
+                )
+        elif already_selected:
+            remains_selected = True
+            self._selection_anchor = box
         else:
-            if not shift_pressed:
+            if not additive:
                 self.selected_boxes.clear()
-            for b in all_boxes:
-                b_rect = self.get_stitched_rect(b)
-                if sel_rect.intersects(b_rect):
-                    if b not in self.selected_boxes:
-                        self.selected_boxes.append(b)
+            self.selected_boxes.append(box)
+            self._selection_anchor = box
+            remains_selected = True
+        self.update_canvas()
+        return remains_selected
 
+    def _boxes_in_selection_range(self, anchor: Box, target: Box) -> list[Box]:
+        if anchor.page_idx != target.page_idx:
+            return [target]
+        left = min(anchor.x, target.x)
+        top = min(anchor.y, target.y)
+        right = max(anchor.x + anchor.w, target.x + target.w)
+        bottom = max(anchor.y + anchor.h, target.y + target.h)
+        return [
+            box
+            for box in self._all_boxes()
+            if box.page_idx == anchor.page_idx
+            and left <= box.x + box.w / 2 <= right
+            and top <= box.y + box.h / 2 <= bottom
+        ]
+
+    def select_box_range(self, box: Box, additive: bool = False) -> bool:
+        all_boxes = self._all_boxes()
+        anchor = getattr(self, "_selection_anchor", None)
+        anchor_is_valid = anchor is not None and any(
+            anchor is candidate for candidate in all_boxes
+        )
+        if not anchor_is_valid or not self._box_is_selected(anchor):
+            anchor = next(
+                (
+                    selected
+                    for selected in reversed(self.selected_boxes)
+                    if any(selected is candidate for candidate in all_boxes)
+                ),
+                box,
+            )
+            self._selection_anchor = anchor
+
+        range_boxes = self._boxes_in_selection_range(anchor, box)
+        if not additive:
+            self.selected_boxes.clear()
+        for candidate in range_boxes:
+            if not self._box_is_selected(candidate):
+                self.selected_boxes.append(candidate)
+        self.update_canvas()
+        return self._box_is_selected(box)
+
+    def clear_box_selection(self):
+        if not self.selected_boxes:
+            self._selection_anchor = None
+            return
+        self.selected_boxes.clear()
+        self._selection_anchor = None
         self.update_canvas()
 
-    def delete_selected_boxes(self):
+    def resize_handle_at_stitched(self, x, y, tolerance: float):
+        if len(self.selected_boxes) != 1:
+            return None
+        box = self.selected_boxes[0]
+        rect = self.get_stitched_rect(box)
+        handles = {
+            "nw": (rect.left(), rect.top()),
+            "ne": (rect.right(), rect.top()),
+            "sw": (rect.left(), rect.bottom()),
+            "se": (rect.right(), rect.bottom()),
+        }
+        for name, (handle_x, handle_y) in handles.items():
+            if abs(x - handle_x) <= tolerance and abs(y - handle_y) <= tolerance:
+                return box, name
+        return None
+
+    def bounded_move_delta(self, boxes: list[Box], dx, dy) -> tuple[int, int]:
+        if not boxes:
+            return 0, 0
+        dx = int(round(dx))
+        dy = int(round(dy))
+        min_dx = max(-box.x for box in boxes)
+        max_dx = min(self.page_W - box.x - box.w for box in boxes)
+        min_dy = max(-box.y for box in boxes)
+        max_dy = min(self.page_H - box.y - box.h for box in boxes)
+        return (
+            max(min_dx, min(max_dx, dx)),
+            max(min_dy, min(max_dy, dy)),
+        )
+
+    def move_selected_boxes(self, dx, dy):
         if not self.selected_boxes:
             return
-
-        for b in self.selected_boxes:
-            if b in self.pending_boxes:
-                self.pending_boxes.remove(b)
-            else:
-                for field in self.preset.fields:
-                    if b in field.boxes:
-                        field.boxes.remove(b)
-                        if not field.boxes:
-                            self.preset.fields.remove(field)
-
-        self.selected_boxes.clear()
+        dx, dy = self.bounded_move_delta(self.selected_boxes, dx, dy)
+        if dx == 0 and dy == 0:
+            return
+        previous_state = self._capture_edit_state()
+        for box in self.selected_boxes:
+            box.x += dx
+            box.y += dy
+        self._commit_edit(previous_state, "선택 영역 이동")
         self.update_canvas()
+
+    def _resized_geometry(self, box: Box, handle: str, dx, dy):
+        min_size = 8
+        dx = int(round(dx))
+        dy = int(round(dy))
+        left = box.x
+        top = box.y
+        right = box.x + box.w
+        bottom = box.y + box.h
+        if "w" in handle:
+            left = max(0, min(right - min_size, left + dx))
+        if "e" in handle:
+            right = min(self.page_W, max(left + min_size, right + dx))
+        if "n" in handle:
+            top = max(0, min(bottom - min_size, top + dy))
+        if "s" in handle:
+            bottom = min(self.page_H, max(top + min_size, bottom + dy))
+        return left, top, right - left, bottom - top
+
+    def preview_resized_stitched_rect(self, box: Box, handle: str, dx, dy) -> QRectF:
+        x, y, width, height = self._resized_geometry(box, handle, dx, dy)
+        return self.get_stitched_rect(
+            Box(box.page_idx, x, y, width, height)
+        )
+
+    def resize_box(self, box: Box, handle: str, dx, dy):
+        if box is None or handle not in {"nw", "ne", "sw", "se"}:
+            return
+        geometry = self._resized_geometry(box, handle, dx, dy)
+        if geometry == (box.x, box.y, box.w, box.h):
+            return
+        previous_state = self._capture_edit_state()
+        box.x, box.y, box.w, box.h = geometry
+        self._commit_edit(previous_state, "선택 영역 크기 변경")
+        self.update_canvas()
+
+    def handle_selection_from_stitched(self, x, y, w, h, additive):
+        sel_rect = QRectF(x, y, w, h)
+
+        if w < 5 and h < 5:
+            clicked = self.box_at_stitched(x, y)
+            if clicked is not None:
+                self.select_box(clicked, additive=additive)
+                return
+            if not additive:
+                self.selected_boxes.clear()
+                self._selection_anchor = None
+        else:
+            if not additive:
+                self.selected_boxes.clear()
+            intersecting = []
+            for b in self._all_boxes():
+                b_rect = self.get_stitched_rect(b)
+                if sel_rect.intersects(b_rect):
+                    intersecting.append(b)
+                    if not self._box_is_selected(b):
+                        self.selected_boxes.append(b)
+            if intersecting:
+                self._selection_anchor = self._boxes_in_reading_order(
+                    intersecting
+                )[0]
+            elif not additive:
+                self._selection_anchor = None
+
+        self.update_canvas()
+
+    def _field_for_box(self, target: Box) -> Field | None:
+        for field in self.preset.fields:
+            if any(box is target for box in field.boxes):
+                return field
+        return None
+
+    @staticmethod
+    def _remove_box_ids_from_field(field: Field, removed_ids: set[int]):
+        kept_boxes = []
+        kept_values = []
+        for index, box in enumerate(field.boxes):
+            if id(box) in removed_ids:
+                continue
+            kept_boxes.append(box)
+            kept_values.append(
+                field.value_map[index] if index < len(field.value_map) else ""
+            )
+        field.boxes = kept_boxes
+        field.value_map = kept_values
+
+    def delete_selected_boxes(self, confirm: bool = True):
+        if not self.selected_boxes:
+            return
+        selected_ids = {id(box) for box in self.selected_boxes}
+        removes_question = any(
+            field.boxes
+            and all(id(box) in selected_ids for box in field.boxes)
+            for field in self.preset.fields
+        )
+        if confirm and (len(selected_ids) > 1 or removes_question):
+            detail = (
+                "선택한 박스를 삭제하면 문항 전체도 함께 삭제됩니다."
+                if removes_question
+                else f"선택한 박스 {len(selected_ids)}개를 삭제할까요?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "선택 삭제",
+                f"{detail}\n삭제 후 Ctrl+Z로 되돌릴 수 있습니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        previous_state = self._capture_edit_state()
+        self.pending_boxes = [
+            box for box in self.pending_boxes if id(box) not in selected_ids
+        ]
+        for field in self.preset.fields:
+            self._remove_box_ids_from_field(field, selected_ids)
+        self.preset.fields = [field for field in self.preset.fields if field.boxes]
+        self.selected_boxes.clear()
+        self._commit_edit(previous_state, f"선택 영역 {len(selected_ids)}개 삭제")
+        self.update_canvas()
+
+    def delete_question(self, field: Field, confirm: bool = True):
+        if not any(current is field for current in self.preset.fields):
+            return
+        if confirm:
+            reply = QMessageBox.question(
+                self,
+                "문항 전체 삭제",
+                f"'{field.name}' 문항과 선택지 {len(field.boxes)}개를 삭제할까요?\n"
+                "삭제 후 Ctrl+Z로 되돌릴 수 있습니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        previous_state = self._capture_edit_state()
+        removed_ids = {id(box) for box in field.boxes}
+        self.preset.fields = [
+            current for current in self.preset.fields if current is not field
+        ]
+        self.selected_boxes = [
+            box for box in self.selected_boxes if id(box) not in removed_ids
+        ]
+        self._commit_edit(previous_state, f"'{field.name}' 문항 삭제")
+        self.update_canvas()
+
+    def toggle_comment_field(self, field: Field):
+        if not any(current is field for current in self.preset.fields):
+            return
+        previous_state = self._capture_edit_state()
+        field.is_comment = not field.is_comment
+        description = (
+            "자유기입으로 지정" if field.is_comment else "자유기입 지정 해제"
+        )
+        self._commit_edit(previous_state, description)
+        self.update_canvas()
+
+    def show_box_context_menu(self, global_pos, clicked: Box):
+        menu = QMenu(self)
+        delete_selected_action = menu.addAction("선택한 영역 삭제")
+        group_action = menu.addAction("선택한 영역을 새 문항으로 묶기")
+        field = self._field_for_box(clicked)
+        delete_question_action = None
+        comment_action = None
+        if field is not None:
+            menu.addSeparator()
+            comment_action = menu.addAction(
+                "자유기입 지정 해제"
+                if field.is_comment
+                else "자유기입으로 지정"
+            )
+            delete_question_action = menu.addAction(f"'{field.name}' 문항 전체 삭제")
+        chosen = menu.exec(global_pos)
+        if chosen is delete_selected_action:
+            self.delete_selected_boxes()
+        elif chosen is group_action:
+            self.group_boxes()
+        elif comment_action is not None and chosen is comment_action:
+            self.toggle_comment_field(field)
+        elif delete_question_action is not None and chosen is delete_question_action:
+            self.delete_question(field)
 
     def group_boxes(self):
         if not self.selected_boxes:
             QMessageBox.warning(
                 self,
                 "알림",
-                "선택된 박스가 없습니다.\n우클릭 드래그로 묶을 박스를 선택해주세요.",
+                "선택된 영역이 없습니다.\n선택 모드에서 박스를 클릭하거나 드래그해주세요.",
             )
             return
 
         name, ok = QInputDialog.getText(
             self,
-            "항목 그룹화",
+            "문항 만들기",
             "문항 이름을 입력하세요",
         )
-        if ok and name:
-            new_field = Field(name=name, boxes=[])
-            for b in self.selected_boxes:
-                if b in self.pending_boxes:
-                    self.pending_boxes.remove(b)
-                    new_field.boxes.append(b)
-                else:
-                    for field in self.preset.fields:
-                        if b in field.boxes:
-                            field.boxes.remove(b)
-                            new_field.boxes.append(b)
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        selected = self._boxes_in_reading_order(self.selected_boxes)
+        selected_ids = {id(box) for box in selected}
+        surviving_names = [
+            field.name
+            for field in self.preset.fields
+            if any(id(box) not in selected_ids for box in field.boxes)
+        ]
+        try:
+            validate_field_names([*surviving_names, name])
+        except ValueError as exc:
+            QMessageBox.warning(self, "문항 이름 확인", str(exc))
+            return
+        previous_state = self._capture_edit_state()
+        mapped_values = {}
+        for field in self.preset.fields:
+            for index, box in enumerate(field.boxes):
+                if id(box) in selected_ids:
+                    mapped_values[id(box)] = (
+                        field.value_map[index]
+                        if index < len(field.value_map)
+                        else ""
+                    )
+        self.pending_boxes = [
+            box for box in self.pending_boxes if id(box) not in selected_ids
+        ]
+        for field in self.preset.fields:
+            self._remove_box_ids_from_field(field, selected_ids)
+        self.preset.fields = [field for field in self.preset.fields if field.boxes]
+        new_field = Field(
+            name=name,
+            boxes=selected,
+            value_map=[mapped_values.get(id(box), "") for box in selected],
+        )
+        self.preset.fields.append(new_field)
+        self.selected_boxes = list(new_field.boxes)
+        self._commit_edit(previous_state, f"'{name}' 문항 만들기")
+        self.update_canvas()
 
-            self.preset.fields = [f for f in self.preset.fields if f.boxes]
-            self.preset.fields.append(new_field)
-            self.selected_boxes.clear()
-            self.update_canvas()
-
-    def auto_detect(self, progress_cb=None, prebuilt_templates=None):
+    def auto_detect(
+        self, progress_cb=None, prebuilt_templates=None, mark_dirty: bool = True
+    ):
         """
         체크박스를 자동으로 탐지하고, 수평으로 같은 라인에 있는 항목을
-        Q1, Q2, Q3 등의 그룹(Field)으로 자동 할당합니다.
+        Q1, Q2, Q3 등의 문항(Field)으로 자동 할당합니다.
 
         prebuilt_templates: load_pdf에서 이미 생성한 병합 템플릿 (중복 생성 방지)
         """
@@ -1775,7 +2978,10 @@ class MainWindow(QMainWindow):
                     self.preset.fields.append(Field(name=field_name, boxes=row))
                     question_number += 1
             report(100, "체크박스 탐지 완료 (캐시)")
+            MainWindow._clear_edit_history(self)
             self.update_canvas()
+            if mark_dirty:
+                MainWindow._set_preset_dirty(self, True)
             return
 
         question_number = 1
@@ -1827,7 +3033,7 @@ class MainWindow(QMainWindow):
 
             rows = self._group_boxes_by_row(boxes)
 
-            # 2. 각 줄에 대해 좌측부터 우측 방향으로 정렬(x 좌표 기준) 후 Field(그룹)로 할당
+            # 2. 각 줄을 왼쪽부터 오른쪽으로 정렬한 뒤 Field(문항)로 할당
             for row in rows:
                 row.sort(key=lambda b: b.x)
 
@@ -1851,7 +3057,10 @@ class MainWindow(QMainWindow):
         )
 
         report(100, "체크박스 탐지 완료")
+        MainWindow._clear_edit_history(self)
         self.update_canvas()
+        if mark_dirty:
+            MainWindow._set_preset_dirty(self, True)
 
     def _analysis_input_pages(self) -> tuple[list[np.ndarray], bool]:
         """Return stable analysis references separately from display pages."""
@@ -1869,6 +3078,11 @@ class MainWindow(QMainWindow):
     def execute_analysis(self):
         if not self.file_paths or not self.preset.fields:
             QMessageBox.warning(self, "경고", "파일이나 생성된 템플릿 항목이 없습니다.")
+            return
+        try:
+            validate_field_names(field.name for field in self.preset.fields)
+        except ValueError as exc:
+            QMessageBox.warning(self, "문항 이름 확인", str(exc))
             return
         if self._analysis_thread is not None and self._analysis_thread.isRunning():
             QMessageBox.information(self, "알림", "이미 분석이 진행 중입니다.")
@@ -1999,6 +3213,11 @@ class MainWindow(QMainWindow):
                 "분석 진행 중",
                 "분석이 끝난 뒤 프로그램을 종료해주세요.",
             )
+            a0.ignore()
+            return
+        if not self._confirm_save_or_discard_changes(
+            "프로그램을 종료하면 저장하지 않은 편집 내용이 사라집니다."
+        ):
             a0.ignore()
             return
         super().closeEvent(a0)

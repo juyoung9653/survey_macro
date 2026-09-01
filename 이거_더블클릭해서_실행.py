@@ -38,12 +38,14 @@ if __name__ == "__main__":
 
     from PyQt6.QtWidgets import QApplication
 
+    from src.localization import install_korean_translations
     from src.ui import MainWindow
     from src.vision import cleanup_old_cache
 
     cleanup_old_cache()
 
     app = QApplication(sys.argv)
+    install_korean_translations(app)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

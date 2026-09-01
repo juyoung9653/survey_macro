@@ -1,120 +1,139 @@
-﻿<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>10. 자주 묻는 질문 (FAQ)</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Malgun Gothic','Apple SD Gothic Neo',sans-serif;background:#f5f7fa;color:#222;line-height:1.8}
-  .wrap{max-width:860px;margin:0 auto;padding:30px 20px 80px}
-  .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
-  .nav a{color:#3f51b5;text-decoration:none;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid #c5cae9}
-  .nav a:hover{background:#e8eaf6}
-  .card{background:#fff;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.06);padding:32px;margin-bottom:28px}
-  .card h2{font-size:22px;color:#1a237e;margin-bottom:16px;display:flex;align-items:center;gap:10px}
-  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#1a237e;color:#fff;font-size:16px;flex-shrink:0}
-  .card p,.card li{font-size:15px;color:#444}
-  .card ul{padding-left:22px;margin:8px 0}
-  .card li{margin-bottom:10px}
-  .qa{border-bottom:1px solid #eee;padding:16px 0}
-  .qa:last-child{border-bottom:none}
-  .qa .q{font-weight:bold;font-size:16px;color:#1a237e;margin-bottom:6px}
-  .qa .q::before{content:"Q. "}
-  .qa .a{font-size:15px;color:#444}
-  .qa .a::before{content:"A. ";color:#4caf50;font-weight:bold}
-  .good{background:#e8f5e9;border-left:4px solid #4caf50;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
-  .warn{background:#fff3e0;border-left:4px solid #ff9800;padding:14px 18px;border-radius:8px;margin:14px 0;font-size:14px}
-  code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:14px;color:#c62828}
-  .footer{text-align:center;color:#999;font-size:13px;margin-top:40px}
-  @media(max-width:600px){.card{padding:20px}}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>10. 문제 해결</title>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="wrap">
+<div class="shell">
+    <nav class="topnav" aria-label="문서 이동">
+        <a class="nav-link" href="9_검토용_폴더.html">← 이전: 기준표</a>
+        <a class="nav-link" href="../설명서.html">목차</a>
+    </nav>
 
-<div class="nav">
-  <a href="9_검토용_폴더.html">◀ 이전: 검토용 폴더</a>
-  <a href="../설명서.html">목차</a>
-</div>
+    <header class="page-head">
+        <span class="page-number">10</span>
+        <h1>문제 해결</h1>
+        <p>증상에 맞는 항목을 열고 위에서부터 확인하세요.</p>
+    </header>
 
-<div class="card">
-  <h2><span class="num">10</span> 자주 묻는 질문 (FAQ)</h2>
+    <main>
+        <section class="card">
+            <h2>PDF와 화면</h2>
+            <details>
+                <summary>PDF를 골랐는데 화면이 바뀌지 않아요</summary>
+                <div>파일 선택 뒤 나오는 페이지 수 창에서 <strong>확인</strong>을 눌렀는지 봅니다. 취소했다면 기존 문서는 그대로 유지됩니다. 다시 <strong>PDF 불러오기</strong>를 누르세요.</div>
+            </details>
+            <details>
+                <summary>PDF 불러오기 오류가 나면 이전 작업도 사라지나요?</summary>
+                <div>아니요. 파일 읽기·템플릿 생성·자동 탐지 중 문제가 생기면 이전 PDF, 문항, 프리셋 상태로 되돌아갑니다. 오류 창의 세부 내용을 확인하고 손상 또는 암호 설정 여부를 점검하세요.</div>
+            </details>
+            <details>
+                <summary>두 번째 응답부터 페이지가 서로 섞여요</summary>
+                <div><strong>한 부당 페이지 수</strong>를 잘못 입력했을 가능성이 큽니다. 예를 들어 2쪽 설문 28부가 들어 있는 56페이지 PDF는 2를 입력해야 합니다. PDF를 다시 불러오세요.</div>
+            </details>
+            <details>
+                <summary>페이지가 옆으로 누웠거나 조금 기울었어요</summary>
+                <div>90도 회전은 <strong>파일 → 페이지 설정 → 회전</strong>, 작은 기울기는 <strong>자동 수평 맞춤</strong>, 마지막 미세 조정은 <strong>전체 미세 회전</strong>을 사용합니다.</div>
+            </details>
+        </section>
 
-  <div class="qa">
-    <div class="q">프로그램을 더블클릭했는데 아무 반응이 없어요.</div>
-    <div class="a">파일 위에서 <strong>마우스 우클릭 &gt; 연결 프로그램 &gt; Python</strong>을 선택해보세요.<br>
-    Python이 설치되어 있지 않다면 <strong>python.org</strong>에서 Python을 설치해야 합니다.<br>
-    관리자에게 문의해주세요.</div>
-  </div>
+        <section class="card">
+            <h2>박스 편집</h2>
+            <details>
+                <summary>체크박스를 너무 많이 또는 너무 적게 찾았어요</summary>
+                <div>빠진 칸은 <strong>선택지 추가</strong>로 그리고, 잘못 잡은 칸은 <strong>선택·이동</strong>에서 클릭한 뒤 Delete로 지웁니다. 스캔 파일을 같은 이름으로 교체한 뒤 이전 탐지가 반복된다면 <strong>파일 → 캐시 삭제</strong>로 다시 탐지하세요.</div>
+            </details>
+            <details>
+                <summary>클릭해도 선택되지 않고 계속 박스만 그려져요</summary>
+                <div><span class="kbd">Esc</span>를 누르거나 <strong>선택·이동</strong> 버튼을 누릅니다. 회색 안내 줄이 “선택·이동”으로 시작하는지 확인하세요.</div>
+            </details>
+            <details>
+                <summary>여러 박스를 빠르게 선택하고 싶어요</summary>
+                <div>떨어진 박스는 <span class="kbd">Ctrl</span> + 클릭으로 하나씩 추가·해제합니다. 연속된 박스는 첫 박스를 클릭한 뒤 마지막 박스를 <span class="kbd">Shift</span> + 클릭합니다. 가로·세로뿐 아니라 대각선으로 클릭하면 두 박스 사이의 사각 범위가 선택됩니다.</div>
+            </details>
+            <details>
+                <summary>박스 크기를 바꾸고 싶어요</summary>
+                <div>박스를 한 개만 선택한 뒤 노란색 모서리를 드래그합니다. 여러 개가 선택된 상태에서는 크기 조절점이 나타나지 않습니다.</div>
+            </details>
+            <details>
+                <summary>실수로 지웠어요</summary>
+                <div><span class="kbd">Ctrl</span> + <span class="kbd">Z</span>를 누릅니다. 다시 적용하려면 <span class="kbd">Ctrl</span> + <span class="kbd">Y</span>를 누릅니다.</div>
+            </details>
+        </section>
 
-  <div class="qa">
-    <div class="q">체크박스 자동 찾기가 너무 많이 또는 너무 적게 찾았어요.</div>
-    <div class="a">자동 탐지는 완벽하지 않습니다. <strong>직접 추가/삭제</strong>하면 됩니다.<br>
-    좌클릭 드래그로 체크박스를 추가하고, 우클릭 &gt; 삭제로 불필요한 박스를 지우세요.<br>
-    스캔 품질이 좋을수록(200 DPI 이상, 선명하게) 인식률이 높아집니다.</div>
-  </div>
+        <section class="card">
+            <h2>문항과 프리셋</h2>
+            <details>
+                <summary>선택지 이름과 실제 위치가 반대로 나와요</summary>
+                <div><strong>파일 → 페이지 설정 → 번호 역순</strong> 상태를 바꾸고 <strong>선택지 이름 설정</strong>을 다시 엽니다. 첫 체크칸의 번호와 이름이 실제 설문 순서와 같은지 확인하세요.</div>
+            </details>
+            <details>
+                <summary>프리셋을 불러왔는데 위치가 안 바뀐 것 같아요</summary>
+                <div>정상일 수 있습니다. 가까운 자동 탐지 박스는 현재 위치를 유지하고 프리셋의 문항 이름과 선택지 값만 적용합니다. 박스가 실제 체크칸을 감싸고 값 순서가 맞는지 확인하세요.</div>
+            </details>
+            <details>
+                <summary>“현재 PDF와 일치하지 않는 프리셋”이라고 나와요</summary>
+                <div>다른 설문 양식, 잘못된 페이지 수, 페이지 순서 변경, 큰 잘림이나 회전을 확인합니다. 실패한 프리셋은 적용되지 않으므로 맞는 프리셋을 고르거나 새 설정을 만드세요.</div>
+            </details>
+            <details>
+                <summary>새 PDF를 열었더니 프리셋이 미적용으로 바뀌었어요</summary>
+                <div>의도된 안전 동작입니다. 새 PDF의 자동 탐지 결과가 기존 프리셋에 덮어써지는 일을 막습니다. PDF를 연 다음 같은 양식의 프리셋을 다시 불러오세요.</div>
+            </details>
+            <details>
+                <summary>문항 이름이 중복됐다는 경고가 나와요</summary>
+                <div>엑셀에서 각 문항이 별도 열로 보존되도록 문항마다 다른 이름을 입력합니다. 대소문자만 다른 이름도 중복으로 처리하며 <code>파일명</code>, <code>페이지</code>는 사용할 수 없습니다.</div>
+            </details>
+        </section>
 
-  <div class="qa">
-    <div class="q">여러 PDF를 한 번에 불러올 수 있나요?</div>
-    <div class="a">네! 파일 선택 창에서 <strong>Ctrl 키를 누른 상태</strong>로 파일을 클릭하면 여러 개를 선택할 수 있습니다.<br>
-    모든 PDF가 동일한 양식이어야 정확하게 분석됩니다.</div>
-  </div>
+        <section class="card">
+            <h2>분석과 결과</h2>
+            <details>
+                <summary>분석 실행 버튼을 눌러도 시작되지 않아요</summary>
+                <div>PDF가 불러와져 있고 문항이 하나 이상 있는지 확인합니다. 영역이 모두 삭제되었다면 PDF를 다시 불러오거나 선택지를 추가해 문항으로 묶습니다.</div>
+            </details>
+            <details>
+                <summary>분석이 오래 걸려요</summary>
+                <div>고해상도·다페이지 PDF는 시간이 걸립니다. 진행률과 현재 파일 메시지가 바뀌면 기다립니다. 다른 무거운 프로그램을 닫으면 메모리 부족 가능성을 줄일 수 있습니다.</div>
+            </details>
+            <details>
+                <summary>결과 파일을 찾을 수 없어요</summary>
+                <div>화면의 <strong>결과 폴더</strong> 버튼을 누릅니다. 파일 이름에는 실행한 연도·월·일·시·분·초가 붙습니다. 완료가 아니라 오류 창이 나왔다면 가장 최근 검토용 결과가 부분 결과인지 확인합니다.</div>
+            </details>
+            <details>
+                <summary>자유기입 PDF가 없어요</summary>
+                <div>자유기입 영역이 없거나 의미 있는 필기가 감지되지 않으면 만들지 않습니다. 엑셀 결과에서 해당 자유기입 열이 모두 비어 있는지 확인하세요.</div>
+            </details>
+            <details>
+                <summary>엑셀에 검수필요가 나왔어요</summary>
+                <div>오류로 단정하지 않고 사람이 판단하도록 남긴 항목입니다. <strong>검수필요</strong> 시트의 원본 이미지와 후보를 보고, <strong>결과</strong> 시트의 값을 맞는 선택지로 수정하세요.</div>
+            </details>
+        </section>
 
-  <div class="qa">
-    <div class="q">설문지가 기울어져서 스캔됐는데 괜찮나요?</div>
-    <div class="a">프로그램이 자동으로 <strong>정렬(이미지 정합)</strong>해서 보정합니다.<br>
-    다만 너무 심하게 기울어지면 인식이 어려울 수 있으니, 스캔 시 최대한 반듯하게 넣어주세요.</div>
-  </div>
+        <section class="card">
+            <h2>프로그램 실행</h2>
+            <details>
+                <summary>더블클릭해도 프로그램이 열리지 않아요</summary>
+                <div><code>설문지스캔.exe</code>가 있으면 먼저 사용합니다. 소스 실행이라면 Python 연결과 인터넷 상태를 확인합니다. <code>이거_더블클릭해서_실행.py</code>를 실행할 때 터미널에 설치 실패 메시지가 보이면 그 내용을 관리자에게 전달하세요.</div>
+            </details>
+            <details>
+                <summary>문제가 반복될 때 무엇을 전달해야 하나요?</summary>
+                <div>사용한 PDF 이름, 한 부당 페이지 수, 프리셋 이름, 오류 창 문구, 가장 최근 결과 폴더를 함께 전달하면 원인을 찾기 쉽습니다. 개인정보가 있는 원본 PDF는 승인된 담당자에게만 전달하세요.</div>
+            </details>
+            <div class="callout good">
+                <strong>가장 빠른 복구 순서</strong><br>
+                PDF 다시 불러오기 → 페이지 수 확인 → 회전·수평 맞춤 → 프리셋 다시 불러오기 → 영역 몇 개 육안 확인 → 분석 실행
+            </div>
+        </section>
+    </main>
 
-  <div class="qa">
-    <div class="q">엑셀 파일이 생성되지 않아요.</div>
-    <div class="a"><strong>분석 실행</strong> 버튼을 눌렀는지 확인하세요.<br>
-    분석 중 오류가 발생했다면 검은 창(터미널)에 빨간색 에러 메시지가 표시됩니다.<br>
-    에러 내용을 관리자에게 알려주세요.</div>
-  </div>
-
-  <div class="qa">
-    <div class="q">실행 중 검은 창이 갑자기 사라졌어요.</div>
-    <div class="a">프로그램이 비정상 종료된 것입니다. 다시 더블클릭해서 실행해보세요.<br>
-    같은 문제가 반복된다면 PDF 파일에 문제가 있는지 확인하거나 관리자에게 문의하세요.</div>
-  </div>
-
-  <div class="qa">
-    <div class="q">다른 컴퓨터에서도 사용할 수 있나요?</div>
-    <div class="a"><code>설문지 스캔</code> 폴더째로 <strong>USB에 담아서</strong> 다른 컴퓨터에 복사하면 됩니다.<br>
-    단, 그 컴퓨터에 <strong>Python이 설치</strong>되어 있어야 하고,<br>
-    첫 실행 시 인터넷 연결이 필요합니다 (필요 패키지 자동 설치).</div>
-  </div>
-
-  <div class="good">
-    <strong>문제가 계속된다면:</strong><br>
-    검은 창(터미널)에 출력된 <strong>에러 메시지</strong>를 캡처해서 관리자에게 보내주세요.<br>
-    가장 빠르게 문제를 해결할 수 있습니다.
-  </div>
-</div>
-
-<div class="card">
-  <h2>⚡ 빠른 시작 요약</h2>
-  <ol>
-    <li><code>이거_더블클릭해서_실행.py</code> 실행</li>
-    <li>파일 &gt; PDF 불러오기 &gt; 설문지 PDF 선택</li>
-    <li>자동 찾은 체크박스 확인 + 직접 추가/삭제</li>
-    <li>체크박스 우클릭 선택 &gt; 선택 묶기 버튼으로 그룹화</li>
-    <li>값 매핑 버튼으로 보기 이름 입력</li>
-    <li>분석 실행 버튼 클릭</li>
-    <li><code>설문결과.xlsx</code> 열어서 확인!</li>
-  </ol>
-</div>
-
-<div class="nav">
-  <a href="9_검토용_폴더.html">◀ 이전: 검토용 폴더</a>
-  <a href="../설명서.html">목차</a>
-</div>
-
-<div class="footer">설문지 자동 분석기 &middot; 10. FAQ</div>
-
+    <nav class="bottomnav" aria-label="문서 이동">
+        <a class="nav-link" href="9_검토용_폴더.html">← 이전: 기준표</a>
+        <a class="nav-link" href="../설명서.html">목차</a>
+    </nav>
+    <footer class="footer">설문지 자동 분석기 · 문제 해결</footer>
 </div>
 </body>
 </html>
-</title></strong></strong></strong></strong></strong></strong></code></strong></strong></code></strong></strong></strong></strong></h2></code></li></li></li></li></li></code>

@@ -591,6 +591,32 @@ class TemplateAlignmentTests(unittest.TestCase):
         self.assertGreater(_overlap(extracted, ink), 50)
         self.assertGreater(len(boxes), 0)
 
+    def test_checkbox_detection_recovers_tiny_grid_border_gaps(self):
+        form = np.full((700, 900, 3), 255, np.uint8)
+        x0, y0, cell_w, cell_h = 120, 100, 100, 80
+        for column in range(6):
+            x = x0 + column * cell_w
+            cv2.line(form, (x, y0), (x, y0 + 5 * cell_h), (0, 0, 0), 2)
+        for row in range(6):
+            y = y0 + row * cell_h
+            cv2.line(form, (x0, y), (x0 + 5 * cell_w, y), (0, 0, 0), 2)
+
+        for row in (3, 4):
+            row_bottom = y0 + (row + 1) * cell_h
+            cv2.rectangle(
+                form,
+                (x0 + 5 * cell_w - 3, row_bottom - 6),
+                (x0 + 5 * cell_w + 3, row_bottom - 6),
+                (255, 255, 255),
+                -1,
+            )
+
+        boxes = auto_detect_checkboxes(form)
+        right_column = [box for box in boxes if box[0] > 500]
+
+        self.assertEqual(len(boxes), 25)
+        self.assertEqual(len(right_column), 5)
+
     def test_checkbox_inner_ink_refines_shift_and_ignores_empty_border(self):
         expected = Box(page_idx=0, x=70, y=60, w=24, h=24)
         actual_x, actual_y = 75, 57
@@ -782,7 +808,7 @@ class TemplateAlignmentTests(unittest.TestCase):
                     boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
                 ),
                 Field(
-                    name="의견",
+                    name="자유기입",
                     boxes=[Box(0, 40, 280, 200, 60)],
                     is_comment=True,
                 ),
@@ -811,6 +837,55 @@ class TemplateAlignmentTests(unittest.TestCase):
         pending = result.auxiliary_boxes[0]
         self.assertAlmostEqual(pending.x, 378, delta=3)
         self.assertAlmostEqual(pending.y, 438, delta=3)
+
+    def test_preset_layout_reuses_supplied_detected_geometry(self):
+        source = np.full((400, 300), 255, np.uint8)
+        target = np.full((600, 450), 255, np.uint8)
+        source_positions = [
+            (50, 90),
+            (120, 90),
+            (190, 90),
+            (50, 190),
+            (120, 190),
+            (190, 190),
+        ]
+        supplied = [
+            Box(0, round(x * 1.5 + 10), round(y * 1.5 - 12), 30, 30)
+            for x, y in source_positions
+        ]
+        supplied.append(Box(0, 380, 500, 30, 30))
+        supplied.append(Box(0, 20, 500, 120, 50))
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="Q",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in source_positions],
+                    value_map=["A", "B", "C", "D", "E", "F"],
+                )
+            ],
+        )
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+            detected_boxes_by_page={0: supplied},
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.matched_boxes, 6)
+        self.assertEqual(len(result.matched_box_keys), 6)
+        self.assertEqual(len(result.supplied_box_keys), 8)
+        for mapped, detected in zip(result.config.fields[0].boxes, supplied[:6]):
+            self.assertEqual(
+                (mapped.x, mapped.y, mapped.w, mapped.h),
+                (detected.x, detected.y, detected.w, detected.h),
+            )
+        self.assertEqual(
+            result.config.fields[0].value_map,
+            ["A", "B", "C", "D", "E", "F"],
+        )
 
     def test_preset_layout_accepts_matching_table_below_header_checkboxes(self):
         source = np.full((500, 400), 255, np.uint8)

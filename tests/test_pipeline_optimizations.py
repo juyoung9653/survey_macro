@@ -26,6 +26,7 @@ from src.processor import (
     _prepare_checkbox_template_interiors,
     _sampled_survey_is_available,
     _save_ui_template_cache,
+    _select_ui_detection_templates,
     extract_ink_info_from_mask,
     extract_checkbox_ink_info,
     extract_pure_ink_mask,
@@ -53,6 +54,69 @@ class _ResourceControllerStub:
 
 
 class PipelineOptimizationTests(unittest.TestCase):
+    @staticmethod
+    def _make_detection_grid() -> np.ndarray:
+        image = np.full((700, 900), 255, np.uint8)
+        x0, y0, cell_w, cell_h = 120, 100, 100, 80
+        for column in range(6):
+            x = x0 + column * cell_w
+            cv2.line(image, (x, y0), (x, y0 + 5 * cell_h), 0, 2)
+        for row in range(6):
+            y = y0 + row * cell_h
+            cv2.line(image, (x0, y), (x0 + 5 * cell_w, y), 0, 2)
+        return image
+
+    def test_ui_detection_template_prefers_sample_with_more_valid_boxes(self):
+        clean = self._make_detection_grid()
+        broken = clean.copy()
+        for row in (3, 4):
+            center_y = 100 + row * 80 + 40
+            cv2.rectangle(
+                broken,
+                (617, center_y - 3),
+                (623, center_y + 3),
+                255,
+                -1,
+            )
+        encoded_ok, encoded = cv2.imencode(".png", clean)
+        self.assertTrue(encoded_ok)
+
+        selected = _select_ui_detection_templates(
+            {0: [encoded.tobytes()]},
+            {0: broken},
+        )
+
+        self.assertTrue(np.array_equal(selected[0], clean))
+
+    def test_ui_detection_template_keeps_median_on_equal_score(self):
+        median = self._make_detection_grid()
+        encoded_ok, encoded = cv2.imencode(".png", median)
+        self.assertTrue(encoded_ok)
+
+        selected = _select_ui_detection_templates(
+            {0: [encoded.tobytes()]},
+            {0: median},
+        )
+
+        self.assertIs(selected[0], median)
+
+    def test_ui_detection_samples_cover_the_end_of_a_merged_batch(self):
+        clean = self._make_detection_grid()
+        broken = clean.copy()
+        cv2.rectangle(broken, (617, 210), (623, 230), 255, -1)
+        broken_ok, broken_png = cv2.imencode(".png", broken)
+        clean_ok, clean_png = cv2.imencode(".png", clean)
+        self.assertTrue(broken_ok)
+        self.assertTrue(clean_ok)
+        samples = [broken_png.tobytes()] * 9 + [clean_png.tobytes()]
+
+        selected = _select_ui_detection_templates(
+            {0: samples},
+            {0: broken},
+        )
+
+        self.assertTrue(np.array_equal(selected[0], clean))
+
     def test_prepared_checkbox_template_interior_matches_per_survey_refinement(self):
         template = np.full((180, 240), 255, np.uint8)
         box = Box(page_idx=0, x=70, y=60, w=28, h=28)

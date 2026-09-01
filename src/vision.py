@@ -987,24 +987,10 @@ def auto_detect_checkboxes(
     # 4. 스캔 손실로 인해 미세하게 끊어진 선들을 이어줌
     grid = cv2.dilate(grid, np.ones((3, 3), np.uint8), iterations=1)
 
-    # 5. 윤곽선 반전 (선이 검은색, 박스 안쪽 빈 공간이 흰색이 됨)
-    inv_grid = cv2.bitwise_not(grid)
-
-    # 6. 흰색 영역(박스 안쪽 공간) 찾기
-    _, _, stats, _ = cv2.connectedComponentsWithStats(
-        inv_grid, connectivity=4, ltype=cv2.CV_32S
+    # 5~7. 닫힌 흰색 영역(박스 안쪽 공간)을 크기와 비율로 선별
+    boxes = _extract_enclosed_grid_boxes(
+        grid, min_w=min_w, max_w=max_w, min_h=min_h, max_h=max_h
     )
-
-    boxes = []
-    for stat in stats[1:]:  # 0번은 보통 배경 전체이므로 건너뜀
-        x, y, w, h, area = stat
-
-        # 7. 비율 및 크기 조건 완화
-        # 표 안의 길쭉한 직사각형 칸들도 모두 체크박스로 잡을 수 있도록 폭을 넓힘
-        if (min_w <= w <= max_w) and (min_h <= h <= max_h):
-            aspect_ratio = w / float(h)
-            if 0.1 <= aspect_ratio <= 10.0:
-                boxes.append((int(x), int(y), int(w), int(h)))
 
     # 8. 중첩 박스 제거 (더 큰 박스 안에 완전히 포함된 작은 박스 삭제)
     boxes = _remove_nested_boxes(boxes)
@@ -1012,6 +998,37 @@ def auto_detect_checkboxes(
     # 9. 고립 박스 제거 (중심에서 선 뻤을 때 만나는 박스 없으면 삭제)
     boxes = _filter_isolated_boxes(boxes)
 
+    # 10. 중앙값 템플릿에서 1~2픽셀 끊긴 선 때문에 열린 칸만 안전하게 복구
+    boxes = _recover_small_grid_gap_boxes(
+        grid,
+        boxes,
+        min_w=min_w,
+        max_w=max_w,
+        min_h=min_h,
+        max_h=max_h,
+    )
+
+    return boxes
+
+
+def _extract_enclosed_grid_boxes(
+    grid: np.ndarray,
+    min_w: int,
+    max_w: int,
+    min_h: int,
+    max_h: int,
+) -> list[tuple[int, int, int, int]]:
+    inv_grid = cv2.bitwise_not(grid)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(
+        inv_grid, connectivity=4, ltype=cv2.CV_32S
+    )
+
+    boxes = []
+    for x, y, w, h, _area in stats[1:]:
+        if not (min_w <= w <= max_w and min_h <= h <= max_h):
+            continue
+        if 0.1 <= w / float(h) <= 10.0:
+            boxes.append((int(x), int(y), int(w), int(h)))
     return boxes
 
 
@@ -1078,6 +1095,70 @@ def _filter_isolated_boxes(
             valid.append((x, y, w, h))
 
     return valid
+
+
+def _recover_small_grid_gap_boxes(
+    grid: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    min_w: int,
+    max_w: int,
+    min_h: int,
+    max_h: int,
+) -> list[tuple[int, int, int, int]]:
+    """Recover only gap-closed cells backed by a repeated row or column."""
+    if len(boxes) < 2:
+        return boxes
+
+    repaired_grid = cv2.morphologyEx(
+        grid,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), np.uint8),
+    )
+    if np.array_equal(repaired_grid, grid):
+        return boxes
+
+    repaired = _extract_enclosed_grid_boxes(
+        repaired_grid,
+        min_w=min_w,
+        max_w=max_w,
+        min_h=min_h,
+        max_h=max_h,
+    )
+    repaired = _filter_isolated_boxes(_remove_nested_boxes(repaired))
+
+    def same_region(first, second) -> bool:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+        overlap_w = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+        overlap_h = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+        overlap = overlap_w * overlap_h
+        return overlap / max(1, min(w1 * h1, w2 * h2)) >= 0.8
+
+    def has_lattice_support(candidate) -> bool:
+        x, y, w, h = candidate
+        cx, cy = x + w / 2, y + h / 2
+        row_neighbors = 0
+        column_neighbors = 0
+        for x2, y2, w2, h2 in boxes:
+            size_similar = (
+                abs(w - w2) / max(w, w2) <= 0.1
+                and abs(h - h2) / max(h, h2) <= 0.1
+            )
+            if not size_similar:
+                continue
+            if y2 <= cy <= y2 + h2:
+                row_neighbors += 1
+            if x2 <= cx <= x2 + w2:
+                column_neighbors += 1
+        return row_neighbors >= 2 or column_neighbors >= 2
+
+    recovered = list(boxes)
+    for candidate in repaired:
+        if any(same_region(candidate, existing) for existing in recovered):
+            continue
+        if has_lattice_support(candidate):
+            recovered.append(candidate)
+    return recovered
 
 
 def _checkbox_cache_key(

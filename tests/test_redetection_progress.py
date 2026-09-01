@@ -1,3 +1,4 @@
+import copy
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,7 +122,7 @@ class RedetectionProgressTests(unittest.TestCase):
         rotate.assert_called_once_with(raw, -1, 0.0)
         window._estimate_page_fine_angles.assert_called_once()
 
-    def test_preset_load_uses_detected_affine_for_canonical_coordinates(self):
+    def test_preset_load_keeps_current_coordinates_and_uses_current_reference(self):
         raw = np.full((60, 40), 245, np.uint8)
         saved = np.full((40, 30), 250, np.uint8)
         current_template = np.full((60, 40), 255, np.uint8)
@@ -193,20 +194,19 @@ class RedetectionProgressTests(unittest.TestCase):
         ):
             MainWindow._apply_loaded_preset(window, data, preset_name="detected")
 
-        self.assertEqual(window.pages[0].shape, saved.shape)
-        self.assertTrue(window._pages_are_canonical)
-        self.assertIs(window._analysis_reference_pages[0], saved)
+        self.assertIs(window.pages[0], raw)
+        self.assertFalse(window._pages_are_canonical)
+        self.assertIs(window._analysis_reference_pages[0], current_template)
         mapped_box = window.preset.fields[0].boxes[0]
-        # Detected boxes determine the page transform, while the validated
-        # preset geometry stays in its original canonical coordinate system.
+        # The remapped preset carries the saved semantics in current-PDF geometry.
         self.assertEqual(
             (mapped_box.x, mapped_box.y, mapped_box.w, mapped_box.h),
-            (9, 9, 15, 14),
+            (12, 14, 20, 20),
         )
         mapped_pending = window.pending_boxes[0]
         self.assertEqual(
             (mapped_pending.x, mapped_pending.y, mapped_pending.w, mapped_pending.h),
-            (3, 4, 9, 7),
+            (5, 6, 10, 10),
         )
         remap.assert_called_once()
         self.assertEqual(generate_single.call_args.args[0], "first.pdf")
@@ -214,6 +214,231 @@ class RedetectionProgressTests(unittest.TestCase):
         aligner.assert_not_called()
         load_pages.assert_not_called()
         window._estimate_page_fine_angles.assert_not_called()
+
+    def test_preset_load_reuses_nearby_boxes_and_drops_unmatched_detection(self):
+        raw = np.full((100, 140), 245, np.uint8)
+        saved = np.full_like(raw, 250)
+        current_template = np.full_like(raw, 255)
+        detected = [
+            Box(0, 10, 20, 16, 16),
+            Box(0, 40, 20, 16, 16),
+            Box(0, 73, 41, 58, 31),
+            Box(0, 105, 70, 16, 16),
+        ]
+        previous_preset = TemplatePreset(
+            page_count=1,
+            fine_angle=0.0,
+            rot_code=-1,
+            page_fine_angles=[0.6],
+            fields=[Field(name="자동", boxes=detected)],
+        )
+        remapped_config = TemplatePreset(
+            page_count=1,
+            fine_angle=0.0,
+            rot_code=-1,
+            page_fine_angles=[0.6],
+            fields=[
+                Field(
+                    name="만족도",
+                    boxes=[copy.copy(detected[0]), copy.copy(detected[1])],
+                    value_map=["좋음", "나쁨"],
+                ),
+                Field(
+                    name="표 선택",
+                    boxes=[Box(0, 70, 40, 60, 30)],
+                    value_map=["해당"],
+                ),
+            ],
+        )
+        box_key = MainWindow._box_geometry_key
+        remap_result = SimpleNamespace(
+            accepted=True,
+            compatible=True,
+            config=remapped_config,
+            auxiliary_boxes=[],
+            matched_boxes=2,
+            expected_boxes=2,
+            page_transforms={0: np.eye(2, 3, dtype=np.float64)},
+            matched_box_keys=frozenset(box_key(box) for box in detected[:2]),
+            supplied_box_keys=frozenset(box_key(box) for box in detected),
+        )
+        window = SimpleNamespace(
+            file_paths=["survey.pdf"],
+            pages=[raw],
+            _pages_are_canonical=False,
+            preset=previous_preset,
+            pending_boxes=[],
+            selected_boxes=[],
+            is_a_view=False,
+            _analysis_reference_pages=[],
+            _wrap_progress=MainWindow._wrap_progress,
+            _sync_rotation_index=Mock(),
+            _sync_fine_angle_spin=Mock(),
+            _sync_reverse_numbering_state=Mock(),
+            _load_template_images=Mock(return_value=[saved]),
+            _filter_boxes_outside_page_count=Mock(),
+            _estimate_page_fine_angles=Mock(),
+            _update_page_size=Mock(),
+            update_canvas=Mock(),
+            _sync_view_toggle_text=Mock(),
+        )
+        data = {
+            "page_count": 1,
+            "fine_angle": 0.0,
+            "rot_code": -1,
+            "page_fine_angles": [-0.4],
+            "fields": [
+                {
+                    "name": "만족도",
+                    "boxes": [
+                        {"page_idx": 0, "x": 8, "y": 18, "w": 16, "h": 16},
+                        {"page_idx": 0, "x": 38, "y": 18, "w": 16, "h": 16},
+                    ],
+                    "value_map": ["좋음", "나쁨"],
+                }
+            ],
+            "pending_boxes": [],
+        }
+
+        with (
+            patch(
+                "src.ui.generate_ui_templates",
+                return_value={0: current_template},
+            ),
+            patch(
+                "src.ui.remap_preset_to_detected_layout",
+                return_value=remap_result,
+            ) as remap,
+        ):
+            MainWindow._apply_loaded_preset(window, data, preset_name="saved")
+
+        supplied = remap.call_args.kwargs["detected_boxes_by_page"][0]
+        self.assertEqual(
+            [box_key(box) for box in supplied],
+            [box_key(box) for box in detected],
+        )
+        self.assertEqual(window.preset.page_fine_angles, [0.6])
+        self.assertEqual(window.preset.fields[0].value_map, ["좋음", "나쁨"])
+        self.assertEqual(
+            [box_key(box) for box in window.preset.fields[0].boxes],
+            [box_key(box) for box in detected[:2]],
+        )
+        self.assertEqual(
+            box_key(window.preset.fields[1].boxes[0]),
+            box_key(detected[2]),
+        )
+        self.assertEqual(window.pending_boxes, [])
+        self.assertIs(window.pages[0], raw)
+        self.assertIs(window._analysis_reference_pages[0], current_template)
+
+    def test_loaded_preset_is_clean_after_unmatched_detection_is_dropped(self):
+        window = SimpleNamespace(
+            preset_dir=Path("presets"),
+            file_paths=[],
+            current_preset_name=None,
+            _apply_loaded_preset=Mock(),
+        )
+        with (
+            patch("builtins.open", mock_open(read_data="{}")),
+            patch.object(
+                MainWindow,
+                "_confirm_save_or_discard_changes",
+                return_value=True,
+            ),
+            patch.object(MainWindow, "_capture_document_state", return_value={}),
+            patch.object(MainWindow, "_set_preset_dirty") as set_dirty,
+        ):
+            loaded = MainWindow._load_preset_by_name(window, "saved")
+
+        self.assertTrue(loaded)
+        self.assertEqual(window.current_preset_name, "saved")
+        set_dirty.assert_called_once_with(window, False)
+
+    def test_preset_load_retries_with_preset_sized_detection(self):
+        raw = np.full((100, 140), 245, np.uint8)
+        saved = np.full_like(raw, 250)
+        current_template = np.full_like(raw, 255)
+        detected = [Box(0, 10, 20, 16, 16), Box(0, 40, 20, 16, 16)]
+        previous_preset = TemplatePreset(
+            page_count=1,
+            page_fine_angles=[0.2],
+            fields=[Field(name="자동", boxes=detected)],
+        )
+        remapped_config = TemplatePreset(
+            page_count=1,
+            page_fine_angles=[0.2],
+            fields=[
+                Field(
+                    name="만족도",
+                    boxes=[copy.copy(box) for box in detected],
+                    value_map=["좋음", "나쁨"],
+                )
+            ],
+        )
+        rejected = SimpleNamespace(accepted=False, compatible=True)
+        recovered = SimpleNamespace(
+            accepted=True,
+            compatible=True,
+            config=remapped_config,
+            auxiliary_boxes=[],
+            matched_boxes=2,
+            expected_boxes=2,
+            matched_box_keys=frozenset(
+                MainWindow._box_geometry_key(box) for box in detected
+            ),
+            supplied_box_keys=frozenset(),
+        )
+        window = SimpleNamespace(
+            file_paths=["survey.pdf"],
+            pages=[raw],
+            _pages_are_canonical=False,
+            preset=previous_preset,
+            pending_boxes=[],
+            selected_boxes=[],
+            is_a_view=False,
+            _analysis_reference_pages=[],
+            _wrap_progress=MainWindow._wrap_progress,
+            _sync_rotation_index=Mock(),
+            _sync_fine_angle_spin=Mock(),
+            _sync_reverse_numbering_state=Mock(),
+            _load_template_images=Mock(return_value=[saved]),
+            _filter_boxes_outside_page_count=Mock(),
+            _estimate_page_fine_angles=Mock(),
+            _update_page_size=Mock(),
+            update_canvas=Mock(),
+            _sync_view_toggle_text=Mock(),
+        )
+        data = {
+            "page_count": 1,
+            "fine_angle": 0.0,
+            "rot_code": -1,
+            "fields": [
+                Field(
+                    name="만족도",
+                    boxes=[Box(0, 8, 18, 16, 16), Box(0, 38, 18, 16, 16)],
+                    value_map=["좋음", "나쁨"],
+                ).to_dict()
+            ],
+            "pending_boxes": [],
+        }
+
+        with (
+            patch(
+                "src.ui.generate_ui_templates",
+                return_value={0: current_template},
+            ),
+            patch(
+                "src.ui.remap_preset_to_detected_layout",
+                side_effect=[rejected, recovered],
+            ) as remap,
+        ):
+            MainWindow._apply_loaded_preset(window, data, preset_name="saved")
+
+        self.assertEqual(remap.call_count, 2)
+        self.assertIsNotNone(remap.call_args_list[0].kwargs["detected_boxes_by_page"])
+        self.assertNotIn("detected_boxes_by_page", remap.call_args_list[1].kwargs)
+        self.assertEqual(window.preset.fields[0].value_map, ["좋음", "나쁨"])
+        self.assertIs(window.pages[0], raw)
 
     def test_preset_load_rejects_a_different_form_and_restores_editor_state(self):
         raw = np.full((60, 40), 245, np.uint8)

@@ -1,4 +1,42 @@
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
+
+
+RESERVED_FIELD_NAMES = frozenset({"파일명", "페이지"})
+
+
+def validate_field_names(names: Iterable[str]) -> list[str]:
+    """Return trimmed field names or raise for names that would corrupt output."""
+    cleaned = ["" if name is None else str(name).strip() for name in names]
+    if any(not name for name in cleaned):
+        raise ValueError("모든 문항에 이름을 입력해주세요.")
+
+    reserved_keys = {name.casefold() for name in RESERVED_FIELD_NAMES}
+    reserved = [name for name in cleaned if name.casefold() in reserved_keys]
+    hidden = [name for name in cleaned if name.startswith("__")]
+    if reserved or hidden:
+        invalid = list(dict.fromkeys([*reserved, *hidden]))
+        raise ValueError(
+            "결과 파일에서 사용하는 이름은 문항 이름으로 쓸 수 없습니다: "
+            + ", ".join(invalid)
+        )
+
+    first_by_key: dict[str, str] = {}
+    duplicates: list[str] = []
+    for name in cleaned:
+        key = name.casefold()
+        if key in first_by_key:
+            original = first_by_key[key]
+            if original not in duplicates:
+                duplicates.append(original)
+        else:
+            first_by_key[key] = name
+    if duplicates:
+        raise ValueError(
+            "문항 이름은 서로 달라야 합니다. 중복된 이름: "
+            + ", ".join(duplicates)
+        )
+    return cleaned
 
 
 @dataclass
