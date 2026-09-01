@@ -931,7 +931,7 @@ class TemplateAlignmentTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertTrue(result.compatible)
 
-    def test_preset_layout_rejects_locally_shifted_table(self):
+    def test_preset_layout_matches_a_locally_shifted_table_by_topology(self):
         source = np.full((500, 400), 255, np.uint8)
         target = np.full_like(source, 255)
         checkbox_positions = [
@@ -962,6 +962,62 @@ class TemplateAlignmentTests(unittest.TestCase):
                 0,
                 2,
             )
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(
+                    name="header",
+                    boxes=[Box(0, x, y, 20, 20) for x, y in checkbox_positions],
+                ),
+                Field(name="table", boxes=table_boxes),
+            ],
+        )
+
+        result = remap_preset_to_detected_layout(
+            config,
+            {0: target},
+            source_templates={0: source},
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertTrue(result.compatible)
+        self.assertEqual(result.matched_boxes, 15)
+        for mapped, source_box in zip(result.config.fields[1].boxes, table_boxes):
+            self.assertAlmostEqual(mapped.x, source_box.x + 28, delta=4)
+            self.assertAlmostEqual(mapped.y, source_box.y, delta=3)
+
+    def test_preset_layout_rejects_shifted_table_with_incompatible_topology(self):
+        source = np.full((500, 400), 255, np.uint8)
+        target = np.full_like(source, 255)
+        checkbox_positions = [
+            (50 + column * 70, 60 + row * 70)
+            for row in range(2)
+            for column in range(3)
+        ]
+        table_boxes = [
+            Box(0, 100 + column * 70, 250 + row * 55, 70, 55)
+            for row in range(3)
+            for column in range(3)
+        ]
+        for image in (source, target):
+            for x, y in checkbox_positions:
+                cv2.rectangle(image, (x, y), (x + 19, y + 19), 0, 2)
+        for index, box in enumerate(table_boxes):
+            cv2.rectangle(
+                source,
+                (box.x, box.y),
+                (box.x + box.w - 1, box.y + box.h - 1),
+                0,
+                2,
+            )
+            if index % 3 != 1:
+                cv2.rectangle(
+                    target,
+                    (box.x + 28, box.y),
+                    (box.x + box.w + 27, box.y + box.h - 1),
+                    0,
+                    2,
+                )
         config = TemplatePreset(
             page_count=1,
             fields=[

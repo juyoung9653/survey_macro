@@ -1,10 +1,17 @@
+import json
 import os
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
-from src.processor import generate_ui_templates, generate_ui_templates_multi
+from src.models import Box, Field, TemplatePreset
+from src.processor import (
+    generate_ui_templates,
+    generate_ui_templates_multi,
+    remap_preset_to_detected_layout,
+)
 from src.vision import (
     auto_detect_checkboxes,
     estimate_deskew_angle,
@@ -15,6 +22,12 @@ from src.vision import (
 _RUN_CORPUS_TESTS = os.getenv("RUN_SCAN_CORPUS_TESTS") == "1"
 _SCAN_DIR = Path(
     os.getenv("SURVEY_SCAN_CORPUS", r"C:\Users\Public\scan")
+)
+_PRESET_DIR = Path(
+    os.getenv(
+        "SURVEY_PRESET_DIR",
+        str(Path(os.getenv("LOCALAPPDATA", "")) / "CheckFinder" / "presets"),
+    )
 )
 
 _ONE_PAGE_PDFS = (
@@ -173,6 +186,119 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                         page_fine_angles=angles,
                     )
                     self._assert_layout(templates, page_count)
+
+    def test_one_page_pdfs_accept_default_preset_with_current_box_geometry(self):
+        preset_path = _PRESET_DIR / "기본.json"
+        template_path = _PRESET_DIR / "기본_tpl_p0.png"
+        if not preset_path.is_file() or not template_path.is_file():
+            raise AssertionError(
+                f"default preset fixture is missing: {_PRESET_DIR}"
+            )
+
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+        config = TemplatePreset(
+            page_count=int(data.get("page_count", 1)),
+            fine_angle=float(data.get("fine_angle", 0.0)),
+            rot_code=int(data.get("rot_code", -1)),
+            reverse_numbering=bool(data.get("reverse_numbering", True)),
+            template_dilate_pct=float(data.get("template_dilate_pct", 0.3)),
+            fields=[Field.from_dict(field) for field in data.get("fields", [])],
+            page_fine_angles=[
+                float(value) for value in data.get("page_fine_angles", [])
+            ],
+        )
+        source_template = cv2.imdecode(
+            np.frombuffer(template_path.read_bytes(), np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertIsNotNone(source_template)
+
+        color_pdf_path = _SCAN_DIR / "색깔.pdf"
+        color_angles = []
+        color_detected = []
+        color_mapped_geometry = set()
+        for name in _ONE_PAGE_PDFS:
+            with self.subTest(pdf=name):
+                pdf_path = _SCAN_DIR / name
+                angles = self._page_angles(pdf_path, 1)
+                templates = generate_ui_templates(
+                    str(pdf_path),
+                    1,
+                    config.rot_code,
+                    config.fine_angle,
+                    page_fine_angles=angles,
+                )
+                detected = [
+                    Box(0, x, y, w, h)
+                    for x, y, w, h in auto_detect_checkboxes(templates[0])
+                ]
+
+                result = remap_preset_to_detected_layout(
+                    config,
+                    templates,
+                    source_templates={0: source_template},
+                    detected_boxes_by_page={0: detected},
+                )
+
+                self.assertTrue(result.accepted)
+                self.assertTrue(result.compatible)
+                self.assertEqual(result.matched_boxes, result.expected_boxes)
+                detected_geometry = {
+                    (box.page_idx, box.x, box.y, box.w, box.h)
+                    for box in detected
+                }
+                mapped_geometry = {
+                    (box.page_idx, box.x, box.y, box.w, box.h)
+                    for field in result.config.fields
+                    if not field.is_comment
+                    for box in field.boxes
+                }
+                self.assertTrue(mapped_geometry <= detected_geometry)
+                if pdf_path == color_pdf_path:
+                    color_angles = angles
+                    color_detected = detected
+                    color_mapped_geometry = mapped_geometry
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+
+        from src.ui import MainWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        try:
+            window.preset_dir = _PRESET_DIR
+            window.file_paths = [str(color_pdf_path)]
+            window.pages = load_pdf_pages(
+                str(color_pdf_path), page_indices=[0]
+            )
+            window.preset = TemplatePreset(page_count=1)
+            window._pages_are_canonical = False
+            window._reset_state_for_new_pdf()
+            window.preset.page_fine_angles = color_angles
+            window._update_page_size()
+            window.auto_detect(mark_dirty=False)
+            self.assertEqual(
+                sum(len(field.boxes) for field in window.preset.fields),
+                len(color_detected),
+            )
+
+            window._apply_loaded_preset(data, preset_name="기본")
+
+            self.assertEqual(
+                [field.name for field in window.preset.fields],
+                [field.name for field in config.fields],
+            )
+            gui_geometry = {
+                (box.page_idx, box.x, box.y, box.w, box.h)
+                for field in window.preset.fields
+                if not field.is_comment
+                for box in field.boxes
+            }
+            self.assertEqual(gui_geometry, color_mapped_geometry)
+        finally:
+            window.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

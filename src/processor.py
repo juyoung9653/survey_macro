@@ -1027,6 +1027,28 @@ def _config_checkbox_refs(
     ]
 
 
+def _config_framed_refs(
+    config: TemplatePreset,
+    page_idx: int,
+    source_template: np.ndarray,
+) -> list[tuple[int, int, Box]]:
+    """Return configured answer cells backed by visible frame edges."""
+    source_mask = _layout_line_mask(source_template)
+    refs = []
+    for field_idx, field in enumerate(config.fields):
+        if field.is_comment:
+            continue
+        for box_idx, box in enumerate(field.boxes):
+            if box.page_idx != page_idx or _is_checkbox_like(
+                box, source_template.shape
+            ):
+                continue
+            edge_scores = _box_frame_edge_scores(source_mask, box)
+            if sum(score >= 0.55 for score in edge_scores) >= 3:
+                refs.append((field_idx, box_idx, box))
+    return refs
+
+
 def _layout_line_mask(image: np.ndarray) -> np.ndarray:
     gray = image
     if gray.ndim == 3:
@@ -1080,62 +1102,6 @@ def _box_frame_edge_scores(mask: np.ndarray, box: Box) -> tuple[float, ...]:
         horizontal_score(y2),
         vertical_score(x1),
         vertical_score(x2),
-    )
-
-
-def _framed_layout_matches_transform(
-    config: TemplatePreset,
-    page_idx: int,
-    source_template: np.ndarray,
-    target_template: np.ndarray,
-    matrix: np.ndarray,
-) -> bool:
-    """Reject local table-layout changes hidden by matching header checkboxes."""
-    source_mask = _layout_line_mask(source_template)
-    target_mask = _layout_line_mask(target_template)
-    source_edge_threshold = 0.55
-    target_edge_threshold = 0.45
-    framed_box_count = 0
-    expected = [0, 0]
-    supported = [0, 0]
-
-    for field in config.fields:
-        if field.is_comment:
-            continue
-        for box in field.boxes:
-            if box.page_idx != page_idx or _is_checkbox_like(
-                box, source_template.shape
-            ):
-                continue
-            source_scores = _box_frame_edge_scores(source_mask, box)
-            strong_edges = [
-                score >= source_edge_threshold for score in source_scores
-            ]
-            if sum(strong_edges) < 3:
-                continue
-
-            framed_box_count += 1
-            projected = copy.copy(box)
-            _transform_box_in_place(projected, matrix, target_template.shape)
-            target_scores = _box_frame_edge_scores(target_mask, projected)
-            for edge_idx, source_is_strong in enumerate(strong_edges):
-                if not source_is_strong:
-                    continue
-                orientation = 0 if edge_idx < 2 else 1
-                expected[orientation] += 1
-                if target_scores[edge_idx] >= target_edge_threshold:
-                    supported[orientation] += 1
-
-    if framed_box_count < 3:
-        return True
-
-    expected_total = sum(expected)
-    supported_total = sum(supported)
-    if expected_total <= 0 or supported_total / expected_total < 0.72:
-        return False
-    return all(
-        count <= 0 or supported[index] / count >= 0.6
-        for index, count in enumerate(expected)
     )
 
 
@@ -1230,7 +1196,7 @@ def _fit_checkbox_anchor_transform(
     return np.asarray(matrix, dtype=np.float64)
 
 
-def _group_checkbox_ref_rows(
+def _group_layout_ref_rows(
     refs: list[tuple[int, int, Box]], tolerance: float
 ) -> list[list[tuple[int, int, Box]]]:
     rows: list[list[tuple[int, int, Box]]] = []
@@ -1252,7 +1218,7 @@ def _group_checkbox_ref_rows(
     return rows
 
 
-def _match_checkbox_row_boxes(
+def _match_layout_row_boxes(
     expected_row: list[tuple[int, int, Box]],
     detected_row: list[Box],
     max_x_distance: float,
@@ -1330,14 +1296,14 @@ def _match_checkbox_row_boxes(
     return best[2], best[1]
 
 
-def _match_checkbox_anchor_rows(
+def _match_layout_anchor_rows(
     expected_refs: list[tuple[int, int, Box]],
     detected: list[Box],
     target_shape: tuple[int, ...],
     *,
     tight: bool = False,
 ) -> tuple[list[tuple[tuple[int, int, Box], Box]], int, int]:
-    """Match checkbox rows by order, then boxes within each matched row."""
+    """Match layout rows by order, then boxes within each matched row."""
     if not expected_refs or not detected:
         return [], 0, 0
 
@@ -1345,7 +1311,7 @@ def _match_checkbox_anchor_rows(
     median_w = float(np.median([ref[2].w for ref in expected_refs]))
     median_h = float(np.median([ref[2].h for ref in expected_refs]))
     row_tolerance = max(4.0, median_h * 0.6)
-    expected_rows = _group_checkbox_ref_rows(expected_refs, row_tolerance)
+    expected_rows = _group_layout_ref_rows(expected_refs, row_tolerance)
     detected_rows = _group_checkbox_rows(detected, row_tolerance)
     if tight:
         max_y_distance = max(median_h * 2.0, target_h * 0.012)
@@ -1369,7 +1335,7 @@ def _match_checkbox_anchor_rows(
             y_distance = abs(detected_y - expected_y)
             if y_distance > max_y_distance:
                 continue
-            matches, box_cost = _match_checkbox_row_boxes(
+            matches, box_cost = _match_layout_row_boxes(
                 expected_row, detected_row, max_x_distance
             )
             minimum_matches = max(1, int(np.ceil(len(expected_row) * 0.5)))
@@ -1473,6 +1439,88 @@ def _detect_preset_checkbox_anchors(
     ]
 
 
+def _layout_boxes_share_region(first: Box, second: Box) -> bool:
+    left = max(first.x, second.x)
+    top = max(first.y, second.y)
+    right = min(first.x + first.w, second.x + second.w)
+    bottom = min(first.y + first.h, second.y + second.h)
+    overlap = max(0, right - left) * max(0, bottom - top)
+    smaller_area = min(first.w * first.h, second.w * second.h)
+    return smaller_area > 0 and overlap / smaller_area >= 0.8
+
+
+def _layout_box_size_is_plausible(expected: Box, detected: Box) -> bool:
+    width_ratio = max(expected.w, detected.w) / max(
+        1, min(expected.w, detected.w)
+    )
+    height_ratio = max(expected.h, detected.h) / max(
+        1, min(expected.h, detected.h)
+    )
+    return width_ratio <= 1.6 and height_ratio <= 1.6
+
+
+def _detect_preset_framed_anchors(
+    template: np.ndarray,
+    expected_refs: list[tuple[int, int, Box]],
+    page_idx: int,
+) -> list[Box]:
+    """Detect repeated framed cells using sizes supplied by the preset itself."""
+    if not expected_refs:
+        return []
+
+    expected_boxes = [ref[2] for ref in expected_refs]
+    widths = [box.w for box in expected_boxes]
+    heights = [box.h for box in expected_boxes]
+    detection_image = (
+        cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+        if template.ndim == 2
+        else template
+    )
+    detected = [
+        Box(page_idx=page_idx, x=x, y=y, w=w, h=h)
+        for x, y, w, h in auto_detect_checkboxes(
+            detection_image,
+            min_w=max(8, round(min(widths) * 0.55)),
+            max_w=max(9, round(max(widths) * 1.8)),
+            min_h=max(8, round(min(heights) * 0.55)),
+            max_h=max(9, round(max(heights) * 1.8)),
+        )
+    ]
+    return [
+        box
+        for box in detected
+        if any(
+            _layout_box_size_is_plausible(expected, box)
+            for expected in expected_boxes
+        )
+    ]
+
+
+def _merge_layout_candidates(*groups: list[Box]) -> list[Box]:
+    merged: list[Box] = []
+    for group in groups:
+        for candidate in group:
+            if any(
+                _layout_boxes_share_region(candidate, existing)
+                for existing in merged
+            ):
+                continue
+            merged.append(candidate)
+    return merged
+
+
+def _layout_matches_have_plausible_geometry(
+    matches: list[tuple[tuple[int, int, Box], Box]],
+) -> bool:
+    if not matches:
+        return False
+    plausible = sum(
+        _layout_box_size_is_plausible(expected_ref[2], detected)
+        for expected_ref, detected in matches
+    )
+    return plausible / len(matches) >= 0.8
+
+
 def remap_preset_to_detected_layout(
     config: TemplatePreset,
     templates: dict[int, np.ndarray],
@@ -1480,15 +1528,15 @@ def remap_preset_to_detected_layout(
     auxiliary_boxes: list[Box] | None = None,
     detected_boxes_by_page: dict[int, list[Box]] | None = None,
 ) -> PresetLayoutRemapResult:
-    """Move a saved preset into the current document's detected box coordinates.
+    """Move a saved preset into the current document's detected layout.
 
-    A saved template can have a different render DPI from the current PDF. Match
-    ordered checkbox rows after a coarse page-size scale, fit a robust transform,
-    and repeat the match around that transform. A small number of obscured frames
-    may be interpolated, but broad row coverage and plausible geometry are still
-    required. When current auto-detected boxes are supplied, matched checkbox
-    geometry is reused exactly; comments and auxiliary boxes follow the same
-    validated transform.
+    Small checkbox rows establish a conservative page transform. Repeated framed
+    answer cells are then matched independently by reading order, so a local
+    table-width change does not invalidate an otherwise identical form. Row and
+    column counts come from the preset at runtime; inserted target rows and a few
+    missing frames are handled by the ordered matcher. Matched cells reuse exact
+    detector geometry while comments and auxiliary boxes follow the validated
+    page transform.
     """
     original_config = copy.deepcopy(config)
     original_auxiliary = copy.deepcopy(auxiliary_boxes or [])
@@ -1506,19 +1554,29 @@ def remap_preset_to_detected_layout(
             original_config, original_auxiliary, {}, 0, 0, False
         )
 
-    source_refs_by_page = {
+    source_checkbox_refs_by_page = {
         page_idx: _config_checkbox_refs(
             config, page_idx, source_templates[page_idx].shape
         )
         for page_idx in layout_pages
     }
-    source_refs_by_page = {
-        page_idx: refs
-        for page_idx, refs in source_refs_by_page.items()
-        if refs
+    source_framed_refs_by_page = {
+        page_idx: _config_framed_refs(
+            config, page_idx, source_templates[page_idx]
+        )
+        for page_idx in layout_pages
     }
-    required_pages = set(source_refs_by_page)
-    expected_total = sum(len(refs) for refs in source_refs_by_page.values())
+    required_pages = {
+        page_idx
+        for page_idx in layout_pages
+        if source_checkbox_refs_by_page[page_idx]
+        or source_framed_refs_by_page[page_idx]
+    }
+    expected_total = sum(
+        len(source_checkbox_refs_by_page[page_idx])
+        + len(source_framed_refs_by_page[page_idx])
+        for page_idx in required_pages
+    )
     if not required_pages:
         return PresetLayoutRemapResult(
             original_config, original_auxiliary, {}, 0, expected_total, False
@@ -1557,45 +1615,104 @@ def remap_preset_to_detected_layout(
     compatible = True
     for page_idx in required_pages:
         source_shape = source_shapes[page_idx]
-        source_refs = source_refs_by_page[page_idx]
-        scaled_refs = _config_checkbox_refs(
-            scaled_config, page_idx, templates[page_idx].shape
-        )
+        source_checkbox_refs = source_checkbox_refs_by_page[page_idx]
+        source_framed_refs = source_framed_refs_by_page[page_idx]
+        scaled_checkbox_refs = [
+            (
+                field_idx,
+                box_idx,
+                scaled_config.fields[field_idx].boxes[box_idx],
+            )
+            for field_idx, box_idx, _box in source_checkbox_refs
+        ]
+        scaled_framed_refs = [
+            (
+                field_idx,
+                box_idx,
+                scaled_config.fields[field_idx].boxes[box_idx],
+            )
+            for field_idx, box_idx, _box in source_framed_refs
+        ]
         supplied_detected = (
             detected_boxes_by_page.get(page_idx)
             if detected_boxes_by_page is not None
             else None
         )
-        if supplied_detected is None:
-            detected = _detect_preset_checkbox_anchors(
-                templates[page_idx], scaled_refs, page_idx
-            )
-        else:
-            valid_supplied = [
-                copy.copy(box)
-                for box in supplied_detected
-                if box.page_idx == page_idx
-                and box.w > 0
-                and box.h > 0
-            ]
+        valid_supplied = [
+            copy.copy(box)
+            for box in supplied_detected or []
+            if box.page_idx == page_idx and box.w > 0 and box.h > 0
+        ]
+        if valid_supplied:
             supplied_box_keys.update(
                 _checkbox_box_key(box) for box in valid_supplied
             )
-            detected = [
+
+        detected_checkboxes = _merge_layout_candidates(
+            [
                 box
                 for box in valid_supplied
                 if _is_checkbox_like(box, templates[page_idx].shape)
-            ]
+            ],
+            _detect_preset_checkbox_anchors(
+                templates[page_idx], scaled_checkbox_refs, page_idx
+            ),
+        )
+        supplied_framed = [
+            box
+            for box in valid_supplied
+            if not _is_checkbox_like(box, templates[page_idx].shape)
+            and any(
+                _layout_box_size_is_plausible(ref[2], box)
+                for ref in scaled_framed_refs
+            )
+        ]
+        detected_framed = _merge_layout_candidates(
+            supplied_framed,
+            _detect_preset_framed_anchors(
+                templates[page_idx], scaled_framed_refs, page_idx
+            ),
+        )
+
         initial_matches, initial_row_matches, expected_row_count = (
-            _match_checkbox_anchor_rows(
-                scaled_refs, detected, templates[page_idx].shape
+            _match_layout_anchor_rows(
+                scaled_checkbox_refs,
+                detected_checkboxes,
+                templates[page_idx].shape,
             )
         )
-        initial_coverage = len(initial_matches) / max(1, len(source_refs))
-        initial_row_coverage = initial_row_matches / max(1, expected_row_count)
-        page_compatible = (
-            initial_coverage >= 0.45 and initial_row_coverage >= 0.5
-        )
+        if source_checkbox_refs:
+            checkbox_initial_coverage = len(initial_matches) / len(
+                source_checkbox_refs
+            )
+            checkbox_initial_row_coverage = initial_row_matches / max(
+                1, expected_row_count
+            )
+            page_compatible = (
+                checkbox_initial_coverage >= 0.45
+                and checkbox_initial_row_coverage >= 0.5
+            )
+        else:
+            page_compatible = True
+
+        if len(initial_matches) < 3 and scaled_framed_refs:
+            initial_matches, initial_row_matches, expected_row_count = (
+                _match_layout_anchor_rows(
+                    scaled_framed_refs,
+                    detected_framed,
+                    templates[page_idx].shape,
+                )
+            )
+            framed_initial_coverage = len(initial_matches) / max(
+                1, len(source_framed_refs)
+            )
+            framed_initial_row_coverage = initial_row_matches / max(
+                1, expected_row_count
+            )
+            page_compatible = page_compatible and (
+                framed_initial_coverage >= 0.45
+                and framed_initial_row_coverage >= 0.5
+            )
         compatible = compatible and page_compatible
         if len(initial_matches) < 3:
             continue
@@ -1614,30 +1731,55 @@ def remap_preset_to_detected_layout(
         if initial_matrix is None:
             continue
 
-        projected_refs = []
-        for field_idx, box_idx, source_box in source_refs:
+        projected_checkbox_refs = []
+        for field_idx, box_idx, source_box in source_checkbox_refs:
             projected = copy.copy(source_box)
             _transform_box_in_place(
                 projected, initial_matrix, templates[page_idx].shape
             )
-            projected_refs.append((field_idx, box_idx, projected))
-        refined_matches, matched_rows, expected_row_count = (
-            _match_checkbox_anchor_rows(
-                projected_refs,
-                detected,
+            projected_checkbox_refs.append((field_idx, box_idx, projected))
+        checkbox_matches, matched_checkbox_rows, checkbox_row_count = (
+            _match_layout_anchor_rows(
+                projected_checkbox_refs,
+                detected_checkboxes,
                 templates[page_idx].shape,
                 tight=True,
             )
         )
-        page_matched = len(refined_matches)
+
+        projected_framed_refs = []
+        for field_idx, box_idx, source_box in source_framed_refs:
+            projected = copy.copy(source_box)
+            _transform_box_in_place(
+                projected, initial_matrix, templates[page_idx].shape
+            )
+            projected_framed_refs.append((field_idx, box_idx, projected))
+        framed_matches, matched_framed_rows, framed_row_count = (
+            _match_layout_anchor_rows(
+                projected_framed_refs,
+                detected_framed,
+                templates[page_idx].shape,
+                tight=True,
+            )
+        )
+
+        page_matched = len(checkbox_matches) + len(framed_matches)
         matched_total += page_matched
-        coverage = page_matched / max(1, len(source_refs))
-        row_coverage = matched_rows / max(1, expected_row_count)
+        checkbox_coverage = len(checkbox_matches) / max(
+            1, len(source_checkbox_refs)
+        )
+        checkbox_row_coverage = matched_checkbox_rows / max(
+            1, checkbox_row_count
+        )
+        framed_coverage = len(framed_matches) / max(1, len(source_framed_refs))
+        framed_row_coverage = matched_framed_rows / max(1, framed_row_count)
+
+        transform_matches = checkbox_matches or framed_matches
         matched_source = [
             config.fields[field_idx].boxes[box_idx]
-            for (field_idx, box_idx, _projected), _target in refined_matches
+            for (field_idx, box_idx, _projected), _target in transform_matches
         ]
-        matched_target = [target for _source, target in refined_matches]
+        matched_target = [target for _source, target in transform_matches]
         matrix = _fit_checkbox_anchor_transform(
             matched_source,
             matched_target,
@@ -1646,39 +1788,53 @@ def remap_preset_to_detected_layout(
         )
         if matrix is None:
             continue
-        if not _framed_layout_matches_transform(
-            config,
-            page_idx,
-            source_templates[page_idx],
-            templates[page_idx],
-            matrix,
-        ):
-            compatible = False
-            continue
 
-        all_y = np.asarray(
-            [box.y + box.h / 2 for _field_idx, _box_idx, box in source_refs],
-            dtype=np.float64,
-        )
-        matched_y = np.asarray(
-            [box.y + box.h / 2 for box in matched_source], dtype=np.float64
-        )
+        if source_checkbox_refs:
+            all_y = np.asarray(
+                [
+                    box.y + box.h / 2
+                    for _field_idx, _box_idx, box in source_checkbox_refs
+                ],
+                dtype=np.float64,
+            )
+            matched_checkbox_source = [
+                config.fields[field_idx].boxes[box_idx]
+                for (field_idx, box_idx, _projected), _target in checkbox_matches
+            ]
+            matched_y = np.asarray(
+                [box.y + box.h / 2 for box in matched_checkbox_source],
+                dtype=np.float64,
+            )
+        else:
+            all_y = np.empty(0, dtype=np.float64)
+            matched_y = np.empty(0, dtype=np.float64)
         if len(all_y) <= 1 or float(np.ptp(all_y)) <= 0:
             vertical_span = 1.0
         else:
             vertical_span = float(np.ptp(matched_y) / np.ptp(all_y))
-        page_accepted = (
-            coverage >= 0.85
-            and row_coverage >= 0.8
+        checkbox_layout_accepted = not source_checkbox_refs or (
+            checkbox_coverage >= 0.85
+            and checkbox_row_coverage >= 0.8
             and vertical_span >= 0.7
         )
+        framed_layout_accepted = not source_framed_refs or (
+            framed_coverage >= 0.8
+            and framed_row_coverage >= 0.8
+            and _layout_matches_have_plausible_geometry(framed_matches)
+        )
+        page_accepted = checkbox_layout_accepted and framed_layout_accepted
         if not page_accepted:
+            if source_framed_refs and not framed_layout_accepted:
+                compatible = False
             continue
 
         page_transforms[page_idx] = matrix
         snapped_refs_by_page[page_idx] = [
             (field_idx, box_idx, target)
-            for (field_idx, box_idx, _projected), target in refined_matches
+            for (field_idx, box_idx, _projected), target in [
+                *checkbox_matches,
+                *framed_matches,
+            ]
         ]
 
     if set(page_transforms) != required_pages:
