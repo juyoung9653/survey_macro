@@ -685,12 +685,14 @@ class _AnalysisWorker(QObject):
         template_pages: list[np.ndarray],
         preset: TemplatePreset,
         template_pages_preprocessed: bool = False,
+        single_sample_template_pages: list[np.ndarray] | None = None,
     ):
         super().__init__()
         self.file_paths = file_paths
         self.template_pages = template_pages
         self.preset = preset
         self.template_pages_preprocessed = template_pages_preprocessed
+        self.single_sample_template_pages = single_sample_template_pages or []
 
     @pyqtSlot()
     def run(self):
@@ -701,6 +703,7 @@ class _AnalysisWorker(QObject):
                 self.preset,
                 progress_cb=self.progress.emit,
                 template_pages_preprocessed=self.template_pages_preprocessed,
+                single_sample_template_pages=self.single_sample_template_pages,
             )
             self.finished.emit(bool(success), "")
         except Exception as exc:
@@ -719,6 +722,7 @@ class MainWindow(QMainWindow):
         self.pages = []
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        self._single_sample_template_pages = []
         self._inferred_display_templates = {}
         self._analysis_validation_error = ""
         self.file_paths = []
@@ -1109,6 +1113,7 @@ class MainWindow(QMainWindow):
         self.current_preset_name = None
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        self._single_sample_template_pages = []
         self._inferred_display_templates = {}
         self._analysis_validation_error = ""
         self.is_a_view = False
@@ -1125,6 +1130,9 @@ class MainWindow(QMainWindow):
             ),
             "analysis_reference_pages": list(
                 getattr(self, "_analysis_reference_pages", [])
+            ),
+            "single_sample_template_pages": list(
+                getattr(self, "_single_sample_template_pages", [])
             ),
             "inferred_display_templates": dict(
                 getattr(self, "_inferred_display_templates", {})
@@ -1147,6 +1155,9 @@ class MainWindow(QMainWindow):
         self.pages = snapshot["pages"]
         self._pages_are_canonical = snapshot["pages_are_canonical"]
         self._analysis_reference_pages = snapshot["analysis_reference_pages"]
+        self._single_sample_template_pages = list(
+            snapshot.get("single_sample_template_pages", [])
+        )
         self._inferred_display_templates = dict(
             snapshot.get("inferred_display_templates", {})
         )
@@ -1684,6 +1695,47 @@ class MainWindow(QMainWindow):
             self.preset.fine_angle_for_page(page_idx),
         )
 
+    @staticmethod
+    def _build_single_sample_template_pages(
+        saved_templates: list[np.ndarray],
+        current_templates: dict[int, np.ndarray],
+        page_transforms: dict[int, np.ndarray],
+        page_count: int,
+    ) -> list[np.ndarray]:
+        """Warp clean preset pages into the current checkbox coordinate system."""
+        if len(saved_templates) < page_count:
+            return []
+
+        transformed = []
+        for page_idx in range(page_count):
+            source = saved_templates[page_idx]
+            target = current_templates.get(page_idx)
+            matrix = page_transforms.get(page_idx)
+            if (
+                not isinstance(source, np.ndarray)
+                or source.size == 0
+                or not isinstance(target, np.ndarray)
+                or target.size == 0
+                or matrix is None
+            ):
+                return []
+            matrix = np.asarray(matrix, dtype=np.float64)
+            if matrix.shape != (2, 3):
+                return []
+            target_h, target_w = target.shape[:2]
+            border_value = (255, 255, 255) if source.ndim == 3 else 255
+            transformed.append(
+                cv2.warpAffine(
+                    source,
+                    matrix,
+                    (target_w, target_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=border_value,
+                )
+            )
+        return transformed
+
     def _clear_inferred_display_templates(self, error_message: str = ""):
         """Clear the display-only template without changing analysis pages."""
         self._inferred_display_templates = {}
@@ -1770,6 +1822,7 @@ class MainWindow(QMainWindow):
         self.pages = raw_pages
         self._pages_are_canonical = False
         self._analysis_reference_pages = []
+        self._single_sample_template_pages = []
         MainWindow._clear_inferred_display_templates(self)
         if len(raw_pages) < self.preset.page_count:
             self.preset.page_count = len(raw_pages)
@@ -1805,6 +1858,9 @@ class MainWindow(QMainWindow):
         )
         previous_analysis_reference_pages = list(
             getattr(self, "_analysis_reference_pages", [])
+        )
+        previous_single_sample_template_pages = list(
+            getattr(self, "_single_sample_template_pages", [])
         )
         previous_inferred_display_templates = dict(
             getattr(self, "_inferred_display_templates", {})
@@ -1867,6 +1923,7 @@ class MainWindow(QMainWindow):
         self.selected_boxes.clear()
         self._selection_anchor = None
         self._analysis_reference_pages = []
+        self._single_sample_template_pages = []
         self._inferred_display_templates = {}
         self._analysis_validation_error = ""
         self._sync_rotation_index()
@@ -1961,6 +2018,9 @@ class MainWindow(QMainWindow):
                 self.pages = previous_pages
                 self._pages_are_canonical = previous_pages_are_canonical
                 self._analysis_reference_pages = previous_analysis_reference_pages
+                self._single_sample_template_pages = (
+                    previous_single_sample_template_pages
+                )
                 self._inferred_display_templates = (
                     previous_inferred_display_templates
                 )
@@ -1999,6 +2059,14 @@ class MainWindow(QMainWindow):
                 self._analysis_reference_pages = [
                     current_templates[i] for i in range(self.preset.page_count)
                 ]
+                self._single_sample_template_pages = (
+                    MainWindow._build_single_sample_template_pages(
+                        saved_templates,
+                        current_templates,
+                        getattr(remap, "page_transforms", {}),
+                        self.preset.page_count,
+                    )
+                )
                 MainWindow._set_inferred_display_templates(
                     self, current_templates
                 )
@@ -2035,12 +2103,16 @@ class MainWindow(QMainWindow):
                 self._analysis_reference_pages = list(
                     saved_templates[: self.preset.page_count]
                 )
+                self._single_sample_template_pages = list(
+                    saved_templates[: self.preset.page_count]
+                )
                 MainWindow._clear_inferred_display_templates(self)
                 alignment_message = "체크박스 매칭 불완전: 기존 템플릿 정렬 사용"
             else:
                 self.pages = raw_pages
                 self._pages_are_canonical = False
                 self._analysis_reference_pages = []
+                self._single_sample_template_pages = []
                 MainWindow._clear_inferred_display_templates(
                     self,
                     "현재 PDF와 프리셋의 체크박스 배치를 충분히 확인하지 못해 "
@@ -2054,6 +2126,7 @@ class MainWindow(QMainWindow):
             self.pages = saved_templates[: self.preset.page_count]
             self._pages_are_canonical = True
             self._analysis_reference_pages = list(self.pages)
+            self._single_sample_template_pages = list(self.pages)
             MainWindow._clear_inferred_display_templates(self)
             self._update_page_size()
             alignment_message = "저장된 프리셋 템플릿 표시"
@@ -3121,6 +3194,7 @@ class MainWindow(QMainWindow):
         self.selected_boxes.clear()
         self.pending_boxes.clear()
         self.preset.fields.clear()
+        self._single_sample_template_pages = []
 
         def template_progress(value: int, message: str = ""):
             mapped = int(value * 0.7)
@@ -3296,6 +3370,9 @@ class MainWindow(QMainWindow):
             analysis_pages,
             copy.deepcopy(self.preset),
             template_pages_preprocessed=pages_preprocessed,
+            single_sample_template_pages=list(
+                getattr(self, "_single_sample_template_pages", [])
+            ),
         )
         worker.moveToThread(thread)
 

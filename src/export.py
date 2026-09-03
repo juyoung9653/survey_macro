@@ -6,7 +6,7 @@ from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .models import TemplatePreset, validate_field_names
+from .models import Field, TemplatePreset, validate_field_names
 
 
 def _try_number(s: str):
@@ -71,6 +71,68 @@ _wrap_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 RESULT_SHEET = "'결과'"
 OVERALL_SHEET = "'전체 통계'"
+
+
+def _excel_formula_literal(value: str | int | float) -> str:
+    """Return a scalar that is safe inside an Excel array constant."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return f'"{_escape_excel_string(str(value))}"'
+
+
+def _average_formula(
+    field: Field,
+    field_column: str,
+    last_data_row: int,
+    file_filter: str | None = None,
+) -> str:
+    """Build an average formula that follows edits made on the result sheet."""
+    result_range = (
+        f"{RESULT_SHEET}!${field_column}$2:${field_column}${last_data_row}"
+    )
+    file_range = f"{RESULT_SHEET}!$A$2:$A${last_data_row}"
+
+    mapped_values = [
+        field.value_map[index].strip()
+        if index < len(field.value_map)
+        else ""
+        for index in range(len(field.boxes))
+    ]
+    if not any(mapped_values):
+        if file_filter is None:
+            return f"=IFERROR(AVERAGE({result_range}),0)"
+        escaped = _escape_excel_string(file_filter)
+        return (
+            f'=IFERROR(AVERAGEIFS({result_range},{file_range},"{escaped}"),0)'
+        )
+
+    # A mapped answer is averaged by its 1-based option number, matching the
+    # previous Python calculation. Unmapped numeric edits remain valid scores.
+    lookup_values: list[str | int | float] = []
+    for option_number, mapped_value in enumerate(mapped_values, start=1):
+        lookup_values.append(
+            _try_number(mapped_value) if mapped_value else option_number
+        )
+    lookup_array = "{" + ",".join(
+        _excel_formula_literal(value) for value in lookup_values
+    ) + "}"
+    score_expression = (
+        f'IF({result_range}="","",'
+        f'IFERROR(MATCH({result_range},{lookup_array},0),'
+        f'IFERROR(1*{result_range},"")))'
+    )
+    if file_filter is None:
+        filter_expression = ""
+    else:
+        escaped = _escape_excel_string(file_filter)
+        filter_expression = f'--({file_range}="{escaped}")*'
+    numerator = (
+        f"SUMPRODUCT({filter_expression}IFERROR(1*({score_expression}),0))"
+    )
+    denominator = (
+        f"SUMPRODUCT({filter_expression}--ISNUMBER({score_expression}))"
+    )
+    return f"=IFERROR({numerator}/{denominator},0)"
 
 
 def _write_stats_formulas(
@@ -375,27 +437,6 @@ def export_to_excel(
                     cell.border = _thin_border
                     cell.alignment = _center_align
 
-                def _calc_avg(items_subset, field) -> int | float:
-                    nums = []
-                    for item in items_subset:
-                        val = str(item.get(field.name, "")).strip()
-                        if not val:
-                            continue
-                        try:
-                            idx = field.value_map.index(val)
-                            num = idx + 1
-                        except ValueError:
-                            num = _try_number(val)
-                            if not isinstance(num, (int, float)):
-                                continue
-                        nums.append(num)
-                    avg_val = sum(nums) / len(nums) if nums else 0
-                    if avg_val == int(avg_val):
-                        avg_val = int(avg_val)
-                    else:
-                        avg_val = round(avg_val, 2)
-                    return avg_val
-
                 row = 2
                 for field in avg_fields:
                     cell = ws_avg.cell(row=row, column=1, value=field.name)
@@ -403,22 +444,35 @@ def export_to_excel(
                     cell.alignment = _center_align
 
                     # 전체 평균
-                    overall = _calc_avg(results, field)
-                    cell = ws_avg.cell(row=row, column=2, value=overall)
+                    field_column = field_col_map[field.name]
+                    cell = ws_avg.cell(
+                        row=row,
+                        column=2,
+                        value=_average_formula(
+                            field,
+                            field_column,
+                            last_data_row,
+                        ),
+                    )
                     cell.border = _thin_border
                     cell.alignment = _center_align
+                    cell.number_format = "0.##"
 
                     # 파일별 평균
                     for fi, fname in enumerate(fname_list):
-                        items_f = [
-                            item
-                            for item in results
-                            if str(item.get("파일명", "")).strip() == fname
-                        ]
-                        f_avg = _calc_avg(items_f, field)
-                        cell = ws_avg.cell(row=row, column=fi + 3, value=f_avg)
+                        cell = ws_avg.cell(
+                            row=row,
+                            column=fi + 3,
+                            value=_average_formula(
+                                field,
+                                field_column,
+                                last_data_row,
+                                file_filter=fname,
+                            ),
+                        )
                         cell.border = _thin_border
                         cell.alignment = _center_align
+                        cell.number_format = "0.##"
 
                     row += 1
 
@@ -446,6 +500,9 @@ def export_to_excel(
                     file_filter=fname,
                 )
 
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
         wb.save(out_path)
         return True
 

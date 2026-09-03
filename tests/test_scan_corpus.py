@@ -1,16 +1,19 @@
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
 import cv2
 import numpy as np
+import openpyxl
 
 from src.models import Box, Field, TemplatePreset
 from src.processor import (
     generate_ui_templates,
     generate_ui_templates_multi,
     remap_preset_to_detected_layout,
+    run_analysis,
     _validate_analysis_page_geometry,
 )
 from src.vision import (
@@ -51,6 +54,11 @@ _TWO_PAGE_PDFS = (
     "카페주거.pdf",
     "편의점.pdf",
     "헤이클린.pdf",
+)
+
+_ADDITIONAL_CORPUS_PDFS = (
+    "S25C-0i26090316340.pdf",
+    "법정의무.pdf",
 )
 
 _TWO_PAGE_ROW_SIGNATURES = (
@@ -102,7 +110,11 @@ class ScanCorpusDetectionTests(unittest.TestCase):
     def setUpClass(cls):
         if not _SCAN_DIR.is_dir():
             raise AssertionError(f"scan corpus directory is missing: {_SCAN_DIR}")
-        expected = set(_ONE_PAGE_PDFS) | set(_TWO_PAGE_PDFS)
+        expected = (
+            set(_ONE_PAGE_PDFS)
+            | set(_TWO_PAGE_PDFS)
+            | set(_ADDITIONAL_CORPUS_PDFS)
+        )
         actual = {path.name for path in _SCAN_DIR.glob("*.pdf")}
         if actual != expected:
             missing = sorted(expected - actual)
@@ -316,6 +328,71 @@ class ScanCorpusDetectionTests(unittest.TestCase):
         finally:
             window.close()
             app.processEvents()
+
+    def test_single_response_keeps_answers_with_clean_preset_fallback(self):
+        preset_path = _PRESET_DIR / "기본.json"
+        template_path = _PRESET_DIR / "기본_tpl_p0.png"
+        data = json.loads(preset_path.read_text(encoding="utf-8"))
+        config = TemplatePreset(
+            page_count=int(data.get("page_count", 1)),
+            fine_angle=float(data.get("fine_angle", 0.0)),
+            rot_code=int(data.get("rot_code", -1)),
+            reverse_numbering=bool(data.get("reverse_numbering", True)),
+            template_dilate_pct=float(data.get("template_dilate_pct", 0.3)),
+            fields=[Field.from_dict(field) for field in data.get("fields", [])],
+            page_fine_angles=[
+                float(value) for value in data.get("page_fine_angles", [])
+            ],
+        )
+        saved_template = cv2.imdecode(
+            np.frombuffer(template_path.read_bytes(), np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        pdf_path = _SCAN_DIR / "S25C-0i26090316340.pdf"
+        current_templates = generate_ui_templates(
+            str(pdf_path),
+            config.page_count,
+            config.rot_code,
+            config.fine_angle,
+            page_fine_angles=config.page_fine_angles,
+        )
+        remap = remap_preset_to_detected_layout(
+            config,
+            current_templates,
+            source_templates={0: saved_template},
+        )
+        self.assertTrue(remap.accepted)
+
+        from src.ui import MainWindow
+
+        clean_pages = MainWindow._build_single_sample_template_pages(
+            [saved_template],
+            current_templates,
+            remap.page_transforms,
+            remap.config.page_count,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertTrue(
+                run_analysis(
+                    [str(pdf_path)],
+                    [current_templates[0]],
+                    remap.config,
+                    template_pages_preprocessed=True,
+                    output_base_dir=temp_dir,
+                    single_sample_template_pages=clean_pages,
+                )
+            )
+            workbook_path = next(Path(temp_dir).rglob("*.xlsx"))
+            workbook = openpyxl.load_workbook(workbook_path, data_only=False)
+            headers = [cell.value for cell in workbook["결과"][1]]
+            values = [cell.value for cell in workbook["결과"][2]]
+
+        answer = dict(zip(headers, values))
+        self.assertEqual(answer["성별"], "남")
+        self.assertEqual(answer["연령"], "50대")
+        self.assertEqual(answer["경력"], "1년차")
+        self.assertEqual([answer[f"Q{i}"] for i in range(1, 6)], [5] * 5)
+        self.assertEqual(answer["의견"], "있음")
 
 
 if __name__ == "__main__":

@@ -24,9 +24,11 @@ from src.processor import (
     _load_ui_template_cache,
     _median_uint8_inplace,
     _prepare_checkbox_template_interiors,
+    _replace_single_sample_templates,
     _sampled_survey_is_available,
     _save_ui_template_cache,
     _select_ui_detection_templates,
+    _ui_template_sample_progress,
     _validate_analysis_page_geometry,
     _validate_analysis_template_layout,
     extract_ink_info_from_mask,
@@ -246,6 +248,80 @@ class PipelineOptimizationTests(unittest.TestCase):
                 actual = _median_uint8_inplace(stack.copy())
 
                 self.assertTrue(np.array_equal(actual, expected))
+
+    def test_single_response_uses_clean_preset_instead_of_its_own_mark(self):
+        blank = np.full((160, 240), 255, np.uint8)
+        box = Box(page_idx=0, x=30, y=60, w=160, h=40)
+        cv2.rectangle(blank, (30, 60), (190, 100), 0, 2)
+        marked = blank.copy()
+        cv2.line(marked, (80, 90), (120, 70), 0, 5)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[Field(name="Q", boxes=[box])],
+        )
+        templates = generate_dynamic_templates({0: [marked]}, config=config)
+
+        absorbed_ink = extract_pure_ink_mask(marked, templates[0], 0.0)
+        absorbed_score, _ = extract_ink_info_from_mask(absorbed_ink, box)
+        replaced = _replace_single_sample_templates(
+            templates,
+            {0: [marked]},
+            [blank],
+        )
+        recovered_ink = extract_pure_ink_mask(marked, templates[0], 0.0)
+        recovered_score, _ = extract_ink_info_from_mask(recovered_ink, box)
+
+        self.assertEqual(absorbed_score, 0)
+        self.assertEqual(replaced, {0})
+        self.assertGreater(recovered_score, 50)
+
+    def test_multiple_responses_keep_the_file_specific_template(self):
+        file_template = np.full((30, 20), 230, np.uint8)
+        templates = {0: file_template}
+
+        replaced = _replace_single_sample_templates(
+            templates,
+            {0: [b"first", b"second"]},
+            [np.full_like(file_template, 255)],
+        )
+
+        self.assertEqual(replaced, set())
+        self.assertIs(templates[0], file_template)
+
+    def test_ui_template_progress_distinguishes_sample_from_full_pdf(self):
+        events = []
+        callback = _ui_template_sample_progress(
+            lambda value, message: events.append((value, message)),
+            sample_page_count=31,
+            total_page_count=50,
+        )
+        self.assertIsNotNone(callback)
+        assert callback is not None
+
+        callback(0, "PDF 로딩 시작")
+        callback(48, "PDF 로딩... (15/31)")
+        callback(100, "PDF 로딩... (31/31)")
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    0,
+                    "체크박스 위치 찾기용 페이지 준비 시작 "
+                    "(전체 50쪽 중 31쪽 사용)",
+                ),
+                (
+                    48,
+                    "체크박스 위치 찾기용 페이지 읽는 중... "
+                    "(15/31쪽 · 전체 50쪽)",
+                ),
+                (
+                    100,
+                    "체크박스 위치 찾기용 페이지 준비 완료 "
+                    "(전체 50쪽 중 31쪽 사용)",
+                ),
+            ],
+        )
 
     def test_response_aware_template_does_not_absorb_majority_mark(self):
         blank = np.full((160, 240), 255, np.uint8)

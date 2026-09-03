@@ -701,6 +701,40 @@ def generate_dynamic_templates(
     return templates
 
 
+def _replace_single_sample_templates(
+    templates: dict[int, np.ndarray],
+    pages_by_local_idx: dict[int, list[_SamplePage]],
+    fallback_pages: list[np.ndarray] | None,
+) -> set[int]:
+    """Use a clean preset page instead of subtracting the only response page."""
+    if not fallback_pages:
+        return set()
+
+    replaced: set[int] = set()
+    for page_idx, samples in pages_by_local_idx.items():
+        valid_samples = sum(
+            bool(sample.size) if isinstance(sample, np.ndarray) else bool(sample)
+            for sample in samples
+        )
+        if valid_samples != 1 or page_idx >= len(fallback_pages):
+            continue
+
+        current = templates.get(page_idx)
+        fallback = fallback_pages[page_idx]
+        if (
+            current is None
+            or not isinstance(fallback, np.ndarray)
+            or fallback.size == 0
+            or fallback.shape[:2] != current.shape[:2]
+        ):
+            continue
+        if fallback.ndim == 3:
+            fallback = cv2.cvtColor(fallback, cv2.COLOR_BGR2GRAY)
+        templates[page_idx] = fallback.copy()
+        replaced.add(page_idx)
+    return replaced
+
+
 def _select_ui_detection_templates(
     pages_by_local_idx: dict[int, list],
     median_templates: dict[int, np.ndarray],
@@ -770,6 +804,44 @@ def _filter_blank_pages(
     return [img for img, m in zip(images, means) if m >= threshold]
 
 
+def _ui_template_sample_progress(
+    callback,
+    sample_page_count: int,
+    total_page_count: int,
+):
+    """Clarify that the bounded page load is only for checkbox inference."""
+    if callback is None:
+        return None
+
+    count_pattern = re.compile(r"\((\d+)/(\d+)\)")
+
+    def report(value: int, message: str = "") -> None:
+        match = count_pattern.search(message)
+        completed = (
+            int(match.group(1))
+            if match is not None
+            else round(sample_page_count * max(0, min(100, value)) / 100)
+        )
+        if value <= 0:
+            label = (
+                "체크박스 위치 찾기용 페이지 준비 시작 "
+                f"(전체 {total_page_count}쪽 중 {sample_page_count}쪽 사용)"
+            )
+        elif value >= 100:
+            label = (
+                "체크박스 위치 찾기용 페이지 준비 완료 "
+                f"(전체 {total_page_count}쪽 중 {sample_page_count}쪽 사용)"
+            )
+        else:
+            label = (
+                "체크박스 위치 찾기용 페이지 읽는 중... "
+                f"({completed}/{sample_page_count}쪽 · 전체 {total_page_count}쪽)"
+            )
+        callback(value, label)
+
+    return report
+
+
 def generate_ui_templates(
     pdf_path: str,
     page_count: int,
@@ -778,7 +850,7 @@ def generate_ui_templates(
     progress_cb=None,
     page_fine_angles: list[float] | None = None,
 ) -> dict[int, np.ndarray]:
-    """UI에서 자동 탐지를 수행하기 전, PDF 전체를 읽어 깔끔한 빈 템플릿을 생성해 반환합니다."""
+    """UI 자동 탐지 전에 최대 31부를 읽어 빈 템플릿을 생성합니다."""
     if page_count <= 0:
         return {}
 
@@ -801,12 +873,17 @@ def generate_ui_templates(
 
     try:
         with fitz.open(pdf_path) as doc:
+            total_page_count = len(doc)
             sample_page_count = min(
-                len(doc), page_count * _UI_TEMPLATE_SAMPLE_LIMIT
+                total_page_count, page_count * _UI_TEMPLATE_SAMPLE_LIMIT
             )
         pages = load_pdf_pages(
             pdf_path,
-            progress_cb=progress_cb,
+            progress_cb=_ui_template_sample_progress(
+                progress_cb,
+                sample_page_count,
+                total_page_count,
+            ),
             gray=True,
             page_indices=list(range(sample_page_count)),
         )
@@ -3522,6 +3599,7 @@ def run_analysis(
     resource_controller: AdaptiveResourceController | None = None,
     template_pages_preprocessed: bool = False,
     output_base_dir: str | Path | None = None,
+    single_sample_template_pages: list[np.ndarray] | None = None,
 ) -> bool:
     def report_progress(value: float, message: str = ""):
         if progress_cb:
@@ -3718,6 +3796,20 @@ def run_analysis(
                     file_template = generate_dynamic_templates(
                         sample_pages, config=config
                     )
+                    replaced_pages = _replace_single_sample_templates(
+                        file_template,
+                        sample_pages,
+                        single_sample_template_pages,
+                    )
+                    if replaced_pages:
+                        page_text = ", ".join(
+                            f"{page_idx + 1}쪽"
+                            for page_idx in sorted(replaced_pages)
+                        )
+                        report_work(
+                            f"{file_label}: 단일 응답용 프리셋 기준 적용 "
+                            f"({page_text}) · 파일 {index + 1}/{num_files}"
+                        )
             except ResourceUnavailableError:
                 raise
             except Exception as e:

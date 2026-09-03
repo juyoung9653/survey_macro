@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, mock_open, patch
 
+import cv2
 from PyQt6.QtWidgets import QMessageBox
 import numpy as np
 
@@ -75,6 +76,33 @@ class RedetectionProgressTests(unittest.TestCase):
 
         self.assertIs(pages[0], saved_page)
         self.assertTrue(preprocessed)
+
+    def test_clean_preset_page_is_warped_to_current_checkbox_coordinates(self):
+        saved = np.full((40, 30), 255, np.uint8)
+        saved[10:14, 8:12] = 0
+        current = np.full((60, 50), 255, np.uint8)
+        matrix = np.array(
+            [[1.2, 0.0, 4.0], [0.0, 1.1, 6.0]],
+            dtype=np.float64,
+        )
+
+        transformed = MainWindow._build_single_sample_template_pages(
+            [saved],
+            {0: current},
+            {0: matrix},
+            1,
+        )
+        expected = cv2.warpAffine(
+            saved,
+            matrix,
+            (50, 60),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+
+        self.assertEqual(len(transformed), 1)
+        self.assertTrue(np.array_equal(transformed[0], expected))
 
     def test_legacy_preset_load_marks_saved_template_alignment_as_canonical(self):
         raw = np.full((40, 30), 245, np.uint8)
@@ -197,6 +225,11 @@ class RedetectionProgressTests(unittest.TestCase):
         self.assertIs(window.pages[0], raw)
         self.assertFalse(window._pages_are_canonical)
         self.assertIs(window._analysis_reference_pages[0], current_template)
+        self.assertEqual(len(window._single_sample_template_pages), 1)
+        self.assertEqual(
+            window._single_sample_template_pages[0].shape,
+            current_template.shape,
+        )
         self.assertIs(window._inferred_display_templates[0], current_template)
         mapped_box = window.preset.fields[0].boxes[0]
         # The remapped preset carries the saved semantics in current-PDF geometry.
