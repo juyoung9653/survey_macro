@@ -888,10 +888,10 @@ class MainWindow(QMainWindow):
         )
         self.delete_selected_btn.clicked.connect(self.delete_selected_boxes)
 
-        self.undo_btn = QPushButton("실행 취소")
+        self.undo_btn = QPushButton("↶ 실행 취소")
         self.undo_btn.setToolTip("마지막 편집을 되돌립니다. (Ctrl+Z)")
         self.undo_btn.clicked.connect(self.undo_edit)
-        self.redo_btn = QPushButton("다시 실행")
+        self.redo_btn = QPushButton("↷ 다시 실행")
         self.redo_btn.setToolTip("되돌린 편집을 다시 적용합니다. (Ctrl+Y)")
         self.redo_btn.clicked.connect(self.redo_edit)
         self.undo_btn.setEnabled(False)
