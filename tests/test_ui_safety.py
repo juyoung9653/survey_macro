@@ -203,6 +203,21 @@ class UiSafetyTests(unittest.TestCase):
             self.assertEqual(existing.read_text(encoding="utf-8"), "keep")
         window.close()
 
+    def test_saving_preset_shows_completion_message(self):
+        window = MainWindow()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window.preset_dir = Path(temp_dir)
+            with patch("src.ui.QMessageBox.information") as information:
+                saved = window._save_preset_to_name("저장한 프리셋")
+
+        self.assertTrue(saved)
+        information.assert_called_once_with(
+            window,
+            "프리셋 저장 완료",
+            "프리셋 '저장한 프리셋'을(를) 저장했습니다.",
+        )
+        window.close()
+
     def test_primary_convenience_buttons_are_visible(self):
         window = MainWindow()
 

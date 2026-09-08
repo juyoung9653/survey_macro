@@ -2210,6 +2210,11 @@ class MainWindow(QMainWindow):
         MainWindow._set_preset_dirty(self, False)
         if hasattr(self, "statusBar"):
             self.statusBar().showMessage(f"프리셋 '{name}' 저장 완료", 5000)
+        QMessageBox.information(
+            self,
+            "프리셋 저장 완료",
+            f"프리셋 '{name}'을(를) 저장했습니다.",
+        )
         return True
 
     def _list_config_names(self) -> list[str]:
