@@ -10,7 +10,7 @@ import numpy as np
 
 
 _PDF_CACHE_VERSION = 2
-_CHECKBOX_CACHE_VERSION = 7
+_CHECKBOX_CACHE_VERSION = 8
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):
@@ -132,6 +132,10 @@ def load_pdf_pages(
     return pages
 
 
+class PageOrientationError(ValueError):
+    """Raised when 0/180-degree page orientation cannot be selected safely."""
+
+
 class ImageAligner:
     _ADAPTIVE_QUICK_MAX_DIMENSION = 480
     _ADAPTIVE_QUICK_MIN_CORRELATION = 0.50
@@ -148,6 +152,13 @@ class ImageAligner:
     _SPARSE_LK_MAX_REPROJECTION_P90 = 1.25
     _SPARSE_LK_SCORE_TOLERANCE = 0.002
     _SPARSE_LK_ECC_ITERATIONS = 4
+    # Orientation is deliberately decided at thumbnail resolution. The full
+    # alignment below remains responsible only for scanner-scale distortion.
+    _ORIENTATION_DIRECT_MIN_CORRELATION = 0.78
+    _ORIENTATION_DIRECT_MIN_MARGIN = 0.12
+    _ORIENTATION_MIN_CORRELATION = 0.60
+    _ORIENTATION_MIN_MARGIN = 0.08
+    _ORIENTATION_ECC_ITERATIONS = 30
 
     def __init__(
         self,
@@ -157,6 +168,7 @@ class ImageAligner:
         stable_mask: np.ndarray | None = None,
         adaptive_cascade: bool = True,
         sparse_lk: bool = False,
+        auto_orient_180: bool = False,
     ):
         self.ref_gray = (
             cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if ref_img.ndim == 3 else ref_img
@@ -165,6 +177,9 @@ class ImageAligner:
         self.refine_ecc = refine_ecc
         self.adaptive_cascade = bool(adaptive_cascade and refine_ecc)
         self.sparse_lk = bool(sparse_lk and self.adaptive_cascade)
+        self.auto_orient_180 = bool(auto_orient_180)
+        self.last_orientation_degrees = 0
+        self.last_orientation_status = "disabled"
         self._last_affine: np.ndarray | None = None
         self._last_ecc_correlation: float | None = None
         self.last_alignment_stage = "full_orb"
@@ -704,6 +719,138 @@ class ImageAligner:
             self._last_ecc_correlation - 0.08,
         )
 
+    def _orientation_direct_score(self, quick_gray: np.ndarray) -> float:
+        """Return a no-warp orientation hint without touching alignment state."""
+        try:
+            mask = (
+                self.quick_stable_mask
+                if self.quick_stable_mask is not None
+                else self._quick_full_mask
+            )
+            return float(cv2.computeECC(self.quick_ref_gray, quick_gray, mask))
+        except Exception:
+            return float("-inf")
+
+    def _orientation_affine_score(self, quick_gray: np.ndarray) -> float:
+        """Score one already-oriented candidate under bounded scanner distortion."""
+        try:
+            criteria = (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                self._ORIENTATION_ECC_ITERATIONS,
+                1e-5,
+            )
+            correlation, ref_to_target = cv2.findTransformECC(
+                self.quick_ref_gray,
+                quick_gray,
+                np.eye(2, 3, dtype=np.float32),
+                cv2.MOTION_AFFINE,
+                criteria,
+                None,
+                5,
+            )
+            target_to_ref = cv2.invertAffineTransform(ref_to_target)
+            if not self._is_plausible_affine(
+                self._affine_from_scale(
+                    target_to_ref,
+                    self.quick_scale_x,
+                    self.quick_scale_y,
+                )
+            ):
+                return float("-inf")
+            aligned = cv2.warpAffine(
+                quick_gray,
+                target_to_ref,
+                (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=255,
+            )
+            valid = cv2.warpAffine(
+                self._quick_valid_source,
+                target_to_ref,
+                (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            base_mask = (
+                self.quick_stable_mask
+                if self.quick_stable_mask is not None
+                else self._quick_full_mask
+            )
+            score_mask = cv2.bitwise_and(base_mask, valid)
+            if cv2.countNonZero(score_mask) < score_mask.size * 0.15:
+                return float("-inf")
+            score = float(cv2.computeECC(self.quick_ref_gray, aligned, score_mask))
+            return score if np.isfinite(score) else float("-inf")
+        except Exception:
+            return float("-inf")
+
+    def _orientation_error(self, status: str) -> None:
+        self.last_orientation_degrees = 0
+        self.last_orientation_status = status
+        if status == "ambiguous":
+            raise PageOrientationError(
+                "페이지 방향을 0°와 180° 중 하나로 안전하게 판단할 수 없습니다."
+            )
+        raise PageOrientationError(
+            "참조 양식과 충분히 일치하지 않아 페이지 방향을 확인할 수 없습니다."
+        )
+
+    def _orient_working_image(self, working_img: np.ndarray) -> np.ndarray:
+        """Choose 0/180 orientation before any cached fine alignment is used."""
+        gray = (
+            cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
+            if working_img.ndim == 3
+            else working_img
+        )
+        quick_gray = (
+            cv2.resize(
+                gray,
+                (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+            if gray.shape != self.quick_ref_gray.shape
+            else gray
+        )
+        rotated_quick = cv2.rotate(quick_gray, cv2.ROTATE_180)
+        direct_scores = (
+            self._orientation_direct_score(quick_gray),
+            self._orientation_direct_score(rotated_quick),
+        )
+        direct_best = max(direct_scores)
+        direct_margin = abs(direct_scores[0] - direct_scores[1])
+
+        # A clean, already-oriented scan pays only two inexpensive thumbnail
+        # correlations. Ambiguous or shifted pages receive the bounded ECC
+        # comparison below, never two full-resolution alignment passes.
+        if (
+            self.quick_stable_mask is None
+            and
+            direct_best >= self._ORIENTATION_DIRECT_MIN_CORRELATION
+            and direct_margin >= self._ORIENTATION_DIRECT_MIN_MARGIN
+        ):
+            orientation = 0 if direct_scores[0] > direct_scores[1] else 180
+        else:
+            scores = (
+                self._orientation_affine_score(quick_gray),
+                self._orientation_affine_score(rotated_quick),
+            )
+            best = max(scores)
+            margin = abs(scores[0] - scores[1])
+            if best < self._ORIENTATION_MIN_CORRELATION:
+                self._orientation_error("untrustworthy")
+            if margin < self._ORIENTATION_MIN_MARGIN:
+                self._orientation_error("ambiguous")
+            orientation = 0 if scores[0] > scores[1] else 180
+
+        self.last_orientation_degrees = orientation
+        self.last_orientation_status = (
+            "upright" if orientation == 0 else "rotated_180"
+        )
+        if orientation == 0:
+            return working_img
+        return cv2.rotate(working_img, cv2.ROTATE_180)
+
     def _remember_alignment(
         self,
         matrix: np.ndarray,
@@ -733,6 +880,11 @@ class ImageAligner:
         # 특징점, ECC, 최종 warp가 모두 같은 좌표계를 사용하도록 먼저 크기를
         # 통일합니다. 서로 다른 용지 크기의 PDF를 묶을 때 행렬이 어긋나는 것을 막습니다.
         working_img = self._resize_to_ref(img)
+        if self.auto_orient_180:
+            working_img = self._orient_working_image(working_img)
+        else:
+            self.last_orientation_degrees = 0
+            self.last_orientation_status = "disabled"
         if self.des1 is None:
             return working_img
 

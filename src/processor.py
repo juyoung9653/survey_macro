@@ -68,6 +68,7 @@ from .models import Box, Field, TemplatePreset, validate_field_names
 from .resources import AdaptiveResourceController, ResourceUnavailableError
 from .vision import (
     ImageAligner,
+    PageOrientationError,
     apply_rotation,
     auto_detect_checkboxes,
     load_pdf_pages,
@@ -76,7 +77,7 @@ from .vision import (
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_DETECTION_SAMPLE_LIMIT = 7
-_UI_TEMPLATE_CACHE_VERSION = 8
+_UI_TEMPLATE_CACHE_VERSION = 9
 _MIB = 1024 * 1024
 _ANALYSIS_SAMPLE_WORK = 2.0
 _ANALYSIS_TEMPLATE_WORK = 1.0
@@ -903,6 +904,7 @@ def generate_ui_templates(
                 _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
             ),
             refine_ecc=False,
+            auto_orient_180=True,
         )
         for local_p, p in enumerate(pages[:page_count])
     ]
@@ -924,7 +926,7 @@ def generate_ui_templates(
             )
             aligner = aligners[local_p] if local_p < len(aligners) else aligners[-1]
 
-            aligned = aligner.align(orig)
+            aligned = _align_with_page_context(aligner, orig, pdf_path, global_p)
             if len(pages_by_local_idx[local_p]) < _UI_TEMPLATE_SAMPLE_LIMIT:
                 success, encoded = cv2.imencode(".png", aligned)
                 if success:
@@ -1051,9 +1053,9 @@ def generate_ui_templates_multi(
                 )
                 aligner = ref_aligners.get(local_p)
                 if aligner is None:
-                    aligner = ImageAligner(orig, refine_ecc=False)
+                    aligner = ImageAligner(orig, refine_ecc=False, auto_orient_180=True)
                     ref_aligners[local_p] = aligner
-                aligned = aligner.align(orig)
+                aligned = _align_with_page_context(aligner, orig, fpath, global_p)
                 success, encoded = cv2.imencode(".png", aligned)
                 if success:
                     all_by_local_idx[local_p].append(encoded.tobytes())
@@ -2591,7 +2593,11 @@ def process_survey_data(
             for idx, (box, is_ticked) in enumerate(
                 zip(scoring_boxes, check_results), start=1
             ):
-                label_number = _label_number(total_boxes, idx, config.reverse_numbering)
+                label_number = _label_number(
+                    total_boxes,
+                    idx,
+                    field.effective_reverse_numbering(config.reverse_numbering),
+                )
                 label = str(label_number)
 
                 if box.page_idx in debug_annotations:
@@ -2672,7 +2678,11 @@ def process_survey_data(
         for idx, (box, is_ticked) in enumerate(
             zip(valid_boxes, check_results), start=1
         ):
-            label_number = _label_number(total_boxes, idx, config.reverse_numbering)
+            label_number = _label_number(
+                total_boxes,
+                idx,
+                field.effective_reverse_numbering(config.reverse_numbering),
+            )
             label = str(label_number)
 
             if box.page_idx in debug_annotations:
@@ -2760,6 +2770,15 @@ def _render_pdf_page(doc, global_p: int, dpi: int) -> np.ndarray:
     return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
 
 
+def _align_with_page_context(aligner, image, file_path, global_p):
+    try:
+        return aligner.align(image)
+    except PageOrientationError as exc:
+        raise PageOrientationError(
+            f"'{Path(file_path).name}' {global_p + 1}쪽: {exc}"
+        ) from exc
+
+
 def _render_aligned_page(
     doc,
     global_p: int,
@@ -2777,7 +2796,7 @@ def _render_aligned_page(
         _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
     )
     a = aligners[local_p] if local_p < len(aligners) else aligners[-1]
-    return local_p, a.align(orig)
+    return local_p, _align_with_page_context(a, orig, doc.name, global_p)
 
 
 def _render_survey_pages(
@@ -2882,6 +2901,7 @@ def _build_page_aligners(
             reference,
             stable_mask=_build_stable_region_mask(reference.shape, config, page_idx),
             sparse_lk=True,
+            auto_orient_180=True,
         )
         for page_idx, reference in enumerate(alignment_references)
     ]
@@ -2958,7 +2978,7 @@ def _collect_template_samples(
             retain_raw_samples: bool | None = None
 
             def align_and_encode(
-                lane_idx: int, local_p: int, page_img: np.ndarray
+                lane_idx: int, local_p: int, page_img: np.ndarray, global_p: int
             ) -> tuple[int, _SamplePage]:
                 lane_aligners = alignment_lanes[lane_idx]
                 if lane_aligners is None:
@@ -2976,7 +2996,7 @@ def _collect_template_samples(
                     if local_p < len(lane_aligners)
                     else lane_aligners[-1]
                 )
-                aligned = aligner.align(rotated)
+                aligned = _align_with_page_context(aligner, rotated, fpath, global_p)
                 if retain_raw_samples:
                     return local_p, aligned
                 success, encoded = cv2.imencode(".png", aligned)
@@ -3048,7 +3068,7 @@ def _collect_template_samples(
                         # of whichever executor thread happens to run the job.
                         lane_idx = job_position % len(alignment_lanes)
                         return executor.submit(
-                            align_and_encode, lane_idx, local_p, page_img
+                            align_and_encode, lane_idx, local_p, page_img, global_p
                         )
 
                     while (
@@ -3733,7 +3753,7 @@ def run_analysis(
             all_results.extend(file_results)
             for image_bytes in comment_pages:
                 _insert_encoded_img_into_pdf(comment_doc, image_bytes)
-        except ResourceUnavailableError:
+        except (ResourceUnavailableError, PageOrientationError):
             raise
         except Exception as e:
             analysis_failures.append(file_label)
@@ -3810,7 +3830,7 @@ def run_analysis(
                             f"{file_label}: 단일 응답용 프리셋 기준 적용 "
                             f"({page_text}) · 파일 {index + 1}/{num_files}"
                         )
-            except ResourceUnavailableError:
+            except (ResourceUnavailableError, PageOrientationError):
                 raise
             except Exception as e:
                 print(f"템플릿 샘플 수집 실패 ({file_label}): {e}")

@@ -41,6 +41,41 @@ class _ProgressStub:
 
 
 class UiSafetyTests(unittest.TestCase):
+    def test_results_button_opens_latest_completed_run_not_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            root = base / "결과"
+            names = [
+                "설문결과_2026.09.08.17.48.34",
+                "설문결과_2026.09.08.17.48.34_2",
+                "설문결과_2026.09.08.17.48.34_10",
+                "설문결과_2026.09.07.18.00.00",
+            ]
+            for name in names:
+                folder = root / name
+                (folder / "검토용").mkdir(parents=True)
+                (folder / "설문결과.xlsx").touch()
+            (root / "설문결과_2026.09.09.00.00.00").mkdir()
+            with patch("src.ui._runtime_directory", return_value=base), patch(
+                "src.ui.QDesktopServices.openUrl", return_value=True
+            ) as open_url:
+                self.assertTrue(MainWindow.open_results_folder(None))
+            self.assertEqual(
+                Path(open_url.call_args.args[0].toLocalFile()),
+                (root / names[2]).resolve(),
+            )
+
+    def test_results_button_without_completed_run_only_shows_notice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            with patch("src.ui._runtime_directory", return_value=base), patch(
+                "src.ui.QDesktopServices.openUrl"
+            ) as open_url, patch("src.ui.QMessageBox.information") as notice:
+                self.assertFalse(MainWindow.open_results_folder(None))
+            open_url.assert_not_called()
+            notice.assert_called_once()
+            self.assertFalse((base / "결과").exists())
+
     def test_standard_dialog_buttons_are_korean(self):
         install_korean_translations(_APP)
         expected_text = {
@@ -223,7 +258,8 @@ class UiSafetyTests(unittest.TestCase):
 
         self.assertEqual(window.save_preset_btn.text(), "프리셋 저장")
         self.assertEqual(window.open_results_btn.text(), "결과 폴더")
-        self.assertEqual(window.help_btn.text(), "도움말")
+        self.assertEqual(window.help_btn.text(), "설명서")
+        self.assertEqual(window.item_help_btn.text(), "? 항목 도움말")
         self.assertIn("#7E57C2", window.value_map_btn.styleSheet())
         self.assertLessEqual(window.centralWidget().sizeHint().width(), 1280)
         window.close()

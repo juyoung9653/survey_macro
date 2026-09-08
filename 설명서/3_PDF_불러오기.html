@@ -31,7 +31,10 @@
                     <span class="button-demo">프리셋 저장</span>
                     <span class="status-demo">PDF 3개 · 2쪽/부 · 프리셋: 만족도 조사 · 화면: 자동 생성 빈 양식</span>
                     <span class="button-demo">기울기 다시 맞추기</span>
+                    <span class="button-demo">↶ 실행 취소</span>
+                    <span class="button-demo">↷ 다시 실행</span>
                     <span class="button-demo green">▶ 분석 실행</span>
+                    <span class="button-demo">결과 폴더</span>
                 </div>
                 <div class="ui-row">
                     <span class="button-demo">선택지 추가</span>
@@ -40,10 +43,8 @@
                     <span class="button-demo">선택지 이름 설정</span>
                     <span class="button-demo">자유기입 전환</span>
                     <span class="button-demo red">선택 삭제</span>
-                    <span class="button-demo">결과 폴더</span>
-                    <span class="button-demo">도움말</span>
-                    <span class="button-demo">↶ 실행 취소</span>
-                    <span class="button-demo">↷ 다시 실행</span>
+                    <span class="button-demo">설명서</span>
+                    <span class="button-demo">? 항목 도움말</span>
                 </div>
                 <div class="ui-row">
                     <span class="status-demo">박스 클릭으로 선택 · Ctrl+클릭 개별 · Shift+클릭 가로·세로·사각 범위</span>
@@ -53,8 +54,9 @@
             <table>
                 <thead><tr><th>화면 부분</th><th>하는 일</th></tr></thead>
                 <tbody>
-                    <tr><td>첫째 줄</td><td>PDF와 프리셋을 불러오거나 저장하고, 페이지를 보정하고, 분석을 실행합니다.</td></tr>
-                    <tr><td>둘째 줄</td><td>선택지·자유기입 영역을 고치고, 결과 폴더나 도움말을 엽니다.</td></tr>
+                    <tr><td>첫째 줄</td><td>PDF와 프리셋을 불러오거나 저장하고, 페이지를 보정합니다. 오른쪽은 실행 취소 → 다시 실행 → 분석 실행 → 결과 폴더 순서입니다.</td></tr>
+                    <tr><td>둘째 줄</td><td>선택지·자유기입 영역을 고치고, ‘설명서’나 항목 도움말을 엽니다.</td></tr>
+                    <tr><td>위쪽 도움말 버튼</td><td>‘설명서’ 옆의 ‘? 항목 도움말’을 누르면 사용법 안내 후 궁금한 항목을 클릭해 설명을 볼 수 있습니다. 안내에서 ‘다시 보지 않기’를 체크하면 다음부터 안내창은 생략됩니다. 항목을 우클릭해도 도움말을 볼 수 있으며, Esc로 도움말 모드를 끝냅니다.</td></tr>
                     <tr><td>안내 줄</td><td>현재 선택한 도구와 다음에 할 동작을 알려줍니다.</td></tr>
                     <tr><td>큰 작업 화면</td><td>설문지 이미지, 문항 이름, 영역 색상을 보여줍니다.</td></tr>
                 </tbody>
@@ -67,7 +69,7 @@
                 <li><span class="button-demo">PDF 불러오기</span>를 누릅니다.</li>
                 <li>같은 설문 양식의 파일을 선택합니다. 여러 파일은 <span class="kbd">Ctrl</span>을 누른 채 클릭하거나 파일 선택 창에서 범위 선택합니다.</li>
                 <li>“설문지 한 부는 몇 페이지인가요?”에 1~10 사이의 값을 입력합니다.</li>
-                <li>PDF 로딩, 기울기 보정, 빈 양식 생성, 체크박스 탐지가 끝날 때까지 기다립니다.</li>
+                <li>PDF 로딩, 기울기 보정, 빈 양식 생성, 체크박스 탐지와 문항 자동 묶기가 끝날 때까지 기다립니다.</li>
                 <li>상단 상태가 <code>PDF n개 · n쪽/부 · 프리셋: 미적용 · 화면: 자동 생성 빈 양식</code>처럼 바뀌었는지 확인합니다.</li>
             </ol>
             <div class="callout good">
@@ -94,9 +96,9 @@
             <h2>자동 탐지 후 먼저 볼 것</h2>
             <p>작업 화면에는 응답 표시를 줄여 만든 빈 양식 기준이 표시됩니다. 화면을 보기 쉽게 하기 위한 기준이며, 분석할 때는 각 PDF의 실제 응답 페이지를 따로 처리합니다.</p>
             <ul class="checklist">
-                <li>실제 체크칸마다 초록색 또는 파란색 박스가 있는가</li>
+                <li>실제 체크칸마다 초록색 박스가 있는가</li>
                 <li>체크칸이 아닌 표 테두리나 글자에 불필요한 박스가 없는가</li>
-                <li>같은 질문의 선택지들이 한 문항으로 묶였는가</li>
+                <li>같은 질문의 선택지들이 <code>Q1</code>, <code>Q2</code>처럼 한 문항으로 묶였는가</li>
                 <li>2쪽 이상이면 각 페이지의 위치가 모두 맞는가</li>
             </ul>
             <div class="callout warn">

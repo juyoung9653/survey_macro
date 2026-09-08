@@ -1,62 +1,82 @@
 <!doctype html>
 <html lang="ko">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="설문지 자동 분석기 초보자용 사용 설명서">
-    <title>설문지 자동 분석기 사용 설명서</title>
-    <link rel="stylesheet" href="설명서/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>설문지 분석 · 화면 보며 따라하기</title>
+  <link rel="stylesheet" href="설명서/walkthrough.css">
+  <script src="설명서/walkthrough.js" defer></script>
 </head>
 <body>
-<div class="shell">
-    <header class="hero">
-        <p class="eyebrow">설문지 자동 분석기 · 초보자용 안내</p>
-        <h1>PDF를 불러와<br>엑셀 결과를 만드는 방법</h1>
-        <p>컴퓨터에 익숙하지 않아도 따라갈 수 있도록, 실제 화면의 버튼 이름과 작업 순서만 사용해 설명합니다.</p>
-    </header>
-
-    <main>
-        <section class="card">
-            <h2>처음 사용한다면</h2>
-            <p class="lead">먼저 1번을 따라 한 번 끝까지 분석해 보세요. 막힌 작업이 생기면 해당 안내만 찾아보면 됩니다.</p>
-            <div class="flow" aria-label="전체 작업 순서">
-                <div class="flow-item"><b>1. PDF</b><span>같은 양식 선택</span></div>
-                <div class="flow-item"><b>2. 영역</b><span>자동 탐지 확인</span></div>
-                <div class="flow-item"><b>3. 문항</b><span>묶기와 이름 설정</span></div>
-                <div class="flow-item"><b>4. 분석</b><span>초록 버튼 실행</span></div>
-                <div class="flow-item"><b>5. 검수</b><span>엑셀과 PDF 확인</span></div>
-            </div>
-            <p><a class="nav-link" href="설명서/1_이_프로그램이_뭐_하는_건가요.html">처음 분석하기 →</a></p>
-        </section>
-
-        <section class="card">
-            <h2>설명서 목차</h2>
-            <div class="toc-grid">
-                <a class="toc-card" href="설명서/1_이_프로그램이_뭐_하는_건가요.html"><b>1. 처음 분석하기</b><span>PDF에서 엑셀까지 한 번에 따라하기</span></a>
-                <a class="toc-card" href="설명서/2_실행_방법.html"><b>2. 실행과 PDF 준비</b><span>실행 파일, 스캔 품질, 페이지 순서</span></a>
-                <a class="toc-card" href="설명서/3_PDF_불러오기.html"><b>3. 화면 구성과 PDF 불러오기</b><span>상단 버튼과 상태 표시 읽는 법</span></a>
-                <a class="toc-card" href="설명서/4_체크박스_자동_찾기.html"><b>4. 영역 편집</b><span>추가·선택·이동·크기 조절·삭제</span></a>
-                <a class="toc-card" href="설명서/5_그룹_만들기_문항_묶기.html"><b>5. 문항과 선택지 설정</b><span>문항으로 묶고 결과값 붙이기</span></a>
-                <a class="toc-card" href="설명서/6_값_매핑_보기_입력.html"><b>6. 자유기입 영역</b><span>글과 숫자를 쓰는 칸 지정하기</span></a>
-                <a class="toc-card" href="설명서/7_분석_실행_엑셀_결과.html"><b>7. 분석과 결과 확인</b><span>엑셀 시트와 검수 대상 확인</span></a>
-                <a class="toc-card" href="설명서/8_프리셋_저장_불러오기.html"><b>8. 프리셋 재사용</b><span>같은 설문 양식을 안전하게 반복 사용</span></a>
-                <a class="toc-card" href="설명서/9_검토용_폴더.html"><b>9. 색상·단축키·파일 기준표</b><span>필요할 때 바로 찾는 참고표</span></a>
-                <a class="toc-card" href="설명서/10_자주_묻는_질문_FAQ.html"><b>10. 문제 해결</b><span>탐지·프리셋·결과가 이상할 때</span></a>
-            </div>
-        </section>
-
-        <section class="card">
-            <h2>용어는 이렇게 씁니다</h2>
-            <div class="two-column">
-                <div class="tool-card"><b>선택형</b><span>체크박스 중 하나 또는 여러 개를 고르는 문항</span></div>
-                <div class="tool-card"><b>자유기입</b><span>글이나 숫자를 직접 적는 답변 영역</span></div>
-                <div class="tool-card"><b>문항</b><span>같은 질문에 속한 선택지 영역들의 묶음</span></div>
-                <div class="tool-card"><b>프리셋</b><span>문항·선택지·영역 위치를 저장한 재사용 설정</span></div>
-            </div>
-        </section>
-    </main>
-
-    <footer class="footer">설문지 자동 분석기 · 현재 GUI 기준 사용 설명서</footer>
-</div>
+<main class="guide">
+  <header>
+    <p class="brand">설문지 자동 분석기 / 설명서</p>
+    <h1>화면을 보며, 한 단계씩.</h1>
+    <p class="intro">PDF를 열고, 문항을 확인하고, 결과를 검수하면 끝납니다.<br>프로그램을 옆에 열어 두고 아래 순서대로 눌러 보세요.</p>
+    <aside class="quick-help"><strong>버튼 하나만 궁금하다면?</strong> 버튼·체크박스를 우클릭해 <b>이 항목 도움말</b>을 고르세요. <b>파일</b> 메뉴 안의 항목은 우클릭하면 바로 설명이 나옵니다. 위쪽 도구줄의 <b>? 항목 도움말</b>을 누르면 사용법 안내 후 원하는 항목을 클릭해 설명을 볼 수도 있습니다. 안내에서 <b>다시 보지 않기</b>를 체크하면 다음부터 안내창은 생략됩니다. 도움말 모드는 <kbd>Esc</kbd>로 취소합니다.</aside>
+  </header>
+  <nav class="steps" aria-label="작업 순서">
+    <a href="#step-1">1 <span>PDF 열기</span></a><a href="#step-2">2 <span>자동 문항 확인</span></a><a href="#step-3">3 <span>이름 정하기</span></a><a href="#step-4">4 <span>분석하기</span></a><a href="#step-5">5 <span>결과 확인</span></a>
+  </nav>
+  <p class="sample-note">아래는 현재 프로그램을 직접 캡처한 화면입니다. 설명을 위한 가상 설문이며, 파일 이름과 영역 위치는 사용자의 설문에 따라 달라집니다. 이미지를 누르면 크게 볼 수 있습니다.</p>
+  <section id="step-1" class="step" aria-labelledby="title-1">
+    <div class="step-heading"><span>01</span><div><p>먼저 분석할 자료를 고릅니다</p><h2 id="title-1" tabindex="-1">PDF 불러오기를 누르세요.</h2></div></div>
+    <p class="action">화면 왼쪽 위 <b>PDF 불러오기</b> → 분석할 PDF 선택 → 설문지 한 부의 페이지 수 입력</p>
+    <a class="screenshot" href="설명서/images/01-pdf.png" target="_blank" rel="noopener"><img src="설명서/images/01-pdf.png" alt="실제 자동 탐지 결과. 만족·보통·불만족 세 칸이 초록색 Q1 문항으로 자동 그룹화되어 있습니다."></a>
+    <div class="check"><b>체크박스 탐지와 문항 묶기는 자동입니다</b><p>불러오기가 끝나면 같은 가로줄의 체크칸이 <b>Q1, Q2…</b> 문항으로 묶여 초록색으로 보입니다. 처음부터 하나씩 묶을 필요는 없습니다. 같은 양식의 PDF는 여러 파일을 함께 선택할 수 있습니다.</p></div>
+    <details><summary>지난번과 같은 양식이라면?</summary><p>PDF를 연 뒤 <b>프리셋 불러오기</b>를 누르세요. 저장된 문항 이름과 영역이 이번 종이에 맞는지 확인하고 <a href="#step-4">4. 분석하기</a>로 이동하면 됩니다.</p></details>
+    <details><summary>영역이 빠졌거나 비뚤어졌어요</summary><p><b>선택지 추가</b>를 누르고 빠진 체크칸을 드래그하세요. 화면 전체가 기울었다면 <b>기울기 다시 맞추기</b>를 사용한 뒤 위치를 다시 확인합니다.</p></details>
+  </section>
+  <section id="step-2" class="step" aria-labelledby="title-2">
+    <div class="step-heading"><span>02</span><div><p>자동으로 묶인 결과만 확인합니다</p><h2 id="title-2" tabindex="-1">Q1, Q2가 실제 질문과 맞나요?</h2></div></div>
+    <p class="action">종이의 질문과 초록색 문항 비교 → 맞으면 <b>다음 단계</b></p>
+    <a class="screenshot" href="설명서/images/02-select.png" target="_blank" rel="noopener"><img src="설명서/images/02-select.png" alt="자동 그룹화된 Q1 문항. 같은 질문의 만족·보통·불만족 세 칸이 한 문항에 들어 있으므로 다시 묶을 필요가 없습니다." loading="lazy"></a>
+    <div class="check"><b>한 질문의 보기들이 한 문항에 들어 있으면 그대로 진행</b><p>예시는 세 칸이 Q1로 잘 묶였습니다. 프로그램은 질문 내용을 읽는 것이 아니라 <b>가로줄의 위치</b>로 묶습니다. 같은 줄에 서로 다른 질문이 있거나, 한 질문의 보기가 여러 줄·세로로 놓인 곳은 특히 확인하세요.</p></div>
+    <details><summary>잘못 묶였거나 빠진 칸이 있을 때만 수정하세요</summary><p>빠진 체크칸은 <b>선택지 추가</b>로 그립니다. 그런 다음 <b>한 질문에 속할 칸을 모두</b> <kbd>Ctrl</kbd>+클릭으로 고르고 <b>문항으로 묶기</b> → 새 문항 이름을 입력합니다. 선택한 칸은 기존 묶음에서 빠져 새 문항으로 이동하고, 선택하지 않은 칸은 기존 문항에 남습니다. 여러 질문이 섞였다면 질문별로 반복하세요.</p></details>
+    <details><summary>잘못 선택했거나 지웠어요</summary><p><kbd>Esc</kbd>로 그리기를 취소하고 다시 선택하세요. 영역 편집은 <kbd>Ctrl</kbd> + <kbd>Z</kbd>로 되돌릴 수 있습니다. 원본 PDF는 바뀌지 않습니다.</p></details>
+    <details><summary>글이나 숫자를 적는 칸은 어떻게 하나요?</summary><p><b>자유기입 영역 추가</b>를 누르고 답변 칸 전체를 드래그하세요. 보라색으로 표시됩니다. 글자를 자동으로 텍스트로 바꾸는 기능이 아니므로, 내용은 검수 PDF에서 확인합니다.</p></details>
+  </section>
+  <section id="step-3" class="step" aria-labelledby="title-3">
+    <div class="step-heading"><span>03</span><div><p>이름을 넣기 전에 집계 방법을 확인합니다</p><h2 id="title-3" tabindex="-1">이 문항은 평균을 낼 건가요?</h2></div></div>
+    <p class="action"><b>선택지 이름 설정</b> → 문항 선택 → 아래 두 경우 중 맞는 설정 → <b>확인</b></p>
+    <div class="check"><b>평균을 낼 문항: 선택지 이름은 입력하지 마세요</b><p>예를 들어 평균을 낼 만족도 5문항은 <b>각 문항의 오른쪽 선택지 이름 칸을 모두 비우고 ‘평균 보기’를 체크</b>합니다. ‘매우 불만족’, ‘매우 만족’뿐 아니라 ‘1’, ‘5’ 같은 숫자도 오른쪽 칸에 다시 입력하지 않습니다. 왼쪽 번호가 점수로 사용됩니다.</p><p><b>문항 이름</b>을 ‘이용 만족도’처럼 바꾸는 것은 괜찮습니다. <b>문항 이름과 선택지 이름은 다릅니다.</b></p></div>
+    <a class="screenshot dialog-shot" href="설명서/images/03-average.png" target="_blank" rel="noopener"><img src="설명서/images/03-average.png" alt="평균용 설정 예시. 문항 이름만 이용 만족도로 바꾸고 오른쪽 선택지 이름은 모두 비어 있으며 평균 보기가 체크되어 있습니다. 왼쪽 번호는 위에서 3, 2, 1입니다." loading="lazy"></a>
+    <h3>선택지 번호 방향: 만족할수록 높은 점수가 되나요?</h3>
+    <p class="action"><b>문항 선택</b> → <b>선택지 번호 방향</b>에서 정순/역순 선택 → 바로 아래 <b>점수 순서</b> 확인</p>
+    <p><b>아래는 매우 만족을 5점으로 처리하려는 5점 척도 예시입니다.</b> 종이에 적힌 보기 순서를 보고 고르세요.</p>
+    <div class="score-table"><table>
+      <thead><tr><th>종이의 보기 순서 (왼쪽 → 오른쪽)</th><th>선택할 방향</th><th>붙는 점수</th></tr></thead>
+      <tbody><tr><td>매우 불만족 → 불만족 → 보통 → 만족 → 매우 만족</td><td><b>정순</b></td><td>1 → 2 → 3 → 4 → 5</td></tr>
+      <tr><td>매우 만족 → 만족 → 보통 → 불만족 → 매우 불만족</td><td><b>역순</b></td><td>5 → 4 → 3 → 2 → 1</td></tr></tbody>
+    </table></div>
+    <p>위 스크린샷은 3점 예시이므로 <b>역순</b>에서 ‘만족·보통·불만족’이 3·2·1점이 됩니다. <b>역순은 점수 번호의 방향이며, PDF 화면을 회전하는 기능이 아닙니다.</b></p>
+    <p><b>이미 입력한 선택지 이름은 다시 입력하지 않아도 됩니다.</b> 번호 역순을 바꾸면 이름 목록도 자동으로 재배치됩니다. 예를 들어 왼쪽 칸에 붙인 ‘매우 만족’은 번호가 1에서 5로 바뀌어도 그 칸의 이름으로 유지됩니다. 이름이 빈 평균용 문항은 점수 번호만 바뀝니다.</p>
+    <div class="check"><b>선택한 문항만 바뀝니다</b><p>문항마다 보기 순서가 다르면 각각 정순/역순을 선택하세요. 같은 설정을 쓰는 문항은 <b>일괄 적용</b>으로 선택지 이름·번호 방향·중복 허용·평균 보기를 함께 복사할 수 있습니다. 부정형 질문을 자동으로 알아서 역채점하는 기능은 아니므로 점수 기준은 직접 확인해야 합니다.</p><p>평균용 문항은 <b>오른쪽 선택지 이름은 빈 칸 · 평균 보기 체크 · 번호 방향 확인</b> 세 가지를 확인한 뒤 확인을 누르고 프리셋을 저장하세요. 기존 프리셋은 예전 전체 번호 방향을 그대로 이어받습니다.</p></div>
+    <details><summary>이미 ‘매우 불만족’ 같은 선택지 이름을 넣었다면?</summary><p>평균용 문항을 선택해 <b>오른쪽 칸의 값을 전부 지운 뒤 ‘평균 보기’를 다시 체크</b>하고 확인을 누르세요. 이름을 입력하면 평균 보기가 자동 해제되며, 값을 지우는 것만으로 다시 체크되지는 않습니다.</p></details>
+    <details><summary>평균을 내지 않고 응답 이름만 표시할 문항이라면</summary><p>이 경우에만 오른쪽 칸을 두 번 클릭해 표시할 이름을 입력합니다. 예: 이용 경로의 ‘인터넷·지인 소개·홍보물’. 아래처럼 만족도 이름을 넣는 방법도 <b>평균을 내지 않을 때만</b> 사용하세요.</p><a class="screenshot dialog-shot" href="설명서/images/03-options.png" target="_blank" rel="noopener"><img src="설명서/images/03-options.png" alt="평균을 내지 않는 경우에만 사용하는 이름 설정 예시. 만족·보통·불만족이 입력되어 있고 평균 보기는 해제되어 있습니다." loading="lazy"></a></details>
+    <details><summary>평균을 낼 문항이 여러 개라면</summary><p>각 문항에 같은 점수 기준을 적용하세요. <b>일괄 적용</b>은 같은 보기 개수와 보기 순서를 쓰는 문항만 대상으로 선택합니다. 대상의 번호 방향도 복사되므로, 평균용 문항과 이름 표시용 문항이나 보기 순서가 반대인 문항을 섞지 마세요. 마지막에 설정 창의 <b>확인</b>을 누릅니다.</p></details>
+    <details><summary>중복 허용은 별도 설정입니다</summary><p>여러 보기를 고를 수 있는 질문에만 체크합니다. 한 가지만 고르는 만족도 문항은 해제하세요.</p></details>
+  </section>
+  <section id="step-4" class="step" aria-labelledby="title-4">
+    <div class="step-heading"><span>04</span><div><p>설정을 확인하고 분석합니다</p><h2 id="title-4" tabindex="-1">초록색 분석 실행을 누르세요.</h2></div></div>
+    <p class="action">문항·영역 위치 확인 → 필요하면 <b>프리셋 저장</b> → <b>▶ 분석 실행</b></p>
+    <div class="check"><b>프리셋은 파일이 아니라 ‘설문 양식의 설정’입니다</b><p>같은 질문과 체크칸 배치를 쓰는 설문지는 한 번만 설정해서 저장하세요. 파일 이름·응답자·체크한 답이 달라도 같은 프리셋을 사용할 수 있습니다. 이름은 ‘홍길동.pdf’보다 <b>‘교육 만족도 양식’</b>처럼 붙이면 찾기 쉽습니다.</p><p>새 PDF는 <b>PDF 불러오기 → 프리셋 불러오기</b>로 처리합니다. 질문·보기 순서·페이지 수·배치가 바뀌었다면 설정을 다시 확인하세요.</p></div>
+    <a class="screenshot" href="설명서/images/04-analyze.png" target="_blank" rel="noopener"><img src="설명서/images/04-analyze.png" alt="이용 만족도 문항의 영역이 초록색으로 묶인 실제 화면. 상단 오른쪽에 초록색 분석 실행 버튼이 있습니다." loading="lazy"></a>
+    <div class="check"><b>완료 알림이 나올 때까지 기다리세요</b><p>진행 창에서 처리 상황을 확인할 수 있습니다. <b>프리셋 저장</b>은 다음에 쓸 설정을 저장하는 버튼이고, 결과 엑셀은 분석하면서 생성됩니다.</p></div>
+    <details><summary>분석을 시작할 수 없다고 나와요</summary><p>PDF를 불러왔는지, 자동 탐지된 문항이 있는지, 프리셋의 페이지 구성이 맞는지 확인하세요. 탐지된 칸이 없다면 선택지를 추가하고 문항으로 묶습니다. 오류 안내가 가리키는 항목을 먼저 수정합니다.</p></details>
+  </section>
+  <section id="step-5" class="step" aria-labelledby="title-5">
+    <div class="step-heading"><span>05</span><div><p>검수까지 해야 한 번의 작업이 끝납니다</p><h2 id="title-5" tabindex="-1">결과 폴더에서 엑셀을 확인하세요.</h2></div></div>
+    <p class="action"><b>결과 폴더</b> → 이번 실행 폴더 → 엑셀의 <b>결과</b>·<b>검수필요</b> 시트</p>
+    <a class="screenshot" href="설명서/images/04-analyze.png" target="_blank" rel="noopener"><img src="설명서/images/04-analyze.png" alt="메인 화면 맨 위 분석 실행 버튼 오른쪽의 결과 폴더 버튼. 분석 완료 후 이 버튼으로 저장 위치를 엽니다." loading="lazy"></a>
+    <div class="result-cards"><div><b>① 결과 시트</b><p>문항과 응답이 예상대로 들어갔는지 확인합니다.</p></div><div><b>② 검수필요 시트</b><p>확인이 필요한 응답을 찾아 원본과 대조합니다.</p></div><div><b>③ 검토용 PDF</b><p>체크가 애매하거나 직접 쓴 내용은 이 파일로 확인합니다.</p></div></div>
+    <div class="check"><b>다음번에는 더 짧게</b><p>같은 양식이면 ‘PDF 불러오기 → 프리셋 불러오기 → 영역 확인 → 분석 실행 → 검수’ 순서로 반복합니다.</p></div>
+  </section>
+  <div class="pager" hidden><button type="button" id="previous">← 이전</button><span id="position" aria-live="polite"></span><button type="button" id="next">다음 단계 →</button></div>
+  <details class="reference"><summary>특수한 상황이나 자세한 기준이 필요해요</summary><ul>
+    <li><a href="설명서/4_체크박스_자동_찾기.html">영역 이동·크기 조절·삭제</a></li><li><a href="설명서/7_분석_실행_엑셀_결과.html">엑셀과 검수 파일 자세히 보기</a></li><li><a href="설명서/8_프리셋_저장_불러오기.html">프리셋 재사용</a></li><li><a href="설명서/9_검토용_폴더.html">색상·단축키 기준표</a></li><li><a href="설명서/10_자주_묻는_질문_FAQ.html">문제 해결</a></li>
+  </ul></details>
+  <footer>궁금한 항목에서 우클릭해 보세요. 이 안내의 스크린샷은 가상 자료를 사용한 실제 프로그램 화면입니다.</footer>
+</main>
 </body>
 </html>

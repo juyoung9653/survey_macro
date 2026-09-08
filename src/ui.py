@@ -18,6 +18,7 @@ from PyQt6.QtCore import (
     pyqtSlot,
 )
 from PyQt6.QtGui import (
+    QAction,
     QActionGroup,
     QCloseEvent,
     QDesktopServices,
@@ -55,12 +56,15 @@ from PyQt6.QtWidgets import (
 )
 
 from .models import Box, Field, TemplatePreset, validate_field_names
+from .help_ui import HelpController
 from .processor import (
     _runtime_directory,
     generate_ui_templates,
     generate_ui_templates_multi,
     remap_preset_to_detected_layout,
     run_analysis,
+    _is_complete_result_run,
+    _result_run_sort_key,
 )
 from .progress import ProgressTiming, format_duration
 from .vision import (
@@ -342,6 +346,8 @@ class MainCanvas(QGraphicsView):
             scene_pos.x(), scene_pos.y()
         )
         if clicked is None:
+            self.parent_window.help_controller.show_help(self, event.globalPos())
+            event.accept()
             return
         if not any(box is clicked for box in self.parent_window.selected_boxes):
             self.parent_window.select_box(clicked, additive=False)
@@ -392,6 +398,7 @@ class _BatchApplyDialog(QDialog):
         self.setMinimumWidth(350)
 
         layout = QVBoxLayout(self)
+        self.help_controller = HelpController(self)
         layout.addWidget(QLabel(f"현재 문항: {src_name}"))
         layout.addWidget(QLabel("선택지 개수가 같은 문항 (일괄 적용 대상):"))
 
@@ -401,6 +408,7 @@ class _BatchApplyDialog(QDialog):
             cb.setChecked(True)
             layout.addWidget(cb)
             self.checkboxes.append((cb, idx))
+            self.help_controller.register(cb, "이 문항에도 적용", "체크한 문항에 현재 선택지 이름과 설정을 복사합니다.\n선택지 개수가 같아도 질문의 뜻이 다른 문항은 체크를 해제하세요.")
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -414,6 +422,9 @@ class _BatchApplyDialog(QDialog):
         button_box.accepted.connect(self._on_accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+
+        self.help_controller.register(ok_btn, "적용", "체크한 문항에 설정을 복사합니다.\n선택지 설정 창의 확인을 눌러야 최종 반영됩니다.")
+        self.help_controller.register(cancel_btn, "취소", "일괄 적용을 하지 않고 이전 설정 창으로 돌아갑니다.")
 
     def _on_accept(self):
         self.selected_indices = [idx for cb, idx in self.checkboxes if cb.isChecked()]
@@ -432,7 +443,11 @@ class ValueMappingDialog(QDialog):
         self.working_maps = [list(f.value_map) for f in fields]
         self.working_names = [f.name for f in fields]
         self.working_allow_duplicates = [f.allow_duplicates for f in fields]
-        self.working_show_average = [f.show_average for f in fields]
+        self.working_show_average = [
+            f.show_average if f.reverse_numbering is not None else
+            f.show_average or not any(f.value_map) for f in fields
+        ]
+        self.working_reverse_numbering = [f.effective_reverse_numbering(reverse_numbering) for f in fields]
         self.row_index_order = []
 
         self.setWindowTitle("문항 및 선택지 설정")
@@ -453,8 +468,14 @@ class ValueMappingDialog(QDialog):
         name_layout.addWidget(self.group_name_edit)
         layout.addLayout(name_layout)
 
-        reverse_text = "ON" if reverse_numbering else "OFF"
-        self.reverse_label = QLabel(f"현재 번호 역순: {reverse_text}")
+        direction_layout = QHBoxLayout()
+        direction_layout.addWidget(QLabel("선택지 번호 방향"))
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItems(["정순 (1 → 마지막 번호)", "역순 (마지막 번호 → 1)"])
+        direction_layout.addWidget(self.direction_combo)
+        layout.addLayout(direction_layout)
+        self.reverse_label = QLabel()
+        self.reverse_label.setWordWrap(True)
         layout.addWidget(self.reverse_label)
 
         check_layout = QHBoxLayout()
@@ -463,6 +484,13 @@ class ValueMappingDialog(QDialog):
         self.average_check = QCheckBox("평균 보기")
         check_layout.addWidget(self.average_check)
         layout.addLayout(check_layout)
+
+        self.average_hint = QLabel(
+            "평균을 낼 문항은 아래 선택지 이름을 모두 비우고 ‘평균 보기’를 체크하세요.\n"
+            "문항 이름은 바꿔도 됩니다. 선택지 이름을 입력하면 평균 보기가 해제됩니다."
+        )
+        self.average_hint.setWordWrap(True)
+        layout.addWidget(self.average_hint)
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
@@ -498,9 +526,31 @@ class ValueMappingDialog(QDialog):
         layout.addWidget(button_box)
 
         self.group_combo.currentIndexChanged.connect(self._on_group_changed)
+        self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
 
         if fields:
             self._load_group(0)
+
+        self.help_controller = HelpController(self)
+        for widget, title, text in (
+            (self.group_combo, "문항 선택", "설정할 문항을 고릅니다.\n다른 문항으로 이동해도 이 창 안의 수정 내용은 유지됩니다. 마지막에 확인을 누르세요."),
+            (self.group_name_edit, "문항 이름", "엑셀에서 알아볼 수 있는 질문 이름을 입력합니다. 예: 이용 만족도.\n다른 문항과 이름이 겹치지 않게 하세요."),
+            (self.direction_combo, "선택지 번호 방향", "선택한 문항만 정순 또는 역순으로 바꿉니다. 아래 점수 순서를 종이의 보기와 대조하세요.\n입력한 선택지 이름은 원래 칸에 대응하도록 자동 재배치됩니다. 다른 문항에도 적용하려면 일괄 적용을 사용하세요."),
+            (self.reverse_label, "점수 순서", "보기 순서에 대응하는 점수입니다. 가로는 왼쪽부터, 여러 줄은 위에서 아래로 읽습니다.\n부정형 질문을 자동으로 판별해 역채점하는 기능은 아닙니다."),
+            (self.duplicate_check, "중복 허용", "여러 보기를 고를 수 있는 질문일 때 체크합니다.\n한 가지만 고르는 질문이라면 해제하세요."),
+            (self.average_check, "평균 보기", "평균을 낼 문항은 오른쪽 선택지 이름을 모두 비우고 이 항목을 체크하세요. 왼쪽 번호가 점수로 사용됩니다.\n문항 이름은 바꿔도 됩니다. 선택지 이름에 글자나 숫자를 입력하면 평균 보기가 해제됩니다. 점수 방향을 종이와 대조하세요."),
+            (self.average_hint, "평균용 문항과 이름 표시용 문항", "평균용 문항: 선택지 이름은 빈 칸으로 두고 평균 보기를 체크합니다.\n이름 표시용 문항: 오른쪽에 이름을 입력하고 평균 보기는 끕니다. 문항 이름 변경은 어느 경우든 가능합니다."),
+            (self.table, "선택지 이름", "평균을 낼 문항은 오른쪽 칸을 비워 두세요. ‘매우 불만족’이나 숫자를 다시 입력하지 않습니다. 왼쪽 번호가 점수입니다.\n평균 없이 이름으로 표시할 문항만 오른쪽에 값을 입력하세요. 예: 인터넷, 지인 소개, 홍보물. 입력하면 평균 보기가 해제됩니다."),
+            (self.batch_apply_btn, "일괄 적용", "선택지 이름, 번호 방향, 중복 허용, 평균 보기 설정을 함께 복사합니다. 문항 이름은 복사하지 않습니다.\n같은 보기 구성을 사용하는 문항만 대상으로 선택하세요."),
+            (ok_btn, "확인", "이 창에서 바꾼 문항 이름과 선택지 설정을 반영합니다.\n다음에도 쓰려면 메인 화면에서 프리셋 저장을 누르세요."),
+            (cancel_btn, "취소", "이 창에서 수정한 내용을 반영하지 않고 닫습니다."),
+        ):
+            self.help_controller.register(widget, title, text)
+        self.item_help_btn = QPushButton("? 항목 도움말")
+        self.item_help_btn.clicked.connect(self.help_controller.enter_mode)
+        self.item_help_btn.setToolTip("누른 뒤 궁금한 항목을 클릭하세요. Esc로 취소합니다.")
+        btn_layout.addWidget(self.item_help_btn)
+        self.help_controller.register(self.item_help_btn, "항목 도움말", "이 버튼을 누른 뒤 궁금한 항목을 클릭하면 설명이 나옵니다.\n항목을 우클릭해도 설명을 볼 수 있습니다. Esc로 취소합니다.")
 
     def _load_group(self, index: int):
         if index < 0 or index >= len(self.fields):
@@ -527,8 +577,16 @@ class ValueMappingDialog(QDialog):
 
         values = self.working_maps[index] if index < len(self.working_maps) else []
         self.row_index_order = list(range(box_count))
-        if self.reverse_numbering:
+        if self.working_reverse_numbering[index]:
             self.row_index_order = list(reversed(self.row_index_order))
+        self.direction_combo.blockSignals(True)
+        self.direction_combo.setCurrentIndex(int(self.working_reverse_numbering[index]))
+        self.direction_combo.setEnabled(not field.is_comment and box_count > 1)
+        self.direction_combo.blockSignals(False)
+        self.reverse_label.setText(
+            "자유기입 문항에는 점수 번호를 적용하지 않습니다." if field.is_comment else
+            "점수 순서: " + " → ".join(str(number + 1) for number in self.row_index_order) + "점"
+        )
 
         self.table.blockSignals(True)
         for row_idx, map_idx in enumerate(self.row_index_order):
@@ -540,14 +598,19 @@ class ValueMappingDialog(QDialog):
             self.table.setItem(row_idx, 1, QTableWidgetItem(value))
         self.table.blockSignals(False)
 
-        # 값이 하나도 없으면 기본적으로 평균 보기 체크
-        all_empty = all(
-            not (self.table.item(r, 1) and self.table.item(r, 1).text().strip())
-            for r in range(box_count)
-        )
-        if all_empty:
-            avg = True
         self.average_check.setChecked(bool(avg))
+
+    def _on_direction_changed(self, index: int):
+        if not self.fields:
+            return
+        current = self.current_group_index
+        reverse = bool(index)
+        if self.fields[current].is_comment or self.working_reverse_numbering[current] == reverse:
+            return
+        self._save_current_group()
+        self.working_maps[current] = list(reversed(self.working_maps[current]))
+        self.working_reverse_numbering[current] = reverse
+        self._load_group(current)
 
     def _on_cell_changed(self, row: int, col: int):
         if col != 1:
@@ -620,7 +683,7 @@ class ValueMappingDialog(QDialog):
         for i, f in enumerate(self.fields):
             if i == src_idx:
                 continue
-            if len(f.boxes) == src_box_count:
+            if len(f.boxes) == src_box_count and f.is_comment == self.fields[src_idx].is_comment:
                 candidates.append((i, f.name))
 
         if not candidates:
@@ -633,6 +696,7 @@ class ValueMappingDialog(QDialog):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             for idx in dialog.selected_indices:
                 self.working_maps[idx] = list(src_values)
+                self.working_reverse_numbering[idx] = self.working_reverse_numbering[src_idx]
                 if src_idx < len(self.working_allow_duplicates):
                     self.working_allow_duplicates[idx] = self.working_allow_duplicates[
                         src_idx
@@ -672,6 +736,8 @@ class ValueMappingDialog(QDialog):
                 else False
             )
             field.show_average = bool(avg)
+            if not field.is_comment:
+                field.reverse_numbering = self.working_reverse_numbering[idx]
         super().accept()
 
 
@@ -784,7 +850,8 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked, i=idx: self.change_rotation(i))
             self.rotation_actions.append(action)
 
-        self.reverse_number_action = page_menu.addAction("번호 역순: ON")
+        # Legacy API only; users now change direction in the per-field dialog.
+        self.reverse_number_action = QAction("번호 역순: ON", self)
         self.reverse_number_action.setCheckable(True)
         self.reverse_number_action.toggled.connect(self.toggle_reverse_numbering)
 
@@ -801,9 +868,7 @@ class MainWindow(QMainWindow):
         delete_preset_action = preset_menu.addAction("삭제")
         delete_preset_action.triggered.connect(self.delete_preset)
 
-        settings_menu = file_menu.addMenu("설정")
-        dup_action = settings_menu.addAction("중복 허용")
-        dup_action.triggered.connect(self.open_value_mapping)
+        settings_menu = file_menu.addMenu("기울기")
         self.manual_fine_angle_action = settings_menu.addAction(
             "수동 기울기 조정..."
         )
@@ -816,6 +881,25 @@ class MainWindow(QMainWindow):
 
         cache_action = file_menu.addAction("캐시 삭제")
         cache_action.triggered.connect(self.clear_cache)
+
+        self._menu_help_entries = [
+            (file_menu, load_action, "PDF 불러오기", "같은 양식의 PDF를 선택합니다. 체크칸을 찾고 가로줄 기준으로 Q1, Q2… 문항을 자동으로 묶습니다.\n완료 후 문항이 실제 질문과 맞는지 확인하세요."),
+            (file_menu, page_menu.menuAction(), "페이지 설정", "페이지 회전과 화면 배치를 설정합니다.\n선택지 번호 방향은 선택지 이름 설정 창에서 문항별로 변경하세요."),
+            (page_menu, rotation_menu.menuAction(), "회전", "설문지가 옆으로 눕거나 뒤집혀 있으면 페이지 방향을 선택합니다.\n작은 기울기는 기울기 → 수동 기울기 조정을 사용하세요."),
+            (page_menu, self.view_toggle_action, "화면 배치", "설문지 페이지를 세로 한 열 또는 두 열로 배치해 봅니다.\n응답 내용이나 문항 구성을 바꾸는 기능은 아닙니다."),
+            (file_menu, preset_menu.menuAction(), "프리셋", "문항 이름, 선택지 설정과 영역 위치를 저장하고 다시 사용합니다.\n다음에도 같은 설문 양식일 때 불러오세요."),
+            (preset_menu, save_action, "프리셋 저장", "현재 문항과 영역 설정을 저장합니다. 이미 이름이 있는 프리셋은 해당 설정을 갱신합니다.\n결과 엑셀 저장과는 다릅니다."),
+            (preset_menu, save_as_action, "다른 이름으로 저장", "현재 설정을 다른 프리셋 이름으로 저장합니다. 기존 설정을 남기면서 새 버전을 만들 때 사용하세요."),
+            (preset_menu, load_preset_action, "프리셋 불러오기", "PDF를 먼저 연 뒤 같은 양식에 저장한 설정을 불러옵니다.\n불러온 후 문항과 영역 위치가 맞는지 확인하세요."),
+            (preset_menu, delete_preset_action, "프리셋 삭제", "저장된 프리셋을 선택해 삭제합니다. 다시 쓸 설정인지 먼저 확인하세요.\n원본 PDF를 삭제하는 기능은 아닙니다."),
+            (file_menu, settings_menu.menuAction(), "기울기", "작은 기울기를 직접 보정하는 설정을 엽니다.\n자동 보정 후에도 기울어졌을 때만 사용하세요."),
+            (settings_menu, self.manual_fine_angle_action, "수동 기울기 조정", "자동 보정 뒤에도 종이가 기울어졌을 때 각도를 직접 조정합니다.\n적용하면 체크칸을 다시 탐지하므로 문항과 영역을 다시 확인하세요."),
+            (file_menu, cache_action, "캐시 삭제", "저장된 중간 처리 자료를 지우고 현재 PDF를 다시 탐색합니다.\n원본 PDF나 결과 엑셀을 지우는 기능은 아닙니다. 다시 탐지된 문항 구성을 확인하세요."),
+        ]
+        self._menu_help_entries.extend(
+            (rotation_menu, action, f"회전: {label}", "페이지를 선택한 방향으로 회전하고 체크칸을 다시 탐지합니다.\n적용 뒤 문항과 영역 위치를 다시 확인하세요.")
+            for action, label in zip(self.rotation_actions, ROTATION_LABELS)
+        )
 
         self._sync_rotation_actions()
         self._sync_reverse_numbering_state()
@@ -950,6 +1034,8 @@ class MainWindow(QMainWindow):
         self.auto_deskew_btn.clicked.connect(self.auto_deskew_pages)
         btn_layout.addWidget(self.auto_deskew_btn)
         btn_layout.addStretch(1)
+        btn_layout.addWidget(self.undo_btn)
+        btn_layout.addWidget(self.redo_btn)
         btn_layout.addWidget(self.exec_btn)
 
         main_layout.addLayout(btn_layout)
@@ -965,15 +1051,13 @@ class MainWindow(QMainWindow):
         edit_layout.addWidget(self.delete_selected_btn)
         edit_layout.addStretch(1)
         self.open_results_btn = QPushButton("결과 폴더")
-        self.open_results_btn.setToolTip("분석 결과가 저장되는 폴더를 엽니다.")
+        self.open_results_btn.setToolTip("가장 최근에 완료된 분석의 결과 폴더를 엽니다.")
         self.open_results_btn.clicked.connect(self.open_results_folder)
-        edit_layout.addWidget(self.open_results_btn)
-        self.help_btn = QPushButton("도움말")
-        self.help_btn.setToolTip("현재 프로그램 사용 설명서를 엽니다.")
+        btn_layout.addWidget(self.open_results_btn)
+        self.help_btn = QPushButton("설명서")
+        self.help_btn.setToolTip("실제 화면을 보며 PDF부터 결과 확인까지 따라합니다.")
         self.help_btn.clicked.connect(self.open_help)
         edit_layout.addWidget(self.help_btn)
-        edit_layout.addWidget(self.undo_btn)
-        edit_layout.addWidget(self.redo_btn)
         main_layout.addLayout(edit_layout)
 
         guide_layout = QHBoxLayout()
@@ -994,6 +1078,43 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.canvas)
         self.set_edit_mode(MainCanvas.MODE_SELECT)
         self._refresh_document_status()
+        self._init_context_help(edit_layout)
+
+    def _init_context_help(self, help_layout):
+        self.help_controller = HelpController(self)
+        entries = (
+            (self.file_menu_btn, "파일 메뉴", "PDF 불러오기, 페이지 방향, 프리셋과 캐시 설정이 있습니다.\n선택지 번호 방향은 선택지 이름 설정 창에서 문항별로 변경하세요."),
+            (self.load_pdf_btn, "PDF 불러오기", "PDF를 열면 체크칸을 찾고 같은 가로줄끼리 Q1, Q2… 문항으로 자동으로 묶습니다.\n초록색 문항이 실제 질문과 맞는지 확인하세요. 같은 양식의 파일은 여러 개 골라도 됩니다."),
+            (self.load_preset_btn, "같은 양식의 설정 불러오기", "PDF를 먼저 연 뒤 저장해 둔 문항·선택지 설정을 불러옵니다.\n질문이나 위치가 바뀐 설문에는 예전 설정을 그대로 쓰지 마세요."),
+            (self.save_preset_btn, "프리셋 저장", "PDF 파일이 아니라 설문 양식의 설정을 저장합니다. 질문과 체크칸 배치가 같으면 파일 이름·응답자·체크한 답이 달라도 재사용할 수 있습니다.\n예: 교육 만족도 양식. 다음 파일은 PDF를 연 뒤 프리셋을 불러오세요. 분석 결과 엑셀을 저장하는 버튼은 아닙니다."),
+            (self.document_status_label, "불러온 문서와 설정", "현재 PDF와 적용된 프리셋 상태를 보여줍니다.\n분석 전에 원하는 파일과 설정인지 확인하세요."),
+            (self.auto_deskew_btn, "기울기 다시 맞추기", "PDF를 열 때 자동으로 맞춘 기울기를 다시 계산합니다.\n체크칸과 영역이 비스듬히 어긋날 때 사용하세요. 보정 뒤 영역 위치를 다시 확인하세요."),
+            (self.draw_box_tool_btn, "빠진 선택지 추가", "버튼을 누르고 종이의 체크칸 테두리를 드래그합니다.\n추가한 파란 영역은 같은 질문의 다른 선택지와 함께 문항으로 묶으세요. Esc로 그리기를 취소합니다."),
+            (self.draw_comment_tool_btn, "자유기입 영역 추가", "글이나 숫자를 적는 답변 칸을 드래그해 지정합니다.\n직접 쓴 글을 문자로 바꾸는 기능은 아닙니다. 내용은 검수 PDF에서 확인하세요."),
+            (self.group_btn, "자동 문항이 틀렸을 때만 다시 묶기", "PDF를 열면 가로줄 기준으로 문항이 자동 생성됩니다. 맞게 묶였다면 이 버튼은 누르지 않아도 됩니다.\n수정할 때는 한 질문의 칸을 모두 Ctrl+클릭으로 고른 뒤 누르세요. 선택한 칸만 기존 묶음에서 새 문항으로 이동합니다."),
+            (self.value_map_btn, "선택지 이름 설정", "먼저 평균을 낼 문항인지 확인하세요. 평균용 문항은 선택지 이름을 비워 두고 평균 보기를 체크합니다.\n문항 이름은 바꿔도 됩니다. 평균 없이 이름으로 표시할 문항만 선택지 이름을 입력하세요."),
+            (self.comment_field_btn, "자유기입 전환", "선택한 기존 문항을 글이나 숫자를 적는 영역으로 바꾸거나 되돌립니다.\n보라색이 자유기입 영역입니다. 새 영역은 자유기입 영역 추가로 만드세요."),
+            (self.delete_selected_btn, "선택 삭제", "현재 선택한 영역만 삭제합니다. 원본 PDF는 지우지 않습니다.\n잘못 지웠으면 Ctrl+Z로 되돌리세요."),
+            (self.undo_btn, "실행 취소", "방금 한 영역 편집을 되돌립니다. 단축키는 Ctrl+Z입니다.\n되돌릴 편집이 없으면 비활성화됩니다."),
+            (self.redo_btn, "다시 실행", "실행 취소한 편집을 다시 적용합니다. 단축키는 Ctrl+Y입니다."),
+            (self.exec_btn, "분석 실행", "설정한 문항을 기준으로 PDF를 분석하고 엑셀과 검수용 파일을 만듭니다.\n파일과 문항 설정을 먼저 확인하세요. 완료 후 결과를 확인해야 작업이 끝납니다."),
+            (self.open_results_btn, "결과 확인", "가장 최근에 완료된 분석의 설문결과_날짜.시간 폴더를 엽니다.\n엑셀의 결과·검수필요 시트를 보고, 확인이 필요한 응답은 검수 PDF와 대조하세요."),
+            (self.help_btn, "설명서", "실제 화면의 스크린샷을 보며 PDF 불러오기부터 결과 확인까지 따라합니다.\n지금 궁금한 버튼 하나만 알고 싶으면 우클릭하세요."),
+            (self.edit_status_label, "현재 편집 상태", "선택한 영역과 현재 편집 모드를 보여줍니다.\n원하는 동작이 안 되면 Esc를 눌러 그리기를 취소한 뒤 다시 선택하세요."),
+            (self.edit_legend_label, "영역 색상", "초록은 문항으로 묶은 선택형, 보라는 자유기입, 파랑은 아직 묶지 않은 영역입니다.\n노랑은 현재 선택한 영역입니다."),
+        )
+        for widget, title, text in entries:
+            self.help_controller.register(widget, title, text)
+        for menu, action, title, text in self._menu_help_entries:
+            self.help_controller.register_action(menu, action, title, text)
+        self.help_controller.register(self.canvas, "자동 문항 확인", "초록색 Q1, Q2…가 실제 질문별 보기와 맞는지 확인하세요. 가로줄 기준 자동 묶음이 맞으면 그대로 진행합니다.\n잘못 묶인 곳만 같은 질문의 칸을 골라 문항으로 묶으세요. 영역 우클릭으로 편집·도움말을 열 수 있습니다. 원본 PDF는 변경하지 않습니다.", context_menu=False)
+        self.help_controller.register(self.canvas.viewport(), "설문지 화면", "선택지를 클릭하거나 드래그해 선택합니다. 선택한 영역은 이동·크기 조절할 수 있습니다.\n초록: 선택형 / 보라: 자유기입 / 파랑: 미분류 / 노랑: 선택됨", context_menu=False)
+        self.item_help_btn = QPushButton("? 항목 도움말")
+        self.item_help_btn.setToolTip("누른 뒤 궁금한 버튼이나 체크박스를 클릭하세요. Esc로 취소합니다.")
+        self.item_help_btn.clicked.connect(self.help_controller.enter_mode)
+        self.help_controller.register(self.item_help_btn, "항목 도움말", "누른 뒤 궁금한 항목을 클릭하세요. 설명만 표시하며 그 항목을 실행하지 않습니다.\n우클릭으로도 설명을 볼 수 있습니다. Esc로 취소합니다.")
+        self.statusBar().showMessage("궁금한 항목은 우클릭 · 처음이라면 ‘설명서’")
+        help_layout.insertWidget(help_layout.indexOf(self.help_btn) + 1, self.item_help_btn)
 
     def _refresh_document_status(self):
         if not hasattr(self, "document_status_label"):
@@ -1074,14 +1195,26 @@ class MainWindow(QMainWindow):
     def open_results_folder(self):
         result_folder = _runtime_directory() / "결과"
         try:
-            result_folder.mkdir(parents=True, exist_ok=True)
+            runs = []
+            for folder in result_folder.iterdir() if result_folder.is_dir() else []:
+                if _is_complete_result_run(folder):
+                    try:
+                        runs.append((_result_run_sort_key(folder), folder))
+                    except ValueError:
+                        continue
+            latest = max(runs, key=lambda item: item[0])[1] if runs else None
         except OSError as exc:
             QMessageBox.critical(
-                self, "결과 폴더 오류", f"결과 폴더를 만들 수 없습니다.\n\n{exc}"
+                self, "결과 폴더 오류", f"분석 결과 폴더를 확인할 수 없습니다.\n\n{exc}"
+            )
+            return False
+        if latest is None:
+            QMessageBox.information(
+                self, "분석 결과 없음", "완료된 분석 결과가 없습니다. 먼저 분석을 실행해주세요."
             )
             return False
         if not QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(result_folder.resolve()))
+            QUrl.fromLocalFile(str(latest.resolve()))
         ):
             QMessageBox.warning(
                 self, "결과 폴더 열기 실패", "결과 폴더를 열지 못했습니다."
@@ -1548,10 +1681,29 @@ class MainWindow(QMainWindow):
     def toggle_reverse_numbering(self, checked: bool):
         checked = bool(checked)
         changed = self.preset.reverse_numbering != checked
+        if changed:
+            MainWindow._reverse_choice_names(self.preset.fields)
+            # Edit snapshots do not store the numbering direction. Rebase their
+            # maps too, so a later undo/redo still names the same physical boxes.
+            for history in (self._undo_history, self._redo_history):
+                for (fields, _pending), _description in history:
+                    MainWindow._reverse_choice_names(fields)
         self.preset.reverse_numbering = checked
         self._sync_reverse_numbering_state()
         if changed:
             MainWindow._set_preset_dirty(self, True)
+
+    @staticmethod
+    def _reverse_choice_names(fields: list[Field]) -> None:
+        for field in fields:
+            count = len(field.boxes)
+            if field.is_comment or field.reverse_numbering is not None or count < 2 or not any(field.value_map):
+                continue
+            # Maps are keyed by displayed number, not physical box index.
+            # Pad missing entries before reversing; preserve unrelated trailing
+            # entries from older presets instead of silently deleting data.
+            values = (field.value_map[:count] + [""] * count)[:count]
+            field.value_map = list(reversed(values)) + field.value_map[count:]
 
     def _show_progress_dialog(self, title: str, label: str) -> QProgressDialog:
         dialog = QProgressDialog(label, None, 0, 100, self)
@@ -3017,18 +3169,30 @@ class MainWindow(QMainWindow):
         return None
 
     @staticmethod
-    def _remove_box_ids_from_field(field: Field, removed_ids: set[int]):
+    def _remove_box_ids_from_field(
+        field: Field, removed_ids: set[int], default_reverse: bool = False
+    ):
+        old_count = len(field.boxes)
+        reverse = field.effective_reverse_numbering(default_reverse)
+        physical_values = []
         kept_boxes = []
-        kept_values = []
-        for index, box in enumerate(field.boxes):
+        for index, box in enumerate(field.boxes, start=1):
             if id(box) in removed_ids:
                 continue
-            kept_boxes.append(box)
-            kept_values.append(
-                field.value_map[index] if index < len(field.value_map) else ""
+            map_index = old_count - index if reverse else index - 1
+            physical_values.append(
+                field.value_map[map_index] if map_index < len(field.value_map) else ""
             )
+            kept_boxes.append(box)
+        if field.is_comment:
+            field.boxes = kept_boxes
+            return
+        kept_values = [""] * len(kept_boxes)
+        for index, value in enumerate(physical_values, start=1):
+            map_index = len(kept_boxes) - index if reverse else index - 1
+            kept_values[map_index] = value
         field.boxes = kept_boxes
-        field.value_map = kept_values
+        field.value_map = kept_values + field.value_map[old_count:]
 
     def delete_selected_boxes(self, confirm: bool = True):
         if not self.selected_boxes:
@@ -3059,7 +3223,9 @@ class MainWindow(QMainWindow):
             box for box in self.pending_boxes if id(box) not in selected_ids
         ]
         for field in self.preset.fields:
-            self._remove_box_ids_from_field(field, selected_ids)
+            self._remove_box_ids_from_field(
+                field, selected_ids, self.preset.reverse_numbering
+            )
         self.preset.fields = [field for field in self.preset.fields if field.boxes]
         self.selected_boxes.clear()
         self._commit_edit(previous_state, f"선택 영역 {len(selected_ids)}개 삭제")
@@ -3115,6 +3281,8 @@ class MainWindow(QMainWindow):
                 else "자유기입으로 지정"
             )
             delete_question_action = menu.addAction(f"'{field.name}' 문항 전체 삭제")
+        menu.addSeparator()
+        help_action = menu.addAction("이 영역 도움말")
         chosen = menu.exec(global_pos)
         if chosen is delete_selected_action:
             self.delete_selected_boxes()
@@ -3124,6 +3292,8 @@ class MainWindow(QMainWindow):
             self.toggle_comment_field(field)
         elif delete_question_action is not None and chosen is delete_question_action:
             self.delete_question(field)
+        elif chosen is help_action:
+            self.help_controller.show_help(self.canvas, global_pos)
 
     def group_boxes(self):
         if not self.selected_boxes:
@@ -3157,23 +3327,36 @@ class MainWindow(QMainWindow):
         previous_state = self._capture_edit_state()
         mapped_values = {}
         for field in self.preset.fields:
-            for index, box in enumerate(field.boxes):
+            count = len(field.boxes)
+            reverse = field.effective_reverse_numbering(
+                self.preset.reverse_numbering
+            )
+            for index, box in enumerate(field.boxes, start=1):
                 if id(box) in selected_ids:
+                    map_index = count - index if reverse else index - 1
                     mapped_values[id(box)] = (
-                        field.value_map[index]
-                        if index < len(field.value_map)
+                        field.value_map[map_index]
+                        if map_index < len(field.value_map)
                         else ""
                     )
         self.pending_boxes = [
             box for box in self.pending_boxes if id(box) not in selected_ids
         ]
         for field in self.preset.fields:
-            self._remove_box_ids_from_field(field, selected_ids)
+            self._remove_box_ids_from_field(
+                field, selected_ids, self.preset.reverse_numbering
+            )
         self.preset.fields = [field for field in self.preset.fields if field.boxes]
+        new_reverse = bool(self.preset.reverse_numbering)
+        new_values = [""] * len(selected)
+        for index, box in enumerate(selected, start=1):
+            map_index = len(selected) - index if new_reverse else index - 1
+            new_values[map_index] = mapped_values.get(id(box), "")
         new_field = Field(
             name=name,
             boxes=selected,
-            value_map=[mapped_values.get(id(box), "") for box in selected],
+            value_map=new_values,
+            reverse_numbering=new_reverse,
         )
         self.preset.fields.append(new_field)
         self.selected_boxes = list(new_field.boxes)

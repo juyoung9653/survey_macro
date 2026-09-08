@@ -70,6 +70,11 @@ class Field:
     is_comment: bool = False
     allow_duplicates: bool = False
     show_average: bool = False
+    reverse_numbering: bool | None = None
+
+    def effective_reverse_numbering(self, default: bool) -> bool:
+        """Return this field's explicit direction, or the legacy default."""
+        return bool(default) if self.reverse_numbering is None else self.reverse_numbering
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -79,6 +84,10 @@ class Field:
         is_comment = bool(data.get("is_comment", False))
         allow_duplicates = bool(data.get("allow_duplicates", False))
         show_average = bool(data.get("show_average", False))
+        raw_reverse_numbering = data.get("reverse_numbering")
+        reverse_numbering = (
+            raw_reverse_numbering if isinstance(raw_reverse_numbering, bool) else None
+        )
         return cls(
             name=str(data.get("name", "")),
             boxes=boxes,
@@ -86,10 +95,11 @@ class Field:
             is_comment=is_comment,
             allow_duplicates=allow_duplicates,
             show_average=show_average,
+            reverse_numbering=reverse_numbering,
         )
 
     def to_dict(self):
-        return {
+        data = {
             "name": self.name,
             "boxes": [b.to_dict() for b in self.boxes],
             "value_map": self.value_map,
@@ -97,6 +107,9 @@ class Field:
             "allow_duplicates": self.allow_duplicates,
             "show_average": self.show_average,
         }
+        if self.reverse_numbering is not None:
+            data["reverse_numbering"] = self.reverse_numbering
+        return data
 
 
 @dataclass

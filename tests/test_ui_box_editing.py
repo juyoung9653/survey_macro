@@ -216,6 +216,7 @@ class BoxEditingTests(unittest.TestCase):
 
     def test_regrouping_preserves_existing_selected_values(self):
         window = _EditorHarness(page_count=1)
+        window.preset.reverse_numbering = False  # A/B are left-to-right names.
         first = Box(0, 10, 10, 10, 10)
         second = Box(0, 30, 10, 10, 10)
         pending = Box(0, 50, 10, 10, 10)
