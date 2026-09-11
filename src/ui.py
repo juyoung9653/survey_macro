@@ -1126,6 +1126,8 @@ class MainWindow(QMainWindow):
             document_text = (
                 f"PDF {len(self.file_paths)}개 · {self.preset.page_count}쪽/부"
             )
+            if len(self.file_paths) > 1:
+                document_text += f" · 화면 기준: {Path(self.file_paths[0]).name}"
         if self.current_preset_name:
             preset_text = self.current_preset_name
         elif getattr(self, "_preset_dirty", False):
@@ -2539,17 +2541,18 @@ class MainWindow(QMainWindow):
             self.update_canvas()
             self._sync_view_toggle_text()
 
-            # 여러 PDF의 첫 설문을 합쳐 자동 탐지 기준을 더 안정적으로 만듭니다.
+            # 화면에서 문항을 설정할 첫 파일의 양식만 준비합니다.
+            # 다른 파일의 칸 위치는 분석할 때 해당 파일에서 따로 찾습니다.
             multi_templates = None
             if len(self.file_paths) > 1:
-                load_stage = "여러 PDF의 페이지 정렬 및 기준 양식 병합"
+                load_stage = "선택한 PDF 확인 및 첫 파일의 문항 설정 양식 준비"
                 multi_templates = generate_ui_templates_multi(
                     self.file_paths,
                     page_count,
                     self.preset.rot_code,
                     self.preset.fine_angle,
                     progress_cb=self._wrap_progress(
-                        40, 30, "템플릿 병합 중...", progress_cb
+                        40, 30, "문항 설정 양식 준비 중...", progress_cb
                     ),
                     page_fine_angles=self.preset.page_fine_angles,
                 )
@@ -3385,7 +3388,7 @@ class MainWindow(QMainWindow):
         체크박스를 자동으로 탐지하고, 수평으로 같은 라인에 있는 항목을
         Q1, Q2, Q3 등의 문항(Field)으로 자동 할당합니다.
 
-        prebuilt_templates: load_pdf에서 이미 생성한 병합 템플릿 (중복 생성 방지)
+        prebuilt_templates: load_pdf에서 준비한 첫 파일의 문항 설정 양식
         """
         if not self.pages or not self.file_paths:
             return
@@ -3405,7 +3408,7 @@ class MainWindow(QMainWindow):
 
         if prebuilt_templates is not None:
             templates = prebuilt_templates
-            report(0, "병합 템플릿 사용")
+            report(0, "문항 설정 양식 사용")
         else:
             report(0, "템플릿 생성 중...")
             if len(self.file_paths) > 1:

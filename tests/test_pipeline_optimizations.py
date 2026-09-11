@@ -767,8 +767,14 @@ class PipelineOptimizationTests(unittest.TestCase):
         sample_names = {id(samples): path for path, samples in sample_sets.items()}
         events: list[tuple[str, str]] = []
         exported_rows: list[dict] = []
+        local_references = {
+            path: [np.full((8, 8), 180 - index * 20, np.uint8)]
+            for index, path in enumerate(file_paths)
+        }
 
         def collect_samples(fpath, *_args, **_kwargs):
+            self.assertIs(_args[1], local_references[fpath])
+            self.assertEqual(_args[0].fields, [])
             file_index = file_paths.index(fpath)
             if file_index > 0:
                 self.assertEqual(sample_sets[file_paths[file_index - 1]], {})
@@ -783,6 +789,7 @@ class PipelineOptimizationTests(unittest.TestCase):
 
         def analyze_file(fpath, file_label, *_args, sample_pages=None, **_kwargs):
             self.assertIs(sample_pages, sample_sets[fpath])
+            self.assertIs(_args[3], local_references[fpath])
             events.append(("analyze", fpath))
             return file_label, [{"파일명": file_label, "페이지": "1p"}], []
 
@@ -792,6 +799,7 @@ class PipelineOptimizationTests(unittest.TestCase):
 
         config = TemplatePreset(page_count=1)
         template_page = np.full((8, 8), 255, np.uint8)
+        clean_pages = [template_page.copy()]
         resource_controller = _ResourceControllerStub()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -812,6 +820,14 @@ class PipelineOptimizationTests(unittest.TestCase):
                         side_effect=analyze_file,
                     ),
                     patch("src.processor._validate_analysis_page_geometry"),
+                    patch(
+                        "src.processor._load_file_alignment_references",
+                        side_effect=lambda path, _config: local_references[path],
+                    ),
+                    patch(
+                        "src.processor._replace_single_sample_templates",
+                        wraps=_replace_single_sample_templates,
+                    ) as replace_blank,
                     patch("src.processor._insert_img_into_pdf"),
                     patch("src.processor.export_to_excel", side_effect=export_rows),
                 ):
@@ -821,11 +837,16 @@ class PipelineOptimizationTests(unittest.TestCase):
                         config,
                         resource_controller=resource_controller,
                         output_base_dir=temp_dir,
+                        single_sample_template_pages=clean_pages,
                     )
             finally:
                 os.chdir(previous_cwd)
 
         self.assertTrue(success)
+        self.assertEqual(replace_blank.call_count, 3)
+        self.assertIs(replace_blank.call_args_list[0].args[2], clean_pages)
+        self.assertIsNone(replace_blank.call_args_list[1].args[2])
+        self.assertIsNone(replace_blank.call_args_list[2].args[2])
         self.assertEqual(
             events,
             [
@@ -875,6 +896,10 @@ class PipelineOptimizationTests(unittest.TestCase):
                         return_value=template,
                     ),
                     patch("src.processor._validate_analysis_page_geometry"),
+                    patch(
+                        "src.processor._load_file_alignment_references",
+                        return_value=[template[0]],
+                    ),
                     patch("src.processor._insert_img_into_pdf"),
                 ):
                     with self.assertRaisesRegex(

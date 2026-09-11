@@ -3,8 +3,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
+import fitz
 import numpy as np
 import openpyxl
 
@@ -24,6 +26,9 @@ from src.vision import (
 
 
 _RUN_CORPUS_TESTS = os.getenv("RUN_SCAN_CORPUS_TESTS") == "1"
+_RUN_TRIO_CORPUS_TESTS = (
+    os.getenv("RUN_TRIO_CORPUS_TESTS") == "1" or _RUN_CORPUS_TESTS
+)
 _SCAN_DIR = Path(
     os.getenv("SURVEY_SCAN_CORPUS", r"C:\Users\Public\scan")
 )
@@ -40,6 +45,9 @@ _ONE_PAGE_PDFS = (
     "운영실무.pdf",
     "웰다잉.pdf",
     "자활창업.pdf",
+    "리더.pdf",
+    "마음.pdf",
+    "여행.pdf",
 )
 _TWO_PAGE_PDFS = (
     "거점.pdf",
@@ -59,7 +67,10 @@ _TWO_PAGE_PDFS = (
 _ADDITIONAL_CORPUS_PDFS = (
     "S25C-0i26090316340.pdf",
     "법정의무.pdf",
+    "법정의무2.pdf",
 )
+
+_INDEPENDENT_LAYOUT_TRIO = ("리더.pdf", "마음.pdf", "여행.pdf")
 
 _TWO_PAGE_ROW_SIGNATURES = (
     (2, 5, 4, 4, 2, 2, 4, 2, 2, 3, 3, 2, 2),
@@ -99,6 +110,56 @@ def _representative_groups(paths):
     if all_paths not in groups:
         groups.append(all_paths)
     return groups
+
+
+def _detected_layout_config(templates, page_count: int) -> TemplatePreset:
+    """Build a disposable preset so remapping checks every local frame."""
+    fields = []
+    for page_idx in range(page_count):
+        boxes = [
+            Box(page_idx, x, y, w, h)
+            for x, y, w, h in auto_detect_checkboxes(templates[page_idx])
+        ]
+        fields.append(Field(f"page_{page_idx + 1}", boxes=boxes))
+    return TemplatePreset(page_count=page_count, fields=fields)
+
+
+def _assert_review_grid_alignment(test_case, document, page_idx: int) -> None:
+    """Check vector answer-cell overlays against frames in the embedded page."""
+    page = document[page_idx]
+    images = page.get_images(full=True)
+    test_case.assertTrue(images, "review page has no embedded scan image")
+    encoded = document.extract_image(images[0][0])["image"]
+    gray = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_GRAYSCALE)
+    test_case.assertIsNotNone(gray)
+    detected = auto_detect_checkboxes(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+    cells = [box for box in detected if 120 < box[2] < 240 and 90 < box[3] < 210]
+    overlays = [
+        drawing["rect"]
+        for drawing in page.get_drawings()
+        if 120 < drawing["rect"].width < 240
+        and 90 < drawing["rect"].height < 210
+    ]
+    # Some forms also contain large non-answer frames.  The 25 configured
+    # answer overlays must each select a distinct nearby detected frame.
+    test_case.assertGreaterEqual(len(cells), 25)
+    test_case.assertEqual(len(overlays), 25)
+    edge_errors = []
+    matched_cells = set()
+    for rect in overlays:
+        matched_idx, (x, y, w, h) = min(
+            enumerate(cells),
+            key=lambda indexed: (
+                indexed[1][0] + indexed[1][2] / 2 - (rect.x0 + rect.x1) / 2
+            ) ** 2
+            + (
+                indexed[1][1] + indexed[1][3] / 2 - (rect.y0 + rect.y1) / 2
+            ) ** 2,
+        )
+        matched_cells.add(matched_idx)
+        edge_errors.extend((x - rect.x0, y - rect.y0, x + w - rect.x1, y + h - rect.y1))
+    test_case.assertEqual(len(matched_cells), 25)
+    test_case.assertLessEqual(float(np.percentile(np.abs(edge_errors), 95)), 5.0)
 
 
 @unittest.skipUnless(
@@ -195,20 +256,42 @@ class ScanCorpusDetectionTests(unittest.TestCase):
             for group in _representative_groups(paths):
                 labels = tuple(path.name for path in group)
                 with self.subTest(pdfs=labels, page_count=page_count):
-                    angles = self._page_angles(group[0], page_count)
-                    templates = generate_ui_templates_multi(
+                    # Multi-file editing intentionally keeps the first file's
+                    # pixels as the UI basis.  Analysis must instead build a
+                    # reference for every file and remap the chosen fields to
+                    # that local layout; checking every file against the first
+                    # template would hide a coordinate regression.
+                    source_templates = generate_ui_templates_multi(
                         [str(path) for path in group],
                         page_count,
                         -1,
                         0.0,
-                        page_fine_angles=angles,
+                        page_fine_angles=self._page_angles(group[0], page_count),
                     )
-                    _validate_analysis_page_geometry(
-                        [str(path) for path in group],
-                        [templates[page] for page in range(page_count)],
-                        TemplatePreset(page_count=page_count),
+                    source_config = _detected_layout_config(
+                        source_templates, page_count
                     )
-                    self._assert_layout(templates, page_count)
+                    for path in group:
+                        local_templates = generate_ui_templates(
+                            str(path),
+                            page_count,
+                            -1,
+                            0.0,
+                            page_fine_angles=self._page_angles(path, page_count),
+                        )
+                        _validate_analysis_page_geometry(
+                            [str(path)],
+                            [local_templates[page] for page in range(page_count)],
+                            TemplatePreset(page_count=page_count),
+                        )
+                        remap = remap_preset_to_detected_layout(
+                            source_config,
+                            local_templates,
+                            source_templates=source_templates,
+                        )
+                        self.assertTrue(remap.compatible)
+                        self.assertTrue(remap.accepted)
+                        self._assert_layout(local_templates, page_count)
 
     def test_one_page_pdfs_accept_default_preset_with_current_box_geometry(self):
         preset_path = _PRESET_DIR / "기본.json"
@@ -393,6 +476,156 @@ class ScanCorpusDetectionTests(unittest.TestCase):
         self.assertEqual(answer["경력"], "1년차")
         self.assertEqual([answer[f"Q{i}"] for i in range(1, 6)], [5] * 5)
         self.assertEqual(answer["의견"], "있음")
+
+
+@unittest.skipUnless(
+    _RUN_TRIO_CORPUS_TESTS,
+    "set RUN_TRIO_CORPUS_TESTS=1 to run the independent-layout trio",
+)
+class IndependentFileLayoutCorpusTests(unittest.TestCase):
+    """Exercise the real UI preset path and per-file analysis references."""
+
+    @classmethod
+    def setUpClass(cls):
+        missing = [
+            name for name in _INDEPENDENT_LAYOUT_TRIO
+            if not (_SCAN_DIR / name).is_file()
+        ]
+        if missing:
+            raise AssertionError(f"independent-layout corpus is missing: {missing}")
+        preset_path = _PRESET_DIR / "기본.json"
+        if not preset_path.is_file():
+            raise AssertionError(f"default preset fixture is missing: {preset_path}")
+
+    def test_trio_loads_default_preset_and_keeps_local_review_frames(self):
+        """83 source pages must retain their own field-frame coordinates."""
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+
+        from src.ui import MainWindow
+
+        paths = [str(_SCAN_DIR / name) for name in _INDEPENDENT_LAYOUT_TRIO]
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        try:
+            window.preset_dir = _PRESET_DIR
+            with (
+                patch(
+                    "src.ui.QFileDialog.getOpenFileNames",
+                    return_value=(paths, ""),
+                ),
+                patch("src.ui.QInputDialog.getInt", return_value=(1, True)),
+                patch("src.ui.QMessageBox.information"),
+                patch("src.ui.QMessageBox.critical") as error_dialog,
+            ):
+                self.assertTrue(window.load_pdf())
+                self.assertFalse(error_dialog.called)
+
+            window._load_preset_by_name("기본")
+            self.assertEqual(window.current_preset_name, "기본")
+            field_contract = [
+                (
+                    field.name,
+                    tuple(field.value_map),
+                    field.is_comment,
+                    len(field.boxes),
+                )
+                for field in window.preset.fields
+            ]
+            self.assertEqual(
+                [item[0] for item in field_contract],
+                ["성별", "연령", "경력", "Q1", "Q2", "Q3", "Q4", "Q5", "의견"],
+            )
+
+            pages, preprocessed = window._analysis_input_pages()
+            with tempfile.TemporaryDirectory() as temp_dir:
+                self.assertTrue(
+                    run_analysis(
+                        paths,
+                        pages,
+                        window.preset,
+                        template_pages_preprocessed=preprocessed,
+                        single_sample_template_pages=(
+                            window._single_sample_template_pages
+                        ),
+                        output_base_dir=temp_dir,
+                    )
+                )
+                review_folder = next(Path(temp_dir).rglob("검토용"))
+                expected_pages = dict(
+                    zip(_INDEPENDENT_LAYOUT_TRIO, (19, 34, 30))
+                )
+                actual_total = 0
+                expected_frames = sum(
+                    item[3] for item in field_contract if not item[2]
+                )
+                self.assertEqual(expected_frames, 37)
+                for name, page_count in expected_pages.items():
+                    label = Path(name).stem
+                    review_pdf = review_folder / f"{label}_원본포함.pdf"
+                    self.assertTrue(review_pdf.is_file(), review_pdf)
+                    document = fitz.open(review_pdf)
+                    try:
+                        self.assertEqual(len(document), page_count)
+                        actual_total += len(document)
+                        for page_idx in {0, min(1, page_count - 1), page_count - 1}:
+                            self.assertGreaterEqual(
+                                len(document[page_idx].get_drawings()),
+                                expected_frames,
+                            )
+                            _assert_review_grid_alignment(
+                                self, document, page_idx
+                            )
+                    finally:
+                        document.close()
+                self.assertEqual(actual_total, 83)
+
+                # The source has two deliberately blank final 리더 sheets.
+                # Review output keeps every scanned page, while Excel omits
+                # only all-blank response rows.  Assert the exact remaining
+                # labels so a filled respondent cannot disappear unnoticed.
+                workbook_path = next(Path(temp_dir).rglob("*.xlsx"))
+                workbook = openpyxl.load_workbook(
+                    workbook_path, read_only=True, data_only=True
+                )
+                try:
+                    sheet = workbook["결과"]
+                    actual_rows = [
+                        (row[0], row[1])
+                        for row in sheet.iter_rows(min_row=2, values_only=True)
+                    ]
+                finally:
+                    workbook.close()
+                expected_rows = [
+                    ("리더", f"리더_{page_idx}p")
+                    for page_idx in range(1, 18)
+                ]
+                expected_rows.extend(
+                    ("마음", f"마음_{page_idx}p")
+                    for page_idx in range(1, 35)
+                )
+                expected_rows.extend(
+                    ("여행", f"여행_{page_idx}p")
+                    for page_idx in range(1, 31)
+                )
+                self.assertEqual(actual_rows, expected_rows)
+
+            self.assertEqual(
+                [
+                    (
+                        field.name,
+                        tuple(field.value_map),
+                        field.is_comment,
+                        len(field.boxes),
+                    )
+                    for field in window.preset.fields
+                ],
+                field_contract,
+            )
+        finally:
+            window._preset_dirty = False
+            window.close()
+            app.processEvents()
 
 
 if __name__ == "__main__":

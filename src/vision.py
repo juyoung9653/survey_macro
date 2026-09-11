@@ -10,7 +10,7 @@ import numpy as np
 
 
 _PDF_CACHE_VERSION = 2
-_CHECKBOX_CACHE_VERSION = 8
+_CHECKBOX_CACHE_VERSION = 9
 
 
 def _report_progress(progress_cb, value: int, message: str = ""):

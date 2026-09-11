@@ -216,7 +216,7 @@ class UiSafetyTests(unittest.TestCase):
         message = critical.call_args.args[2]
         self.assertIn("문항 배치와 페이지 방향", message)
         self.assertIn("second.pdf 1쪽", message)
-        self.assertIn("실패 단계: 여러 PDF의 페이지 정렬 및 기준 양식 병합", message)
+        self.assertIn("실패 단계: 선택한 PDF 확인 및 첫 파일의 문항 설정 양식 준비", message)
         self.assertIn("기준 파일: first.pdf", message)
         self.assertIn("선택한 파일: first.pdf, second.pdf", message)
         self.assertIn("설문지 한 부: 1쪽", message)

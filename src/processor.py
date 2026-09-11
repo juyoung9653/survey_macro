@@ -954,162 +954,34 @@ def generate_ui_templates_multi(
     progress_cb=None,
     page_fine_angles: list[float] | None = None,
 ) -> dict[int, np.ndarray]:
-    """여러 PDF에서 템플릿을 생성하고 병합하여 더 정확한 템플릿을 만듭니다."""
+    """Use the first PDF for editing; other PDFs get their own analysis layout.
+
+    Mixing pixels from different forms would erase or displace their local
+    frames. Validate readability here and defer field correspondence until the
+    user has chosen the questions and each file's own template is available.
+    """
     if not pdf_paths or page_count <= 0:
         return {}
-
-    cache_path = _ui_template_cache_path(
-        pdf_paths,
-        page_count,
-        rot_code,
-        fine_angle,
-        "multi",
-        page_fine_angles,
-    )
-    cached_templates = _load_ui_template_cache(cache_path)
-    if cached_templates is not None:
-        if progress_cb:
-            progress_cb(100, "캐시된 병합 템플릿 불러오기 완료")
-        return {
-            key: cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
-            for key, value in cached_templates.items()
-        }
-
-    page_totals = []
-    full_capacities = []
-    partial_page_counts = []
     for fpath in pdf_paths:
         try:
-            with fitz.open(fpath) as doc:
-                total_pages = len(doc)
-        except Exception:
-            total_pages = 0
-        page_totals.append(total_pages)
-        full_capacities.append(total_pages // page_count)
-        partial_page_counts.append(total_pages % page_count)
-
-    # 완전한 설문을 먼저 균등 배분하고, 남는 한도에만 partial survey를 사용합니다.
-    full_quotas = [0] * len(pdf_paths)
-    remaining = _UI_TEMPLATE_SAMPLE_LIMIT
-    while remaining > 0:
-        progressed = False
-        for index, capacity in enumerate(full_capacities):
-            if full_quotas[index] >= capacity:
-                continue
-            full_quotas[index] += 1
-            remaining -= 1
-            progressed = True
-            if remaining == 0:
-                break
-        if not progressed:
-            break
-
-    selected_page_counts = [quota * page_count for quota in full_quotas]
-    if remaining > 0:
-        for index, partial_pages in enumerate(partial_page_counts):
-            if partial_pages <= 0:
-                continue
-            selected_page_counts[index] += partial_pages
-            remaining -= 1
-            if remaining == 0:
-                break
-
-    all_by_local_idx = {i: [] for i in range(page_count)}
-    ref_aligners: dict[int, ImageAligner] = {}
-
-    for f_i, (fpath, sample_page_count) in enumerate(
-        zip(pdf_paths, selected_page_counts)
-    ):
-        if sample_page_count <= 0:
-            if progress_cb:
-                progress_cb(
-                    int((f_i + 1) / len(pdf_paths) * 100), "템플릿 병합 중..."
-                )
-            continue
-
-        sample_page_count = min(page_totals[f_i], sample_page_count)
-        try:
-            pages = load_pdf_pages(
-                fpath,
-                gray=True,
-                page_indices=list(range(sample_page_count)),
-            )
-        except Exception:
-            continue
-
-        source_aligners: dict[int, ImageAligner] = {}
-        canonical_mappers: dict[int, ImageAligner] = {}
-        survey_count = _survey_count(len(pages), page_count)
-        for survey_idx in range(survey_count):
-            for local_p in range(page_count):
-                global_p = survey_idx * page_count + local_p
-                if global_p >= len(pages):
-                    break
-
-                orig = apply_rotation(
-                    pages[global_p],
-                    rot_code,
-                    _fine_angle_for_page(
-                        fine_angle, page_fine_angles, local_p
-                    ),
-                )
-                aligner = ref_aligners.get(local_p)
-                if aligner is None:
-                    aligner = ImageAligner(orig, refine_ecc=False, auto_orient_180=True)
-                    aligner.reference_context = (str(fpath), global_p)
-                    ref_aligners[local_p] = aligner
-                    aligned = orig
-                elif f_i == 0:
-                    aligned = _align_with_page_context(
-                        aligner, orig, fpath, global_p
+            with fitz.open(fpath) as document:
+                if document.needs_pass:
+                    raise ValueError("암호가 설정되어 있습니다.")
+                if len(document) < page_count:
+                    raise ValueError(
+                        f"설문지 한 부는 {page_count}쪽으로 설정했지만 "
+                        f"파일에는 {len(document)}쪽만 있습니다."
                     )
-                else:
-                    source_aligner = source_aligners.get(local_p)
-                    if source_aligner is None:
-                        canonical_anchor = _align_with_page_context(
-                            aligner, orig, fpath, global_p
-                        )
-                        source_aligners[local_p] = ImageAligner(
-                            orig, refine_ecc=False, auto_orient_180=True
-                        )
-                        source_aligners[local_p].reference_context = (str(fpath), global_p)
-                        canonical_mappers[local_p] = ImageAligner(
-                            canonical_anchor,
-                            refine_ecc=False,
-                            auto_orient_180=False,
-                        )
-                        aligned = canonical_anchor
-                    else:
-                        source_aligned = _align_with_page_context(
-                            source_aligner, orig, fpath, global_p
-                        )
-                        aligned = canonical_mappers[local_p].align(source_aligned)
-                        if canonical_mappers[local_p].last_alignment_stage == "unaligned":
-                            raise PageOrientationError(
-                                f"'{Path(fpath).name}' {global_p + 1}쪽: "
-                                "파일 기준 페이지를 공통 양식 좌표로 정렬하지 못했습니다."
-                            )
-                success, encoded = cv2.imencode(".png", aligned)
-                if success:
-                    all_by_local_idx[local_p].append(encoded.tobytes())
+        except Exception as exc:
+            raise ValueError(f"'{Path(fpath).name}' 파일 확인 실패: {exc}") from exc
 
-        if progress_cb:
-            progress_cb(int((f_i + 1) / len(pdf_paths) * 100), "템플릿 병합 중...")
-
-    if progress_cb:
-        progress_cb(100, "템플릿 병합 완료")
-
-    dynamic_templates = generate_dynamic_templates(all_by_local_idx)
-    dynamic_templates = _select_ui_detection_templates(
-        all_by_local_idx, dynamic_templates
+    templates = generate_ui_templates(
+        pdf_paths[0], page_count, rot_code, fine_angle,
+        progress_cb=progress_cb, page_fine_angles=page_fine_angles,
     )
-    _save_ui_template_cache(cache_path, dynamic_templates)
-
-    bgr_templates = {}
-    for k, v in dynamic_templates.items():
-        bgr_templates[k] = cv2.cvtColor(v, cv2.COLOR_GRAY2BGR)
-
-    return bgr_templates
+    if not templates:
+        raise ValueError(f"'{Path(pdf_paths[0]).name}'에서 문항 설정용 양식을 만들지 못했습니다.")
+    return templates
 
 
 def _label_number(total: int, index: int, reverse: bool) -> int:
@@ -3011,6 +2883,22 @@ def _build_page_aligners(
     ]
 
 
+def _load_file_alignment_references(
+    fpath: str,
+    config: TemplatePreset,
+) -> list[np.ndarray]:
+    """Use each PDF's first survey as its own alignment coordinate system."""
+    pages = load_pdf_pages(
+        fpath, page_indices=list(range(config.page_count))
+    )
+    if len(pages) < config.page_count:
+        raise ValueError(f"'{Path(fpath).name}'에 기준 페이지가 부족합니다.")
+    return [
+        apply_rotation(page, config.rot_code, config.fine_angle_for_page(index))
+        for index, page in enumerate(pages[: config.page_count])
+    ]
+
+
 # ── Phase 1 Worker: 파일 1개에서 템플릿 샘플 수집 (스레드 안전) ──
 def _collect_template_samples(
     fpath: str,
@@ -3787,7 +3675,7 @@ def run_analysis(
         for sample_count, survey_count in zip(sample_counts, survey_counts)
     )
 
-    # 정합 기준 이미지만 공유하고, 상태를 가진 ImageAligner는 파일마다 새로 만듭니다.
+    # 문항 설정의 기준 이미지를 준비합니다. 실제 정렬 기준은 파일별로 읽습니다.
     # Saved preset templates and pages aligned to them are already in the
     # configured rotation coordinate system. Applying the configured angle
     # again would rotate them twice while survey pages are rotated once.
@@ -3855,6 +3743,8 @@ def run_analysis(
         index: int,
         file_template: dict[int, np.ndarray],
         sample_pages: dict[int, list[_SamplePage]] | None,
+        file_config: TemplatePreset,
+        file_references: list[np.ndarray],
     ) -> None:
         nonlocal completed
         fpath = file_paths[index]
@@ -3884,10 +3774,10 @@ def run_analysis(
             _, file_results, comment_pages = _analyze_single_file(
                 fpath,
                 file_label,
-                config,
+                file_config,
                 file_template,
-                reference_templates,
-                alignment_references,
+                file_template,
+                file_references,
                 review_folder,
                 sample_pages=sample_pages,
                 resource_controller=controller,
@@ -3921,6 +3811,9 @@ def run_analysis(
             )
             sample_pages: dict[int, list[_SamplePage]] = {}
             file_template: dict[int, np.ndarray] = {}
+            file_references = _load_file_alignment_references(fpath, config)
+            collection_config = copy.deepcopy(config)
+            collection_config.fields = []
             expected_samples = sample_counts[index]
             samples_done = 0
 
@@ -3939,8 +3832,8 @@ def run_analysis(
             try:
                 _, sample_pages = _collect_template_samples(
                     fpath,
-                    config,
-                    alignment_references,
+                    collection_config,
+                    file_references,
                     resource_controller=controller,
                     resource_status_cb=report_work,
                     progress_cb=sample_progress,
@@ -3958,12 +3851,12 @@ def run_analysis(
                         f"파일 {index + 1}/{num_files}"
                     )
                     file_template = generate_dynamic_templates(
-                        sample_pages, config=config
+                        sample_pages
                     )
                     replaced_pages = _replace_single_sample_templates(
                         file_template,
                         sample_pages,
-                        single_sample_template_pages,
+                        single_sample_template_pages if index == 0 else None,
                     )
                     if replaced_pages:
                         page_text = ", ".join(
@@ -3990,10 +3883,26 @@ def run_analysis(
                     f"파일 {index + 1}/{num_files}",
                 )
 
+            canonical_sources = {
+                page_idx: reference
+                for page_idx, reference in enumerate(alignment_references)
+            }
+            file_remap = remap_preset_to_detected_layout(
+                config, file_template, source_templates=canonical_sources
+            )
+            if file_remap.expected_boxes > 0 and not file_remap.compatible:
+                raise ValueError(
+                    f"'{Path(fpath).name}': 문항 설정을 이 파일의 답안 칸에 연결하지 못했습니다.\n"
+                    f"설정된 칸 {file_remap.expected_boxes}개 중 "
+                    f"{file_remap.matched_boxes}개를 연결했습니다.\n"
+                    "같은 문항 순서와 선택지 개수인지, 스캔에서 칸이 잘리거나 흐려졌는지 확인해주세요. "
+                    "문항 구성이 다른 파일은 따로 불러와 설정해주세요."
+                )
+            file_config = file_remap.config if file_remap.accepted else config
             _validate_analysis_template_layout(
-                config,
+                file_config,
                 file_template,
-                alignment_references,
+                file_references,
                 file_label,
             )
 
@@ -4005,6 +3914,8 @@ def run_analysis(
                 index,
                 file_template or reference_templates,
                 sample_pages or None,
+                file_config,
+                file_references,
             )
 
             sample_pages.clear()
