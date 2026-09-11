@@ -77,7 +77,7 @@ from .vision import (
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_DETECTION_SAMPLE_LIMIT = 7
-_UI_TEMPLATE_CACHE_VERSION = 9
+_UI_TEMPLATE_CACHE_VERSION = 12
 _MIB = 1024 * 1024
 _ANALYSIS_SAMPLE_WORK = 2.0
 _ANALYSIS_TEMPLATE_WORK = 1.0
@@ -1037,6 +1037,8 @@ def generate_ui_templates_multi(
         except Exception:
             continue
 
+        source_aligners: dict[int, ImageAligner] = {}
+        canonical_mappers: dict[int, ImageAligner] = {}
         survey_count = _survey_count(len(pages), page_count)
         for survey_idx in range(survey_count):
             for local_p in range(page_count):
@@ -1055,7 +1057,36 @@ def generate_ui_templates_multi(
                 if aligner is None:
                     aligner = ImageAligner(orig, refine_ecc=False, auto_orient_180=True)
                     ref_aligners[local_p] = aligner
-                aligned = _align_with_page_context(aligner, orig, fpath, global_p)
+                    aligned = orig
+                elif f_i == 0:
+                    aligned = _align_with_page_context(
+                        aligner, orig, fpath, global_p
+                    )
+                else:
+                    source_aligner = source_aligners.get(local_p)
+                    if source_aligner is None:
+                        canonical_anchor = _align_with_page_context(
+                            aligner, orig, fpath, global_p
+                        )
+                        source_aligners[local_p] = ImageAligner(
+                            orig, refine_ecc=False, auto_orient_180=True
+                        )
+                        canonical_mappers[local_p] = ImageAligner(
+                            canonical_anchor,
+                            refine_ecc=False,
+                            auto_orient_180=False,
+                        )
+                        aligned = canonical_anchor
+                    else:
+                        source_aligned = _align_with_page_context(
+                            source_aligner, orig, fpath, global_p
+                        )
+                        aligned = canonical_mappers[local_p].align(source_aligned)
+                        if canonical_mappers[local_p].last_alignment_stage == "unaligned":
+                            raise PageOrientationError(
+                                f"'{Path(fpath).name}' {global_p + 1}쪽: "
+                                "파일 기준 페이지를 공통 양식 좌표로 정렬하지 못했습니다."
+                            )
                 success, encoded = cv2.imencode(".png", aligned)
                 if success:
                     all_by_local_idx[local_p].append(encoded.tobytes())
@@ -2774,6 +2805,13 @@ def _align_with_page_context(aligner, image, file_path, global_p):
     try:
         return aligner.align(image)
     except PageOrientationError as exc:
+        if getattr(aligner, "last_orientation_status", None) == "untrustworthy":
+            aligned = aligner.align_if_orb_confident(image)
+            if aligned is not None:
+                return aligned
+            aligned = aligner.align_if_checkbox_layout_matches(image)
+            if aligned is not None:
+                return aligned
         raise PageOrientationError(
             f"'{Path(file_path).name}' {global_p + 1}쪽: {exc}"
         ) from exc

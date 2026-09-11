@@ -876,6 +876,100 @@ class ImageAligner:
             borderValue=border_value,
         )
 
+    def align_if_orb_confident(
+        self,
+        img: np.ndarray,
+        min_correlation: float = 0.60,
+    ) -> np.ndarray | None:
+        """Align without an orientation guess only when ORB and ECC agree."""
+        working_img = self._resize_to_ref(img)
+        gray = (
+            cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
+            if working_img.ndim == 3
+            else working_img
+        )
+        matrix = self._estimate_affine_with_orb(gray, scaled=False)
+        if matrix is None:
+            self.last_quick_score = None
+            self.last_alignment_stage = "unaligned"
+            return None
+
+        refined, correlation = self._refine_affine_with_ecc(
+            gray, matrix, min_correlation=min_correlation
+        )
+        self.last_quick_score = correlation
+        if refined is None:
+            self.last_alignment_stage = "untrusted_orb"
+            return None
+
+        self.last_alignment_stage = "full_orb"
+        return self._warp_aligned(working_img, refined)
+
+    def align_if_checkbox_layout_matches(self, img: np.ndarray) -> np.ndarray | None:
+        """Align a layout variant from repeated checkbox-frame geometry."""
+        working_img = self._resize_to_ref(img)
+        reference = cv2.cvtColor(self.ref_gray, cv2.COLOR_GRAY2BGR)
+        candidate = (
+            cv2.cvtColor(working_img, cv2.COLOR_GRAY2BGR)
+            if working_img.ndim == 2
+            else working_img
+        )
+        reference_boxes = getattr(self, "_checkbox_layout_reference_boxes", None)
+        if reference_boxes is None:
+            reference_boxes = auto_detect_checkboxes(reference)
+            self._checkbox_layout_reference_boxes = reference_boxes
+        candidate_boxes = auto_detect_checkboxes(candidate)
+        if min(len(reference_boxes), len(candidate_boxes)) < 8:
+            return None
+
+        scale = min(1.0, 640.0 / max(self.ref_w, self.ref_h))
+        shape = (max(1, round(self.ref_h * scale)), max(1, round(self.ref_w * scale)))
+
+        def frame_mask(boxes):
+            mask = np.zeros(shape, np.float32)
+            for x, y, w, h in boxes:
+                cv2.rectangle(mask, (round(x * scale), round(y * scale)),
+                              (round((x + w) * scale), round((y + h) * scale)), 1, 1)
+            return mask
+
+        shift, _response = cv2.phaseCorrelate(
+            frame_mask(reference_boxes), frame_mask(candidate_boxes)
+        )
+
+        def matched_count(dx, dy):
+            used = set()
+            matches = []
+            for rx, ry, rw, rh in reference_boxes:
+                best = None
+                for index, (cx, cy, cw, ch) in enumerate(candidate_boxes):
+                    if index in used or max(rw, cw) / max(1, min(rw, cw)) > 1.6 or max(rh, ch) / max(1, min(rh, ch)) > 1.6:
+                        continue
+                    distance = float(np.hypot(rx + rw / 2 - (cx + cw / 2 + dx), ry + rh / 2 - (cy + ch / 2 + dy)))
+                    if distance <= max(12.0, min(rw, rh) * 0.45) and (best is None or distance < best[0]):
+                        best = (distance, index)
+                if best is not None:
+                    used.add(best[1])
+                    matches.append((rx + rw / 2, ry + rh / 2))
+            if len(matches) < 8:
+                return 0
+            points = np.asarray(matches)
+            if np.ptp(points[:, 0]) < self.ref_w * 0.35 or np.ptp(points[:, 1]) < self.ref_h * 0.35:
+                return 0
+            return len(matches)
+
+        candidates = [(shift[0] / scale, shift[1] / scale), (-shift[0] / scale, -shift[1] / scale)]
+        dx, dy = max(candidates, key=lambda point: matched_count(*point))
+        matches = matched_count(dx, dy)
+        if (
+            abs(dx) > self.ref_w * 0.12
+            or abs(dy) > self.ref_h * 0.12
+            or min(len(reference_boxes), len(candidate_boxes)) / max(len(reference_boxes), len(candidate_boxes)) < 0.9
+            or matches < max(8, int(max(len(reference_boxes), len(candidate_boxes)) * 0.85))
+        ):
+            return None
+        self.last_alignment_stage = "checkbox_layout"
+        return self._warp_aligned(working_img, np.float32([[1, 0, dx], [0, 1, dy]]))
+
     def align(self, img: np.ndarray) -> np.ndarray:
         # 특징점, ECC, 최종 warp가 모두 같은 좌표계를 사용하도록 먼저 크기를
         # 통일합니다. 서로 다른 용지 크기의 PDF를 묶을 때 행렬이 어긋나는 것을 막습니다.

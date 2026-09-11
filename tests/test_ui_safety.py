@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from src.localization import install_korean_translations
 from src.models import Field, TemplatePreset
 from src.ui import MainCanvas, MainWindow, ValueMappingDialog
+from src.vision import PageOrientationError
 
 
 _APP = QApplication.instance() or QApplication([])
@@ -187,6 +188,34 @@ class UiSafetyTests(unittest.TestCase):
         self.assertIs(window._inferred_display_templates[0], display_template)
         self.assertTrue(progress.closed)
         self.assertIn("읽기 오류", critical.call_args.args[2])
+        window.close()
+
+    def test_multi_pdf_alignment_error_explains_alignment_and_restores_document(self):
+        window = MainWindow()
+        window.file_paths = ["previous.pdf"]
+        window.preset = TemplatePreset(page_count=1, fields=[Field(name="기존 문항")])
+        page = np.full((40, 30, 3), 255, np.uint8)
+        window.pages = [page]
+        window._update_page_size()
+        with (
+            patch("src.ui.QFileDialog.getOpenFileNames", return_value=(["first.pdf", "second.pdf"], "")),
+            patch("src.ui.QInputDialog.getInt", return_value=(1, True)),
+            patch.object(window, "_show_progress_dialog", return_value=_ProgressStub()),
+            patch("src.ui.load_pdf_pages", return_value=[page.copy()]),
+            patch("src.ui.estimate_deskew_angle", return_value=0.0),
+            patch("src.ui.generate_ui_templates_multi", side_effect=PageOrientationError("second.pdf 1쪽: 방향 확인 실패")),
+            patch("src.ui.QMessageBox.critical") as critical,
+            patch("src.ui.QMessageBox.information") as information,
+        ):
+            self.assertFalse(window.load_pdf())
+        self.assertEqual(window.file_paths, ["previous.pdf"])
+        self.assertEqual([field.name for field in window.preset.fields], ["기존 문항"])
+        self.assertIs(window.pages[0], page)
+        message = critical.call_args.args[2]
+        self.assertIn("문항 배치와 페이지 방향", message)
+        self.assertIn("second.pdf 1쪽", message)
+        self.assertNotIn("손상", message)
+        information.assert_not_called()
         window.close()
 
     def test_unsaved_change_prompt_honors_cancel_discard_and_save(self):

@@ -69,6 +69,7 @@ from .processor import (
 from .progress import ProgressTiming, format_duration
 from .vision import (
     ImageAligner,
+    PageOrientationError,
     apply_rotation,
     auto_detect_checkboxes,
     clear_all_cache,
@@ -2560,11 +2561,17 @@ class MainWindow(QMainWindow):
             progress_cb(100, "PDF 로드 완료")
         except Exception as exc:
             self._restore_document_state(snapshot)
+            guidance = (
+                "페이지의 방향이나 위치를 기준 양식에 맞추지 못했습니다. "
+                "함께 선택한 PDF의 문항 배치와 페이지 방향을 확인해주세요."
+                if isinstance(exc, PageOrientationError)
+                else "PDF를 불러오지 못했습니다. 파일이 손상되었거나 암호가 "
+                "설정됐는지 확인해주세요."
+            )
             QMessageBox.critical(
                 self,
                 "PDF 불러오기 실패",
-                "PDF를 불러오지 못했습니다. 파일이 손상되었거나 암호가 "
-                f"설정됐는지 확인해주세요.\n\n세부 내용: {exc}",
+                f"{guidance}\n\n세부 내용: {exc}",
             )
             return False
         finally:
