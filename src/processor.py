@@ -2293,6 +2293,29 @@ def _checkbox_layout_is_trustworthy(
     return saw_checkbox
 
 
+def _configured_layout_has_frame_support(
+    config: TemplatePreset,
+    pages: dict[int, np.ndarray],
+    source_templates: dict[int, np.ndarray],
+) -> bool:
+    """Accept an incomplete detector result only when visible frames agree."""
+    checked = 0
+    supported = 0
+    for page_idx, image in pages.items():
+        refs = _config_checkbox_refs(config, page_idx, image.shape)
+        source = source_templates.get(page_idx)
+        if source is not None:
+            refs.extend(_config_framed_refs(config, page_idx, source))
+        if not refs:
+            continue
+        mask = _layout_line_mask(image)
+        for _field_idx, _box_idx, box in refs:
+            checked += 1
+            if sum(score >= 0.55 for score in _box_frame_edge_scores(mask, box)) >= 3:
+                supported += 1
+    return checked > 0 and supported / checked >= 0.8
+
+
 def _collect_ink_data(
     working_boxes: list[Box],
     pure_ink_masks: dict[int, np.ndarray],
@@ -3308,9 +3331,18 @@ def _analyze_single_file(
                 survey_gray_pages,
                 source_templates=f_template,
             )
-            if (
+            remap_accepted = (
+                survey_remap.accepted and survey_remap.compatible
+            )
+            frame_supported_fallback = (
                 survey_remap.expected_boxes > 0
-                and not (survey_remap.accepted and survey_remap.compatible)
+                and not remap_accepted
+                and _configured_layout_has_frame_support(
+                    analysis_config, survey_gray_pages, f_template
+                )
+            )
+            if survey_remap.expected_boxes > 0 and not (
+                remap_accepted or frame_supported_fallback
             ):
                 raise PageOrientationError(
                     f"'{Path(fpath).name}' {survey_idx + 1}쪽: "
@@ -3318,7 +3350,7 @@ def _analyze_single_file(
                 )
             survey_config = (
                 survey_remap.config
-                if survey_remap.accepted and survey_remap.compatible
+                if remap_accepted
                 else analysis_config
             )
             survey_field_plans = _prepare_field_plans(survey_config)
@@ -3330,8 +3362,7 @@ def _analyze_single_file(
             }
             survey_trust_checkbox_layout = (
                 trust_checkbox_layout
-                and survey_remap.accepted
-                and survey_remap.compatible
+                and (remap_accepted or frame_supported_fallback)
             )
             survey_data = {
                 "fname": file_label,

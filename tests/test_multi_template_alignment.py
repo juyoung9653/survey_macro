@@ -12,6 +12,7 @@ from src.models import Box, Field, TemplatePreset
 from src.processor import (
     _align_with_page_context,
     _analyze_single_file,
+    _configured_layout_has_frame_support,
     _prepare_field_plans,
     remap_preset_to_detected_layout,
 )
@@ -56,6 +57,24 @@ def _mixed_answer_layout(main_offset_x: int = 0) -> tuple[np.ndarray, list[Box],
 
 
 class MultiTemplateAlignmentTests(unittest.TestCase):
+    def test_frame_support_allows_incomplete_remap_only_at_current_coordinates(self):
+        source, demographics, source_grid = _mixed_answer_layout()
+        shifted, _demographics, _grid = _mixed_answer_layout(22)
+        config = TemplatePreset(
+            page_count=1,
+            fields=[
+                Field(name="demographics", boxes=demographics),
+                Field(name="main_grid", boxes=source_grid),
+            ],
+        )
+
+        self.assertTrue(
+            _configured_layout_has_frame_support(config, {0: source}, {0: source})
+        )
+        self.assertFalse(
+            _configured_layout_has_frame_support(config, {0: shifted}, {0: source})
+        )
+
     def test_analysis_snaps_each_shifted_large_grid_before_annotations(self):
         source, demographics, source_grid = _mixed_answer_layout()
         target, _target_demographics, target_grid = _mixed_answer_layout(22)
