@@ -3264,7 +3264,25 @@ def _analyze_single_file(
             template_masks[local_p] = cv2.threshold(
                 gray_template, 200, 255, cv2.THRESH_BINARY_INV
             )[1]
-        analysis_config = _remap_checkbox_layout(config, f_template)
+        source_templates = {
+            page_idx: reference
+            for page_idx, reference in enumerate(
+                alignment_references[: config.page_count]
+            )
+        }
+        layout_remap = remap_preset_to_detected_layout(
+            config,
+            f_template,
+            source_templates=source_templates,
+        )
+        # Apply the same complete-frame remap that validates each file's
+        # template. The legacy checkbox-only adjustment remains the fallback
+        # for manual/comment regions with no detected framed layout.
+        analysis_config = (
+            layout_remap.config
+            if layout_remap.accepted and layout_remap.compatible
+            else _remap_checkbox_layout(config, f_template)
+        )
         trust_checkbox_layout = _checkbox_layout_is_trustworthy(
             analysis_config, f_template
         )
@@ -3272,24 +3290,6 @@ def _analyze_single_file(
         page_shapes = {
             page_idx: reference.shape
             for page_idx, reference in enumerate(alignment_references)
-        }
-        checkbox_template_interiors = _prepare_checkbox_template_interiors(
-            field_plans, f_template, page_shapes
-        )
-        stable_region_masks = {
-            page_idx: _build_stable_region_mask(
-                reference.shape, analysis_config, page_idx
-            )
-            for page_idx, reference in enumerate(alignment_references)
-        }
-        template_alignment_caches = {
-            page_idx: _prepare_template_alignment_cache(
-                template_mask,
-                alignment_references[page_idx].shape,
-                alignment_mask=stable_region_masks.get(page_idx),
-            )
-            for page_idx, template_mask in template_masks.items()
-            if page_idx < len(alignment_references)
         }
 
         page_count = config.page_count
@@ -3303,6 +3303,36 @@ def _analyze_single_file(
             survey_idx: int,
             survey_gray_pages: dict[int, np.ndarray],
         ):
+            survey_remap = remap_preset_to_detected_layout(
+                analysis_config,
+                survey_gray_pages,
+                source_templates=f_template,
+            )
+            if (
+                survey_remap.expected_boxes > 0
+                and not (survey_remap.accepted and survey_remap.compatible)
+            ):
+                raise PageOrientationError(
+                    f"'{Path(fpath).name}' {survey_idx + 1}쪽: "
+                    "현재 페이지의 답안 칸 배치를 확인하지 못했습니다."
+                )
+            survey_config = (
+                survey_remap.config
+                if survey_remap.accepted and survey_remap.compatible
+                else analysis_config
+            )
+            survey_field_plans = _prepare_field_plans(survey_config)
+            survey_stable_region_masks = {
+                page_idx: _build_stable_region_mask(
+                    image.shape, survey_config, page_idx
+                )
+                for page_idx, image in survey_gray_pages.items()
+            }
+            survey_trust_checkbox_layout = (
+                trust_checkbox_layout
+                and survey_remap.accepted
+                and survey_remap.compatible
+            )
             survey_data = {
                 "fname": file_label,
                 "row_title": f"{file_label}_{survey_idx + 1}p",
@@ -3317,14 +3347,16 @@ def _analyze_single_file(
                 comment_images,
             ) = process_survey_data(
                 survey_data,
-                analysis_config,
+                survey_config,
                 f_template,
                 template_masks,
-                field_plans,
-                trust_checkbox_layout=trust_checkbox_layout,
-                checkbox_template_interiors=checkbox_template_interiors,
-                prepared_stable_region_masks=stable_region_masks,
-                template_alignment_caches=template_alignment_caches,
+                survey_field_plans,
+                trust_checkbox_layout=survey_trust_checkbox_layout,
+                # Prepared interiors are tied to the file template coordinates;
+                # a per-page snapped layout must score its own visible frame.
+                checkbox_template_interiors=None,
+                prepared_stable_region_masks=survey_stable_region_masks,
+                template_alignment_caches=None,
             )
             encoded_debug = {
                 local_p: _encode_page_image(image)
