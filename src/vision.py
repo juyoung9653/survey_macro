@@ -180,6 +180,10 @@ class ImageAligner:
         self.auto_orient_180 = bool(auto_orient_180)
         self.last_orientation_degrees = 0
         self.last_orientation_status = "disabled"
+        self.last_alignment_diagnostics: dict[str, object] = {
+            "reference_size": (self.ref_w, self.ref_h),
+        }
+        self.reference_context: tuple[str, int] | None = None
         self._last_affine: np.ndarray | None = None
         self._last_ecc_correlation: float | None = None
         self.last_alignment_stage = "full_orb"
@@ -788,6 +792,9 @@ class ImageAligner:
     def _orientation_error(self, status: str) -> None:
         self.last_orientation_degrees = 0
         self.last_orientation_status = status
+        self.last_alignment_diagnostics.update(
+            {"method": "orientation", "reason": status}
+        )
         if status == "ambiguous":
             raise PageOrientationError(
                 "페이지 방향을 0°와 180° 중 하나로 안전하게 판단할 수 없습니다."
@@ -837,6 +844,10 @@ class ImageAligner:
             )
             best = max(scores)
             margin = abs(scores[0] - scores[1])
+            self.last_alignment_diagnostics.update({
+                "method": "orientation", "direct_scores": direct_scores,
+                "affine_scores": scores, "best_score": best, "margin": margin,
+            })
             if best < self._ORIENTATION_MIN_CORRELATION:
                 self._orientation_error("untrustworthy")
             if margin < self._ORIENTATION_MIN_MARGIN:
@@ -892,6 +903,7 @@ class ImageAligner:
         if matrix is None:
             self.last_quick_score = None
             self.last_alignment_stage = "unaligned"
+            self.last_alignment_diagnostics.update({"method": "orb_ecc", "reason": "orb_transform_missing"})
             return None
 
         refined, correlation = self._refine_affine_with_ecc(
@@ -900,6 +912,7 @@ class ImageAligner:
         self.last_quick_score = correlation
         if refined is None:
             self.last_alignment_stage = "untrusted_orb"
+            self.last_alignment_diagnostics.update({"method": "orb_ecc", "reason": "ecc_below_threshold", "score": correlation, "required": min_correlation})
             return None
 
         self.last_alignment_stage = "full_orb"
@@ -919,7 +932,9 @@ class ImageAligner:
             reference_boxes = auto_detect_checkboxes(reference)
             self._checkbox_layout_reference_boxes = reference_boxes
         candidate_boxes = auto_detect_checkboxes(candidate)
+        self.last_alignment_diagnostics.update({"method": "checkbox_layout", "reference_boxes": len(reference_boxes), "candidate_boxes": len(candidate_boxes), "candidate_size": (img.shape[1], img.shape[0])})
         if min(len(reference_boxes), len(candidate_boxes)) < 8:
+            self.last_alignment_diagnostics["reason"] = "too_few_detected_boxes"
             return None
 
         scale = min(1.0, 640.0 / max(self.ref_w, self.ref_h))
@@ -936,7 +951,7 @@ class ImageAligner:
             frame_mask(reference_boxes), frame_mask(candidate_boxes)
         )
 
-        def matched_count(dx, dy):
+        def match_metrics(dx, dy):
             used = set()
             matches = []
             for rx, ry, rw, rh in reference_boxes:
@@ -951,26 +966,43 @@ class ImageAligner:
                     used.add(best[1])
                     matches.append((rx + rw / 2, ry + rh / 2))
             if len(matches) < 8:
-                return 0
+                return 0, len(matches), False
             points = np.asarray(matches)
             if np.ptp(points[:, 0]) < self.ref_w * 0.35 or np.ptp(points[:, 1]) < self.ref_h * 0.35:
-                return 0
-            return len(matches)
+                return 0, len(matches), False
+            return len(matches), len(matches), True
+
+        def matched_count(dx, dy):
+            return match_metrics(dx, dy)[0]
 
         candidates = [(shift[0] / scale, shift[1] / scale), (-shift[0] / scale, -shift[1] / scale)]
         dx, dy = max(candidates, key=lambda point: matched_count(*point))
         matches = matched_count(dx, dy)
+        _, raw_matches, spread_ok = match_metrics(dx, dy)
         if (
             abs(dx) > self.ref_w * 0.12
             or abs(dy) > self.ref_h * 0.12
             or min(len(reference_boxes), len(candidate_boxes)) / max(len(reference_boxes), len(candidate_boxes)) < 0.9
             or matches < max(8, int(max(len(reference_boxes), len(candidate_boxes)) * 0.85))
         ):
+            if abs(dx) > self.ref_w * 0.12 or abs(dy) > self.ref_h * 0.12:
+                reason = "translation_exceeds_limit"
+            elif min(len(reference_boxes), len(candidate_boxes)) / max(len(reference_boxes), len(candidate_boxes)) < 0.9:
+                reason = "box_count_mismatch"
+            elif raw_matches >= 8 and not spread_ok:
+                reason = "insufficient_spread"
+            else:
+                reason = "insufficient_matches"
+            self.last_alignment_diagnostics.update({"reason": reason, "shift": (dx, dy), "matched": raw_matches, "required_matches": max(8, int(max(len(reference_boxes), len(candidate_boxes)) * 0.85))})
             return None
         self.last_alignment_stage = "checkbox_layout"
         return self._warp_aligned(working_img, np.float32([[1, 0, dx], [0, 1, dy]]))
 
     def align(self, img: np.ndarray) -> np.ndarray:
+        self.last_alignment_diagnostics = {
+            "reference_size": (self.ref_w, self.ref_h),
+            "candidate_size": (img.shape[1], img.shape[0]),
+        }
         # 특징점, ECC, 최종 warp가 모두 같은 좌표계를 사용하도록 먼저 크기를
         # 통일합니다. 서로 다른 용지 크기의 PDF를 묶을 때 행렬이 어긋나는 것을 막습니다.
         working_img = self._resize_to_ref(img)

@@ -188,6 +188,8 @@ class UiSafetyTests(unittest.TestCase):
         self.assertIs(window._inferred_display_templates[0], display_template)
         self.assertTrue(progress.closed)
         self.assertIn("읽기 오류", critical.call_args.args[2])
+        self.assertIn("실패 단계: 첫 PDF 페이지 읽기", critical.call_args.args[2])
+        self.assertIn("기준 파일: broken.pdf", critical.call_args.args[2])
         window.close()
 
     def test_multi_pdf_alignment_error_explains_alignment_and_restores_document(self):
@@ -214,6 +216,10 @@ class UiSafetyTests(unittest.TestCase):
         message = critical.call_args.args[2]
         self.assertIn("문항 배치와 페이지 방향", message)
         self.assertIn("second.pdf 1쪽", message)
+        self.assertIn("실패 단계: 여러 PDF의 페이지 정렬 및 기준 양식 병합", message)
+        self.assertIn("기준 파일: first.pdf", message)
+        self.assertIn("선택한 파일: first.pdf, second.pdf", message)
+        self.assertIn("설문지 한 부: 1쪽", message)
         self.assertNotIn("손상", message)
         information.assert_not_called()
         window.close()

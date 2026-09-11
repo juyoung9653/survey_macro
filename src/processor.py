@@ -1056,6 +1056,7 @@ def generate_ui_templates_multi(
                 aligner = ref_aligners.get(local_p)
                 if aligner is None:
                     aligner = ImageAligner(orig, refine_ecc=False, auto_orient_180=True)
+                    aligner.reference_context = (str(fpath), global_p)
                     ref_aligners[local_p] = aligner
                     aligned = orig
                 elif f_i == 0:
@@ -1071,6 +1072,7 @@ def generate_ui_templates_multi(
                         source_aligners[local_p] = ImageAligner(
                             orig, refine_ecc=False, auto_orient_180=True
                         )
+                        source_aligners[local_p].reference_context = (str(fpath), global_p)
                         canonical_mappers[local_p] = ImageAligner(
                             canonical_anchor,
                             refine_ecc=False,
@@ -2835,8 +2837,49 @@ def _align_with_page_context(aligner, image, file_path, global_p):
             aligned = aligner.align_if_checkbox_layout_matches(image)
             if aligned is not None:
                 return aligned
+        diagnostics = getattr(aligner, "last_alignment_diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        reason = diagnostics.get("reason")
+        details = []
+        reference_context = getattr(aligner, "reference_context", None)
+        if isinstance(reference_context, tuple) and len(reference_context) == 2:
+            reference_file, reference_page = reference_context
+            details.append(f"정렬 비교 기준: '{Path(reference_file).name}' {reference_page + 1}쪽")
+        detail = ""
+        if reason == "ecc_below_threshold":
+            score = diagnostics.get("score")
+            detail = (
+                f" ORB/ECC 일치도 {diagnostics.get('score', 0):.3f}가 "
+                f"기준 {diagnostics.get('required', 0):.2f}보다 낮았습니다."
+            ) if isinstance(score, (int, float)) and np.isfinite(score) else "영상 정렬의 일치도를 계산하지 못했습니다."
+        elif reason in ("layout_geometry_rejected", "insufficient_matches", "box_count_mismatch", "insufficient_spread", "translation_exceeds_limit"):
+            detail = (
+                f"탐지된 칸 후보: 기준 {diagnostics.get('reference_boxes', 0)}개 / 현재 {diagnostics.get('candidate_boxes', 0)}개\n"
+                f"위치 대응: {diagnostics.get('matched', 0)}개 / 필요한 대응 {diagnostics.get('required_matches', 0)}개\n"
+            )
+            detail += {
+                "box_count_mismatch": "두 페이지의 탐지 칸 수 차이가 허용 범위를 넘었습니다.",
+                "insufficient_spread": "대응 칸이 일부 영역에 몰려 전체 페이지의 위치를 확인하지 못했습니다.",
+                "translation_exceeds_limit": "필요한 페이지 이동량이 허용 범위를 넘었습니다.",
+            }.get(reason, "칸 위치가 충분히 대응하지 않아 공통 양식으로 합칠 수 없습니다.")
+        elif reason == "too_few_detected_boxes":
+            detail = (
+                f" 감지 칸 수가 기준 {diagnostics.get('reference_boxes', 0)}개, "
+                f"현재 {diagnostics.get('candidate_boxes', 0)}개로 부족했습니다."
+            )
+        elif reason in ("untrustworthy", "ambiguous"):
+            detail = " 0°/180° 방향 판정의 근거가 부족했습니다."
+        if detail:
+            details.append(detail.strip())
+        suffix = "\n" + "\n".join(details) if details else ""
+        summary = (
+            "현재 정렬 방식으로 체크칸 배치를 맞추지 못했습니다."
+            if reason in ("layout_geometry_rejected", "insufficient_matches", "box_count_mismatch", "insufficient_spread", "translation_exceeds_limit", "too_few_detected_boxes")
+            else str(exc)
+        )
         raise PageOrientationError(
-            f"'{Path(file_path).name}' {global_p + 1}쪽: {exc}"
+            f"'{Path(file_path).name}' {global_p + 1}쪽: {summary}{suffix}"
         ) from exc
 
 

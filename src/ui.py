@@ -2506,6 +2506,7 @@ class MainWindow(QMainWindow):
 
         snapshot = self._capture_document_state()
         progress = None
+        load_stage = "첫 PDF 페이지 읽기"
         try:
             progress = self._show_progress_dialog("PDF 로드", "PDF 로딩 중...")
             progress_cb = self._make_progress_cb(progress)
@@ -2528,6 +2529,7 @@ class MainWindow(QMainWindow):
             self.pages = loaded_pages
             self._pages_are_canonical = False
             self._reset_state_for_new_pdf()
+            load_stage = "첫 PDF의 기울기 보정"
             self._estimate_page_fine_angles(
                 progress_cb=self._wrap_progress(
                     35, 5, "자동 수평 맞춤 중...", progress_cb
@@ -2540,6 +2542,7 @@ class MainWindow(QMainWindow):
             # 여러 PDF의 첫 설문을 합쳐 자동 탐지 기준을 더 안정적으로 만듭니다.
             multi_templates = None
             if len(self.file_paths) > 1:
+                load_stage = "여러 PDF의 페이지 정렬 및 기준 양식 병합"
                 multi_templates = generate_ui_templates_multi(
                     self.file_paths,
                     page_count,
@@ -2551,6 +2554,7 @@ class MainWindow(QMainWindow):
                     page_fine_angles=self.preset.page_fine_angles,
                 )
 
+            load_stage = "체크칸 탐지 및 문항 구성"
             self.auto_detect(
                 progress_cb=self._wrap_progress(
                     70, 30, "체크박스 탐지 중...", progress_cb
@@ -2565,13 +2569,17 @@ class MainWindow(QMainWindow):
                 "페이지의 방향이나 위치를 기준 양식에 맞추지 못했습니다. "
                 "함께 선택한 PDF의 문항 배치와 페이지 방향을 확인해주세요."
                 if isinstance(exc, PageOrientationError)
-                else "PDF를 불러오지 못했습니다. 파일이 손상되었거나 암호가 "
-                "설정됐는지 확인해주세요."
+                else "PDF를 불러오지 못했습니다. 아래 실패 단계와 원인을 확인해주세요."
             )
             QMessageBox.critical(
                 self,
                 "PDF 불러오기 실패",
-                f"{guidance}\n\n세부 내용: {exc}",
+                f"{guidance}\n\n"
+                f"실패 단계: {load_stage}\n"
+                f"기준 파일: {Path(paths[0]).name}\n"
+                f"선택한 파일: {', '.join(Path(path).name for path in paths)}\n"
+                f"설문지 한 부: {page_count}쪽\n\n"
+                f"세부 원인:\n{exc}",
             )
             return False
         finally:
