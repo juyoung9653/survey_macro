@@ -1,4 +1,4 @@
-"""Production wiring and opt-in real mixed-orientation scan regression."""
+"""Production wiring and real mixed-orientation scan regression."""
 import hashlib
 import os
 from pathlib import Path
@@ -32,10 +32,8 @@ class OrientationPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(PageOrientationError, "sample.pdf.*7쪽"):
             _align_with_page_context(aligner, np.zeros((2, 2)), "sample.pdf", 6)
 
-    @unittest.skipUnless(os.getenv("RUN_BOARD_ORIENTATION_TEST") == "1",
-                         "opt-in local board-game PDF")
     def test_all_29_board_pages_match_manually_oriented_alignment(self):
-        source = Path("C:/Users/Public/scan/보드게임.pdf")
+        source = Path(os.getenv("SURVEY_SCAN_CORPUS", "C:/Users/Public/scan")) / "보드게임.pdf"
         self.assertTrue(source.is_file())
         before = hashlib.sha256(source.read_bytes()).hexdigest()
         with fitz.open(source) as doc:

@@ -159,6 +159,11 @@ class ImageAligner:
     _ORIENTATION_MIN_CORRELATION = 0.60
     _ORIENTATION_MIN_MARGIN = 0.08
     _ORIENTATION_ECC_ITERATIONS = 30
+    # This is deliberately separate from the normal orientation threshold.
+    # It is only used after the usual orientation and ORB paths have failed,
+    # and only together with a complete, large repeated answer grid.
+    _GRID_FALLBACK_MIN_UPRIGHT_SCORE = 0.40
+    _GRID_FALLBACK_MIN_UPRIGHT_MARGIN = 0.15
 
     def __init__(
         self,
@@ -994,9 +999,162 @@ class ImageAligner:
             else:
                 reason = "insufficient_matches"
             self.last_alignment_diagnostics.update({"reason": reason, "shift": (dx, dy), "matched": raw_matches, "required_matches": max(8, int(max(len(reference_boxes), len(candidate_boxes)) * 0.85))})
+            grid_alignment = self._bounded_complete_grid_alignment(
+                reference_boxes, candidate_boxes, working_img
+            )
+            if grid_alignment is not None:
+                grid_dx, grid_dy, grid_details = grid_alignment
+                self.last_alignment_diagnostics.update(grid_details)
+                self.last_alignment_stage = "checkbox_layout_grid"
+                return self._warp_aligned(
+                    working_img, np.float32([[1, 0, grid_dx], [0, 1, grid_dy]])
+                )
             return None
         self.last_alignment_stage = "checkbox_layout"
         return self._warp_aligned(working_img, np.float32([[1, 0, dx], [0, 1, dy]]))
+
+    @staticmethod
+    def _complete_repeated_grid(
+        boxes: list[tuple[int, int, int, int]],
+    ) -> list[list[tuple[int, int, int, int]]] | None:
+        """Return one complete grid made of similarly-sized enclosed cells.
+
+        The normal layout check intentionally considers every detected frame.
+        This narrower helper instead recognizes one rectangular response grid;
+        it must be complete so that a cropped header cannot hide a changed
+        question row or response column.
+        """
+        if len(boxes) < 16:
+            return None
+        dimensions = np.asarray([(w, h) for _x, _y, w, h in boxes], np.float32)
+        median_w, median_h = np.median(dimensions, axis=0)
+        comparable = [
+            box for box in boxes
+            if max(box[2], median_w) / max(1.0, min(box[2], median_w)) <= 1.35
+            and max(box[3], median_h) / max(1.0, min(box[3], median_h)) <= 1.35
+        ]
+        if len(comparable) < 16:
+            return None
+
+        def clusters(values: list[float], tolerance: float) -> list[float]:
+            grouped: list[list[float]] = []
+            for value in sorted(values):
+                if not grouped or value - float(np.mean(grouped[-1])) > tolerance:
+                    grouped.append([value])
+                else:
+                    grouped[-1].append(value)
+            return [float(np.mean(group)) for group in grouped]
+
+        x_centers = [x + w / 2 for x, _y, w, _h in comparable]
+        y_centers = [y + h / 2 for _x, y, _w, h in comparable]
+        columns = clusters(x_centers, max(5.0, float(median_w) * 0.45))
+        rows = clusters(y_centers, max(5.0, float(median_h) * 0.45))
+        if len(columns) < 4 or len(rows) < 4:
+            return None
+
+        cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+        for box in comparable:
+            x, y, w, h = box
+            center_x, center_y = x + w / 2, y + h / 2
+            col = int(np.argmin(np.abs(np.asarray(columns) - center_x)))
+            row = int(np.argmin(np.abs(np.asarray(rows) - center_y)))
+            if (
+                abs(columns[col] - center_x) > max(5.0, float(median_w) * 0.45)
+                or abs(rows[row] - center_y) > max(5.0, float(median_h) * 0.45)
+                or (row, col) in cells
+            ):
+                return None
+            cells[row, col] = box
+        if len(cells) != len(rows) * len(columns):
+            return None
+        return [[cells[row, col] for col in range(len(columns))] for row in range(len(rows))]
+
+    def _bounded_complete_grid_alignment(
+        self,
+        reference_boxes: list[tuple[int, int, int, int]],
+        candidate_boxes: list[tuple[int, int, int, int]],
+        working_img: np.ndarray,
+    ) -> tuple[float, float, dict[str, object]] | None:
+        """Validate a complete answer grid before accepting a cropped header."""
+        reference_grid = self._complete_repeated_grid(reference_boxes)
+        candidate_grid = self._complete_repeated_grid(candidate_boxes)
+        if reference_grid is None or candidate_grid is None:
+            self.last_alignment_diagnostics["grid_fallback_reason"] = "complete_grid_missing"
+            return None
+        ref_rows, ref_columns = len(reference_grid), len(reference_grid[0])
+        candidate_rows, candidate_columns = len(candidate_grid), len(candidate_grid[0])
+        if (ref_rows, ref_columns) != (candidate_rows, candidate_columns):
+            self.last_alignment_diagnostics["grid_fallback_reason"] = "grid_shape_mismatch"
+            return None
+
+        reference_cells = [cell for row in reference_grid for cell in row]
+        candidate_cells = [cell for row in candidate_grid for cell in row]
+        ref_left = min(x for x, _y, _w, _h in reference_cells)
+        ref_top = min(y for _x, y, _w, _h in reference_cells)
+        ref_right = max(x + w for x, _y, w, _h in reference_cells)
+        ref_bottom = max(y + h for _x, y, _w, h in reference_cells)
+        if (
+            ref_right - ref_left < self.ref_w * 0.25
+            or ref_bottom - ref_top < self.ref_h * 0.20
+        ):
+            self.last_alignment_diagnostics["grid_fallback_reason"] = "grid_area_too_small"
+            return None
+
+        center_offsets = np.asarray([
+            (rx + rw / 2 - (cx + cw / 2), ry + rh / 2 - (cy + ch / 2))
+            for (rx, ry, rw, rh), (cx, cy, cw, ch) in zip(reference_cells, candidate_cells)
+        ], np.float32)
+        dx, dy = (float(value) for value in np.median(center_offsets, axis=0))
+        if abs(dx) > self.ref_w * 0.12 or abs(dy) > self.ref_h * 0.12:
+            self.last_alignment_diagnostics["grid_fallback_reason"] = "grid_translation_exceeds_limit"
+            return None
+        for (rx, ry, rw, rh), (cx, cy, cw, ch) in zip(reference_cells, candidate_cells):
+            edge_tolerance = max(3.0, min(rw, rh, cw, ch) * 0.08)
+            if (
+                max(rw, cw) / max(1, min(rw, cw)) > 1.20
+                or max(rh, ch) / max(1, min(rh, ch)) > 1.20
+                or max(
+                    abs((cx + dx) - rx), abs((cy + dy) - ry),
+                    abs((cx + cw + dx) - (rx + rw)),
+                    abs((cy + ch + dy) - (ry + rh)),
+                ) > edge_tolerance
+            ):
+                self.last_alignment_diagnostics["grid_fallback_reason"] = "grid_edges_mismatch"
+                return None
+
+        gray = (
+            cv2.cvtColor(working_img, cv2.COLOR_BGR2GRAY)
+            if working_img.ndim == 3 else working_img
+        )
+        quick_gray = cv2.resize(
+            gray, (self.quick_ref_gray.shape[1], self.quick_ref_gray.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+        upright_score = self._orientation_affine_score(quick_gray)
+        upside_down_score = self._orientation_affine_score(
+            cv2.rotate(quick_gray, cv2.ROTATE_180)
+        )
+        if (
+            not np.isfinite([upright_score, upside_down_score]).all()
+            or upright_score < self._GRID_FALLBACK_MIN_UPRIGHT_SCORE
+            or upright_score - upside_down_score < self._GRID_FALLBACK_MIN_UPRIGHT_MARGIN
+        ):
+            self.last_alignment_diagnostics.update({
+                "grid_fallback_reason": "upright_evidence_missing",
+                "grid_upright_score": upright_score,
+                "grid_upside_down_score": upside_down_score,
+            })
+            return None
+        return dx, dy, {
+            "method": "checkbox_layout_grid",
+            "reason": "complete_grid_match",
+            "shift": (dx, dy),
+            "matched": len(reference_cells),
+            "required_matches": len(reference_cells),
+            "grid_shape": (ref_rows, ref_columns),
+            "grid_upright_score": upright_score,
+            "grid_upside_down_score": upside_down_score,
+        }
 
     def align(self, img: np.ndarray) -> np.ndarray:
         self.last_alignment_diagnostics = {

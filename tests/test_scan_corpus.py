@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from functools import lru_cache
 from unittest.mock import patch
 
 import cv2
@@ -25,10 +26,6 @@ from src.vision import (
 )
 
 
-_RUN_CORPUS_TESTS = os.getenv("RUN_SCAN_CORPUS_TESTS") == "1"
-_RUN_TRIO_CORPUS_TESTS = (
-    os.getenv("RUN_TRIO_CORPUS_TESTS") == "1" or _RUN_CORPUS_TESTS
-)
 _SCAN_DIR = Path(
     os.getenv("SURVEY_SCAN_CORPUS", r"C:\Users\Public\scan")
 )
@@ -48,6 +45,9 @@ _ONE_PAGE_PDFS = (
     "리더.pdf",
     "마음.pdf",
     "여행.pdf",
+    "법정의무.pdf",
+    "법정의무2.pdf",
+    "S25C-0i26090316340.pdf",
 )
 _TWO_PAGE_PDFS = (
     "거점.pdf",
@@ -62,12 +62,6 @@ _TWO_PAGE_PDFS = (
     "카페주거.pdf",
     "편의점.pdf",
     "헤이클린.pdf",
-)
-
-_ADDITIONAL_CORPUS_PDFS = (
-    "S25C-0i26090316340.pdf",
-    "법정의무.pdf",
-    "법정의무2.pdf",
 )
 
 _INDEPENDENT_LAYOUT_TRIO = ("리더.pdf", "마음.pdf", "여행.pdf")
@@ -99,10 +93,10 @@ def _group_boxes_by_row(boxes):
 
 def _representative_groups(paths):
     groups = []
-    for size in (2, 3):
+    for size in range(2, len(paths) + 1):
         for start in range(0, len(paths), size):
             group = tuple(paths[start : start + size])
-            if len(group) < 2:
+            if len(group) < size:
                 group = tuple(paths[-size:])
             if group not in groups:
                 groups.append(group)
@@ -122,6 +116,16 @@ def _detected_layout_config(templates, page_count: int) -> TemplatePreset:
         ]
         fields.append(Field(f"page_{page_idx + 1}", boxes=boxes))
     return TemplatePreset(page_count=page_count, fields=fields)
+
+
+class CorpusGroupingTests(unittest.TestCase):
+    def test_every_file_appears_at_every_group_size(self):
+        for names in (_ONE_PAGE_PDFS, _TWO_PAGE_PDFS):
+            groups = _representative_groups(names)
+            self.assertEqual({len(group) for group in groups}, set(range(2, len(names) + 1)))
+            for size in range(2, len(names) + 1):
+                covered = {name for group in groups if len(group) == size for name in group}
+                self.assertEqual(covered, set(names))
 
 
 def _assert_review_grid_alignment(test_case, document, page_idx: int) -> None:
@@ -162,10 +166,6 @@ def _assert_review_grid_alignment(test_case, document, page_idx: int) -> None:
     test_case.assertLessEqual(float(np.percentile(np.abs(edge_errors), 95)), 5.0)
 
 
-@unittest.skipUnless(
-    _RUN_CORPUS_TESTS,
-    "set RUN_SCAN_CORPUS_TESTS=1 to run the external PDF corpus",
-)
 class ScanCorpusDetectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -174,7 +174,6 @@ class ScanCorpusDetectionTests(unittest.TestCase):
         expected = (
             set(_ONE_PAGE_PDFS)
             | set(_TWO_PAGE_PDFS)
-            | set(_ADDITIONAL_CORPUS_PDFS)
         )
         actual = {path.name for path in _SCAN_DIR.glob("*.pdf")}
         if actual != expected:
@@ -185,6 +184,7 @@ class ScanCorpusDetectionTests(unittest.TestCase):
             )
 
     @staticmethod
+    @lru_cache(maxsize=32)
     def _page_angles(path: Path, page_count: int):
         pages = load_pdf_pages(
             str(path),
@@ -192,7 +192,7 @@ class ScanCorpusDetectionTests(unittest.TestCase):
         )
         return [float(estimate_deskew_angle(page) or 0.0) for page in pages]
 
-    def _assert_layout(self, templates, page_count: int):
+    def _assert_layout(self, templates, page_count: int, pdf_name: str = ""):
         self.assertEqual(set(templates), set(range(page_count)))
         detected_by_page = {
             page: auto_detect_checkboxes(template)
@@ -214,7 +214,10 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                 and np.median([box[2] for box in row]) >= 100
                 and np.median([box[3] for box in row]) >= 100
             ]
-            self.assertEqual([len(row) for row in small_rows], [2, 6, 4])
+            # One career frame is obscured in this filled single-response scan;
+            # its preset mapping and final answers are tested separately below.
+            small_signature = [2, 6, 3] if pdf_name == "S25C-0i26090316340.pdf" else [2, 6, 4]
+            self.assertEqual([len(row) for row in small_rows], small_signature)
             self.assertEqual([len(row) for row in grid_rows], [5] * 6)
             return
 
@@ -245,9 +248,9 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                         [templates[page] for page in range(page_count)],
                         TemplatePreset(page_count=page_count),
                     )
-                    self._assert_layout(templates, page_count)
+                    self._assert_layout(templates, page_count, name)
 
-    def test_compatible_pdfs_in_pairs_triples_and_all(self):
+    def test_compatible_pdfs_in_every_group_size(self):
         for page_count, names in (
             (1, _ONE_PAGE_PDFS),
             (2, _TWO_PAGE_PDFS),
@@ -291,7 +294,7 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                         )
                         self.assertTrue(remap.compatible)
                         self.assertTrue(remap.accepted)
-                        self._assert_layout(local_templates, page_count)
+                        self._assert_layout(local_templates, page_count, path.name)
 
     def test_one_page_pdfs_accept_default_preset_with_current_box_geometry(self):
         preset_path = _PRESET_DIR / "기본.json"
@@ -348,7 +351,9 @@ class ScanCorpusDetectionTests(unittest.TestCase):
 
                 self.assertTrue(result.accepted)
                 self.assertTrue(result.compatible)
-                self.assertEqual(result.matched_boxes, result.expected_boxes)
+                missing_frames = 1 if name == "S25C-0i26090316340.pdf" else 0
+                self.assertEqual(result.expected_boxes, 37)
+                self.assertEqual(result.matched_boxes, result.expected_boxes - missing_frames)
                 detected_geometry = {
                     (box.page_idx, box.x, box.y, box.w, box.h)
                     for box in detected
@@ -359,7 +364,8 @@ class ScanCorpusDetectionTests(unittest.TestCase):
                     if not field.is_comment
                     for box in field.boxes
                 }
-                self.assertTrue(mapped_geometry <= detected_geometry)
+                self.assertEqual(len(mapped_geometry), 37)
+                self.assertEqual(len(mapped_geometry - detected_geometry), missing_frames)
                 if pdf_path == color_pdf_path:
                     color_angles = angles
                     color_detected = detected
@@ -478,10 +484,6 @@ class ScanCorpusDetectionTests(unittest.TestCase):
         self.assertEqual(answer["의견"], "있음")
 
 
-@unittest.skipUnless(
-    _RUN_TRIO_CORPUS_TESTS,
-    "set RUN_TRIO_CORPUS_TESTS=1 to run the independent-layout trio",
-)
 class IndependentFileLayoutCorpusTests(unittest.TestCase):
     """Exercise the real UI preset path and per-file analysis references."""
 
@@ -499,12 +501,26 @@ class IndependentFileLayoutCorpusTests(unittest.TestCase):
 
     def test_trio_loads_default_preset_and_keeps_local_review_frames(self):
         """83 source pages must retain their own field-frame coordinates."""
+        expected_rows = [
+            (name, f"{name}_{page_idx}p")
+            for name, count in (("리더", 17), ("마음", 34), ("여행", 30))
+            for page_idx in range(1, count + 1)
+        ]
+        self._check_real_analysis(dict(zip(_INDEPENDENT_LAYOUT_TRIO, (19, 34, 30))), expected_rows)
+
+    def test_startup_third_page_and_remaining_pages_keep_local_frames(self):
+        with fitz.open(_SCAN_DIR / "자활창업.pdf") as document:
+            page_count = len(document)
+        self.assertGreaterEqual(page_count, 3)
+        self._check_real_analysis({"자활창업.pdf": page_count})
+
+    def _check_real_analysis(self, expected_pages, expected_rows=None):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PyQt6.QtWidgets import QApplication
 
         from src.ui import MainWindow
 
-        paths = [str(_SCAN_DIR / name) for name in _INDEPENDENT_LAYOUT_TRIO]
+        paths = [str(_SCAN_DIR / name) for name in expected_pages]
         app = QApplication.instance() or QApplication([])
         window = MainWindow()
         try:
@@ -552,9 +568,6 @@ class IndependentFileLayoutCorpusTests(unittest.TestCase):
                     )
                 )
                 review_folder = next(Path(temp_dir).rglob("검토용"))
-                expected_pages = dict(
-                    zip(_INDEPENDENT_LAYOUT_TRIO, (19, 34, 30))
-                )
                 actual_total = 0
                 expected_frames = sum(
                     item[3] for item in field_contract if not item[2]
@@ -568,7 +581,7 @@ class IndependentFileLayoutCorpusTests(unittest.TestCase):
                     try:
                         self.assertEqual(len(document), page_count)
                         actual_total += len(document)
-                        for page_idx in {0, min(1, page_count - 1), page_count - 1}:
+                        for page_idx in {0, min(1, page_count - 1), min(2, page_count - 1), page_count - 1}:
                             self.assertGreaterEqual(
                                 len(document[page_idx].get_drawings()),
                                 expected_frames,
@@ -578,7 +591,7 @@ class IndependentFileLayoutCorpusTests(unittest.TestCase):
                             )
                     finally:
                         document.close()
-                self.assertEqual(actual_total, 83)
+                self.assertEqual(actual_total, sum(expected_pages.values()))
 
                 # The source has two deliberately blank final 리더 sheets.
                 # Review output keeps every scanned page, while Excel omits
@@ -596,19 +609,12 @@ class IndependentFileLayoutCorpusTests(unittest.TestCase):
                     ]
                 finally:
                     workbook.close()
-                expected_rows = [
-                    ("리더", f"리더_{page_idx}p")
-                    for page_idx in range(1, 18)
-                ]
-                expected_rows.extend(
-                    ("마음", f"마음_{page_idx}p")
-                    for page_idx in range(1, 35)
-                )
-                expected_rows.extend(
-                    ("여행", f"여행_{page_idx}p")
-                    for page_idx in range(1, 31)
-                )
-                self.assertEqual(actual_rows, expected_rows)
+                if expected_rows is not None:
+                    self.assertEqual(actual_rows, expected_rows)
+                else:
+                    self.assertTrue(actual_rows)
+                    self.assertEqual(len(actual_rows), len(set(actual_rows)))
+                    self.assertIn(("자활창업", "자활창업_3p"), actual_rows)
 
             self.assertEqual(
                 [

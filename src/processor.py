@@ -77,7 +77,7 @@ from .vision import (
 
 _UI_TEMPLATE_SAMPLE_LIMIT = 31
 _UI_DETECTION_SAMPLE_LIMIT = 7
-_UI_TEMPLATE_CACHE_VERSION = 12
+_UI_TEMPLATE_CACHE_VERSION = 13
 _MIB = 1024 * 1024
 _ANALYSIS_SAMPLE_WORK = 2.0
 _ANALYSIS_TEMPLATE_WORK = 1.0
@@ -843,6 +843,28 @@ def _ui_template_sample_progress(
     return report
 
 
+def _complete_local_reference(pages: list[np.ndarray]) -> np.ndarray:
+    """Replace a damaged first reference only with a geometrically verified scan."""
+    first = pages[0]
+    def detected(image):
+        color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if image.ndim == 2 else image
+        boxes = auto_detect_checkboxes(color)
+        small_count = sum(_is_checkbox_like(Box(0, *box), image.shape) for box in boxes)
+        return small_count
+    first_count = detected(first)
+    if first_count >= 8 or len(pages) == 1:
+        return first
+    candidates = sorted(((detected(page), index) for index, page in enumerate(pages[1:], 1)), reverse=True)
+    for count, index in candidates:
+        if count < 8 or first_count >= count * 0.7:
+            continue
+        aligner = ImageAligner(first, refine_ecc=False, auto_orient_180=True)
+        aligned = aligner.align_if_checkbox_layout_matches(pages[index])
+        if aligned is not None:
+            return aligned
+    return first
+
+
 def generate_ui_templates(
     pdf_path: str,
     page_count: int,
@@ -898,15 +920,14 @@ def generate_ui_templates(
     # 중앙값 템플릿에서 끊어질 수 있습니다. 템플릿 합성은 ORB 정합만 사용합니다.
     aligners = [
         ImageAligner(
-            apply_rotation(
-                p,
-                rot_code,
-                _fine_angle_for_page(fine_angle, page_fine_angles, local_p),
-            ),
+            _complete_local_reference([
+                apply_rotation(pages[index], rot_code, _fine_angle_for_page(fine_angle, page_fine_angles, local_p))
+                for index in range(local_p, min(len(pages), page_count * 3), page_count)
+            ]),
             refine_ecc=False,
             auto_orient_180=True,
         )
-        for local_p, p in enumerate(pages[:page_count])
+        for local_p in range(min(page_count, len(pages)))
     ]
 
     survey_count = _survey_count(len(pages), page_count)
@@ -1871,7 +1892,9 @@ def remap_preset_to_detected_layout(
         else:
             all_y = np.empty(0, dtype=np.float64)
             matched_y = np.empty(0, dtype=np.float64)
-        if len(all_y) <= 1 or float(np.ptp(all_y)) <= 0:
+        if len(matched_y) == 0 and len(all_y) > 0:
+            vertical_span = 0.0
+        elif len(all_y) <= 1 or float(np.ptp(all_y)) <= 0:
             vertical_span = 1.0
         else:
             vertical_span = float(np.ptp(matched_y) / np.ptp(all_y))
@@ -2175,19 +2198,45 @@ def _configured_layout_has_frame_support(
     """Accept an incomplete detector result only when visible frames agree."""
     checked = 0
     supported = 0
+    blank_occlusion_supported = True
     for page_idx, image in pages.items():
-        refs = _config_checkbox_refs(config, page_idx, image.shape)
+        checkbox_refs = _config_checkbox_refs(config, page_idx, image.shape)
+        refs = list(checkbox_refs)
         source = source_templates.get(page_idx)
+        framed_refs = []
         if source is not None:
-            refs.extend(_config_framed_refs(config, page_idx, source))
+            framed_refs = _config_framed_refs(config, page_idx, source)
+            refs.extend(framed_refs)
         if not refs:
             continue
         mask = _layout_line_mask(image)
+        unsupported = []
         for _field_idx, _box_idx, box in refs:
             checked += 1
             if sum(score >= 0.55 for score in _box_frame_edge_scores(mask, box)) >= 3:
                 supported += 1
-    return checked > 0 and supported / checked >= 0.8
+            else:
+                unsupported.append(box)
+        if unsupported:
+            # A white occlusion may erase demographics while leaving the whole
+            # answer grid intact. Keep its missing answers empty only when all
+            # large answer frames verify the configured coordinates directly.
+            framed_boxes = [ref[2] for ref in framed_refs]
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+            grid_agrees = len(framed_boxes) >= 20 and all(
+                sum(score >= 0.55 for score in _box_frame_edge_scores(mask, box)) >= 3
+                for box in framed_boxes
+            )
+            if grid_agrees:
+                centers = np.asarray([(b.x + b.w / 2, b.y + b.h / 2) for b in framed_boxes])
+                grid_agrees = np.ptp(centers[:, 0]) >= image.shape[1] * 0.25 and np.ptp(centers[:, 1]) >= image.shape[0] * 0.15
+            for box in unsupported:
+                roi = gray[max(0, box.y - 2):box.y + box.h + 2, max(0, box.x - 2):box.x + box.w + 2]
+                if not _is_checkbox_like(box, image.shape) or roi.size == 0 or np.mean(roi < 220) > 0.005:
+                    grid_agrees = False
+                    break
+            blank_occlusion_supported = blank_occlusion_supported and grid_agrees
+    return checked > 0 and (supported / checked >= 0.8 or blank_occlusion_supported)
 
 
 def _collect_ink_data(
@@ -2888,14 +2937,17 @@ def _load_file_alignment_references(
     config: TemplatePreset,
 ) -> list[np.ndarray]:
     """Use each PDF's first survey as its own alignment coordinate system."""
-    pages = load_pdf_pages(
-        fpath, page_indices=list(range(config.page_count))
-    )
+    with fitz.open(fpath) as document:
+        sample_count = min(len(document), config.page_count * 3)
+    pages = load_pdf_pages(fpath, page_indices=list(range(sample_count)))
     if len(pages) < config.page_count:
         raise ValueError(f"'{Path(fpath).name}'에 기준 페이지가 부족합니다.")
     return [
-        apply_rotation(page, config.rot_code, config.fine_angle_for_page(index))
-        for index, page in enumerate(pages[: config.page_count])
+        _complete_local_reference([
+            apply_rotation(pages[index], config.rot_code, config.fine_angle_for_page(local_p))
+            for index in range(local_p, len(pages), config.page_count)
+        ])
+        for local_p in range(config.page_count)
     ]
 
 
